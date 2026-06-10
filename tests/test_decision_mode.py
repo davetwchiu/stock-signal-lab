@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import pandas as pd
+
+from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config, profile_settings
+from src.decision.report import generate_markdown_report, portfolio_summary_text
+from src.decision.table import build_decision_table, confidence_from_score, target_exposure_bucket
+from src.features.regime import UPTREND_LOW_VOL
+from src.portfolio.allocation import suggested_action
+
+
+def test_default_decision_config_loading() -> None:
+    config = load_decision_config()
+
+    assert "NVDA" in config.default_ticker_universe
+    assert config.default_benchmark == "SPY"
+    assert config.default_model == "logistic_regression"
+    assert profile_settings(config, "Balanced").cash_floor == config.default_cash_floor
+
+
+def test_action_label_generation() -> None:
+    assert suggested_action(0.00, 0.05) == "Add"
+    assert suggested_action(0.05, 0.05) == "Hold"
+    assert suggested_action(0.10, 0.05) == "Trim"
+    assert suggested_action(0.10, 0.00) == "Exit"
+    assert suggested_action(0.00, 0.00) == "Watch"
+
+
+def test_target_exposure_bucket_generation() -> None:
+    assert target_exposure_bucket(0.00, 0.12) == "0%"
+    assert target_exposure_bucket(0.03, 0.12) == "25%"
+    assert target_exposure_bucket(0.06, 0.12) == "50%"
+    assert target_exposure_bucket(0.09, 0.12) == "75%"
+    assert target_exposure_bucket(0.12, 0.12) == "100%"
+
+
+def test_confidence_bucket_generation() -> None:
+    assert confidence_from_score(50, 0.50) == "Low"
+    assert confidence_from_score(65, 0.50) == "Medium"
+    assert confidence_from_score(90, 0.10) == "High"
+
+
+def test_decision_mode_table_output_shape() -> None:
+    config = load_decision_config()
+    profile = profile_settings(config, "Balanced")
+    current_scores = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB"],
+            "Rule-Based Regime": [UPTREND_LOW_VOL, UPTREND_LOW_VOL],
+            "ML Score": [90.0, 30.0],
+            "ML Drawdown-Risk Probability": [0.10, 0.70],
+        }
+    )
+    latest_features = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB"],
+            "Adj Close": [100.0, 50.0],
+            "rs_spy_60d": [0.05, -0.02],
+        }
+    )
+
+    table = build_decision_table(current_scores, latest_features, config, profile)
+
+    assert list(table.columns) == [
+        "Ticker",
+        "Price",
+        "Rule-based regime",
+        "ML score",
+        "Drawdown-risk probability",
+        "Relative strength rank",
+        "Suggested action",
+        "Target exposure bucket",
+        "Confidence",
+        "One-line reason",
+    ]
+    assert len(table) == 2
+
+
+def test_markdown_report_generation() -> None:
+    table = pd.DataFrame(
+        {
+            "Ticker": ["AAA"],
+            "Suggested action": ["Add"],
+            "Target exposure bucket": ["100%"],
+            "Confidence": ["High"],
+            "One-line reason": ["Strong score with acceptable risk."],
+            "Drawdown-risk probability": [0.10],
+            "Rule-based regime": [UPTREND_LOW_VOL],
+        }
+    )
+    summary = portfolio_summary_text(UPTREND_LOW_VOL, table, 0.10)
+    report = generate_markdown_report(
+        table,
+        profile="Balanced",
+        benchmark="SPY",
+        market_regime=UPTREND_LOW_VOL,
+        suggested_gross_exposure=0.90,
+        suggested_cash_level=0.10,
+        summary_text=summary,
+    )
+
+    assert "# Stock Signal Lab Decision Report" in report
+    assert "## Actions" in report
+    assert "AAA" in report
+
+
+def test_advanced_override_hidden_by_default() -> None:
+    assert DEFAULT_ADVANCED_OVERRIDE is False
+
