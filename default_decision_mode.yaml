@@ -1,0 +1,53 @@
+default_ticker_universe:
+  - NVDA
+  - TSM
+  - AMD
+  - AVGO
+  - MU
+  - LITE
+  - COHR
+  - CRDO
+  - XLK
+  - SMH
+  - SOXX
+  - QQQ
+  - SPY
+default_benchmark: SPY
+default_label_horizon: 20
+default_model: logistic_regression
+default_feature_group: all
+ml_score_thresholds:
+  add: 80
+  hold: 60
+  watch: 40
+drawdown_risk_thresholds:
+  moderate: 0.40
+  high: 0.60
+allocation_buckets:
+  - 0
+  - 25
+  - 50
+  - 75
+  - 100
+default_rebalance_frequency: weekly
+default_transaction_cost_bps: 5
+default_slippage_bps: 2
+default_cash_floor: 0.10
+default_max_single_position_exposure: 0.12
+profiles:
+  Conservative:
+    cash_floor: 0.20
+    max_single_position_exposure: 0.08
+    high_drawdown_risk_threshold: 0.50
+    moderate_drawdown_risk_threshold: 0.35
+  Balanced:
+    cash_floor: 0.10
+    max_single_position_exposure: 0.12
+    high_drawdown_risk_threshold: 0.60
+    moderate_drawdown_risk_threshold: 0.40
+  Aggressive:
+    cash_floor: 0.05
+    max_single_position_exposure: 0.16
+    high_drawdown_risk_threshold: 0.70
+    moderate_drawdown_risk_threshold: 0.50
+
