@@ -44,9 +44,16 @@ from src.utils.config import FeatureConfig
 st.set_page_config(page_title="Stock Signal Lab", layout="wide")
 
 DECISION_HELP = {
-    "ml_score": "A 0-100 research score based on estimated forward relative strength and risk state. It is not a price target or guaranteed forecast.",
-    "drawdown": "Estimated probability of a material forward drawdown under the selected model and validation setup.",
-    "action": "An interpretable decision label derived from rule-based regime, ML score, drawdown risk, relative strength, and risk controls.",
+    "ml_score": "A 0-100 read on relative strength and risk conditions. Higher means the setup looks more constructive; it is not a price target or guaranteed forecast.",
+    "drawdown": "Estimated chance of a meaningful pullback over the forward review window.",
+    "action": "A plain-English action label based on trend, opportunity, pullback risk, relative strength, and risk controls.",
+}
+DECISION_TABLE_COLUMN_LABELS = {
+    "Rule-based regime": "Trend backdrop",
+    "ML score": "Opportunity score",
+    "Drawdown-risk probability": "Pullback risk",
+    "Target exposure bucket": "Suggested position size",
+    "One-line reason": "Reason",
 }
 BENCHMARK_OPTIONS = ["SPY", "QQQ", "SMH", "SOXX"]
 
@@ -159,18 +166,33 @@ def score_panel_from_validation(out_predictions: pd.DataFrame, risk_predictions:
     )
 
 
+def display_decision_table(table: pd.DataFrame) -> pd.DataFrame:
+    """Return a display-only copy with investor-facing column labels."""
+
+    return table.copy().rename(columns=DECISION_TABLE_COLUMN_LABELS)
+
+
+def _decision_display_column(table: pd.DataFrame, internal_column: str) -> str:
+    """Resolve the visible column label used for styling."""
+
+    display_column = DECISION_TABLE_COLUMN_LABELS.get(internal_column, internal_column)
+    return display_column if display_column in table.columns else internal_column
+
+
 def styled_decision_table(table: pd.DataFrame):
     """Return a lightly styled DataFrame for the cockpit."""
 
     if table.empty:
         return table
+    score_column = _decision_display_column(table, "ML score")
+    risk_column = _decision_display_column(table, "Drawdown-risk probability")
     return table.style.background_gradient(
-        subset=["ML score"],
+        subset=[score_column],
         cmap="RdYlGn",
         vmin=0,
         vmax=100,
     ).background_gradient(
-        subset=["Drawdown-risk probability"],
+        subset=[risk_column],
         cmap="YlOrRd",
         vmin=0,
         vmax=1,
@@ -183,17 +205,17 @@ st.title("Stock Signal Lab")
 st.caption("Decision support for regime, risk, and portfolio exposure. Research only, not financial advice.")
 
 with st.sidebar:
-    st.header("Decision Mode")
+    st.header("Decision Cockpit")
     profile_name = st.selectbox(
         "Profile",
         options=["Conservative", "Balanced", "Aggressive"],
         index=1,
-        help="Simple preset for cash floor, max position size, and drawdown-risk tolerance.",
+        help="Choose how conservative the suggested cash reserve and position sizes should be.",
     )
     advanced_override = st.toggle(
-        "Advanced override",
+        "Show advanced settings",
         value=DEFAULT_ADVANCED_OVERRIDE,
-        help="Show limited Decision Mode overrides. Full diagnostics live in Research Lab.",
+        help="Show benchmark and date-range settings for the decision view.",
     )
 
     default_end = date.today()
@@ -233,7 +255,7 @@ with st.sidebar:
             "Benchmark",
             options=BENCHMARK_OPTIONS,
             index=BENCHMARK_OPTIONS.index(benchmark) if benchmark in BENCHMARK_OPTIONS else 0,
-            help="Benchmark used for relative strength and forward excess-return labels.",
+            help="Market benchmark used to compare relative strength.",
         )
         if st.session_state.get("benchmark_saved_message"):
             st.success(st.session_state.pop("benchmark_saved_message"))
@@ -254,7 +276,7 @@ feature_config = FeatureConfig()
 
 today_tab, explain_tab, research_tab = st.tabs(["Today / Decision Cockpit", "Explain / Why", "Research Lab"])
 
-with st.spinner("Loading data and computing the locked Decision Mode view..."):
+with st.spinner("Loading data and preparing today's decision view..."):
     frames: dict[str, pd.DataFrame] = {}
     load_errors: dict[str, str] = {}
     for ticker in data_tickers:
@@ -317,7 +339,7 @@ with today_tab:
                 st.warning(f"{ticker}: {message}")
 
     st.write(f"**Portfolio stock list:** {len(tickers)} tickers")
-    st.write("**Tickers being scored:** " + ", ".join(tickers))
+    st.write("**Tickers being reviewed:** " + ", ".join(tickers))
 
     counts = action_counts(decision_table)
     card_1, card_2, card_3, card_4 = st.columns(4)
@@ -335,17 +357,18 @@ with today_tab:
     if warning_text != "No dominant warning.":
         st.warning(warning_text)
 
-    st.subheader("Today Decision Table")
+    st.subheader("Today's Decision Table")
     st.caption(
-        "ML score: "
+        "Opportunity score: "
         + DECISION_HELP["ml_score"]
-        + " Drawdown-risk probability: "
+        + " Pullback risk: "
         + DECISION_HELP["drawdown"]
     )
-    st.dataframe(styled_decision_table(decision_table), width="stretch")
+    displayed_decision_table = display_decision_table(decision_table)
+    st.dataframe(styled_decision_table(displayed_decision_table), width="stretch")
     c1, c2 = st.columns(2)
     c1.download_button(
-        "Export Today Decision Table to CSV",
+        "Export today's decision table to CSV",
         dataframe_to_csv(decision_table),
         file_name="today_decision_table.csv",
         mime="text/csv",
