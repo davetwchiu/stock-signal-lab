@@ -14,3 +14,7 @@ data/cache/*
 data/experiments/*
 !data/experiments/.gitkeep
 notebooks/.ipynb_checkpoints/
+
+# Local runtime state
+/data/user_portfolio.yaml
+/data/user_benchmark.yaml
