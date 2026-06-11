@@ -624,6 +624,7 @@ with research_tab:
                                 risk_result.predictions,
                                 result.overall_metrics,
                                 risk_result.overall_metrics,
+                                baseline_panel=supervised,
                             )
                             show_research_lab_run_interpretation(
                                 interpret_research_lab_run(
@@ -683,6 +684,15 @@ with research_tab:
                                     key="download_ml_score_buckets_csv",
                                 )
                             show_diagnostic_interpretation(interpret_ml_score_buckets(diagnostics.score_buckets))
+                            st.write("**ML baseline comparison**")
+                            st.caption(
+                                "Diagnostics-only comparison of existing ML score bucket separation "
+                                "against no-skill and simple price-derived baselines."
+                            )
+                            if diagnostics.baseline_comparison.empty:
+                                st.info("No baseline comparison was available for this walk-forward sample.")
+                            else:
+                                st.dataframe(diagnostics.baseline_comparison, width="stretch")
                             st.write("**Drawdown-risk calibration**")
                             st.dataframe(diagnostics.drawdown_risk_calibration, width="stretch")
                             drawdown_calibration_export = diagnostic_export_frame(
