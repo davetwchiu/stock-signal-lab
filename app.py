@@ -692,6 +692,12 @@ with research_tab:
                 st.dataframe(comparison, width="stretch")
 
                 if show_ml_diagnostics:
+                    st.info(
+                        "ML signal health is research-only. It checks whether past out-of-sample "
+                        "ML predictions separated stronger and weaker signals. Healthy does not mean buy; "
+                        "Weak does not mean sell. This panel does not affect Decision Mode, scores, "
+                        "actions, sizing, ranking, allocation, saved portfolio, benchmark, or cache."
+                    )
                     try:
                         risk_result = walk_forward_validate_classifier(
                             supervised,
