@@ -15,6 +15,7 @@ from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config,
 from src.decision.explain import ticker_explanation
 from src.decision.report import generate_markdown_report, main_warning, portfolio_summary_text
 from src.decision.table import action_counts, build_decision_table
+from src.decision.user_benchmark import resolve_active_benchmark, save_user_benchmark
 from src.decision.user_portfolio import (
     parse_portfolio_tickers,
     resolve_active_portfolio_tickers,
@@ -47,6 +48,7 @@ DECISION_HELP = {
     "drawdown": "Estimated probability of a material forward drawdown under the selected model and validation setup.",
     "action": "An interpretable decision label derived from rule-based regime, ML score, drawdown risk, relative strength, and risk controls.",
 }
+BENCHMARK_OPTIONS = ["SPY", "QQQ", "SMH", "SOXX"]
 
 
 @st.cache_data(show_spinner=False)
@@ -198,7 +200,7 @@ with st.sidebar:
     default_start = default_end - timedelta(days=365 * 3)
     active_tickers, saved_portfolio = resolve_active_portfolio_tickers(config.default_ticker_universe)
     tickers = list(active_tickers)
-    benchmark = config.default_benchmark
+    benchmark = resolve_active_benchmark(config.default_benchmark, allowed_benchmarks=BENCHMARK_OPTIONS)
     start_date = default_start
     end_date = default_end
 
@@ -229,10 +231,16 @@ with st.sidebar:
         st.divider()
         benchmark = st.selectbox(
             "Benchmark",
-            options=["SPY", "QQQ", "SMH", "SOXX"],
-            index=["SPY", "QQQ", "SMH", "SOXX"].index(benchmark) if benchmark in {"SPY", "QQQ", "SMH", "SOXX"} else 0,
+            options=BENCHMARK_OPTIONS,
+            index=BENCHMARK_OPTIONS.index(benchmark) if benchmark in BENCHMARK_OPTIONS else 0,
             help="Benchmark used for relative strength and forward excess-return labels.",
         )
+        if st.session_state.get("benchmark_saved_message"):
+            st.success(st.session_state.pop("benchmark_saved_message"))
+        if st.button("Save benchmark"):
+            save_user_benchmark(benchmark)
+            st.session_state["benchmark_saved_message"] = f"Using saved benchmark: {benchmark}"
+            st.rerun()
         start_date = st.date_input("Start date", value=default_start, help="Historical data start date.")
         end_date = st.date_input("End date", value=default_end, help="Historical data end date.")
 
