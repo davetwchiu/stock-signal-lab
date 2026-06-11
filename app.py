@@ -85,6 +85,20 @@ def dataframe_to_csv(data: pd.DataFrame) -> bytes:
     return data.to_csv(index=False).encode("utf-8")
 
 
+def diagnostic_export_frame(data: object) -> pd.DataFrame:
+    """Normalize diagnostics-only outputs for CSV export."""
+
+    if isinstance(data, pd.DataFrame):
+        return data
+    if isinstance(data, dict):
+        return pd.DataFrame(
+            [{"metric": key, "value": value} for key, value in data.items()]
+        )
+    if data is None:
+        return pd.DataFrame()
+    return pd.DataFrame([{"metric": "value", "value": data}])
+
+
 def parse_float_list(raw: str) -> list[float]:
     """Parse comma-separated floats."""
 
@@ -602,18 +616,56 @@ with research_tab:
                             else:
                                 st.info(verdict_message)
                             st.dataframe(health_metrics, width="stretch", hide_index=True)
+                            health_export = diagnostic_export_frame(health_metrics)
+                            if not health_export.empty:
+                                st.download_button(
+                                    "Download health CSV",
+                                    dataframe_to_csv(health_export),
+                                    file_name="ml_signal_health.csv",
+                                    mime="text/csv",
+                                    key="download_ml_signal_health_csv",
+                                )
                             st.write("**ML diagnostics summary**")
                             st.caption(
                                 "Research-only diagnostics for existing walk-forward signal outputs. "
                                 "These tables do not change Decision Mode logic."
                             )
                             st.dataframe(diagnostics.summary, width="stretch")
+                            summary_export = diagnostic_export_frame(diagnostics.summary)
+                            if not summary_export.empty:
+                                st.download_button(
+                                    "Download summary CSV",
+                                    dataframe_to_csv(summary_export),
+                                    file_name="ml_diagnostics_summary.csv",
+                                    mime="text/csv",
+                                    key="download_ml_diagnostics_summary_csv",
+                                )
                             show_diagnostic_interpretation(interpret_ml_diagnostics_summary(diagnostics.summary))
                             st.write("**ML score buckets**")
                             st.dataframe(diagnostics.score_buckets, width="stretch")
+                            score_buckets_export = diagnostic_export_frame(diagnostics.score_buckets)
+                            if not score_buckets_export.empty:
+                                st.download_button(
+                                    "Download buckets CSV",
+                                    dataframe_to_csv(score_buckets_export),
+                                    file_name="ml_score_buckets.csv",
+                                    mime="text/csv",
+                                    key="download_ml_score_buckets_csv",
+                                )
                             show_diagnostic_interpretation(interpret_ml_score_buckets(diagnostics.score_buckets))
                             st.write("**Drawdown-risk calibration**")
                             st.dataframe(diagnostics.drawdown_risk_calibration, width="stretch")
+                            drawdown_calibration_export = diagnostic_export_frame(
+                                diagnostics.drawdown_risk_calibration
+                            )
+                            if not drawdown_calibration_export.empty:
+                                st.download_button(
+                                    "Download calibration CSV",
+                                    dataframe_to_csv(drawdown_calibration_export),
+                                    file_name="drawdown_risk_calibration.csv",
+                                    mime="text/csv",
+                                    key="download_drawdown_risk_calibration_csv",
+                                )
                             show_diagnostic_interpretation(
                                 interpret_drawdown_calibration(diagnostics.drawdown_risk_calibration)
                             )
