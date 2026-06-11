@@ -1,17 +1,32 @@
 default_ticker_universe:
-  - NVDA
-  - TSM
-  - AMD
+  - AAPL
+  - AMAT
+  - ANET
   - AVGO
-  - MU
-  - LITE
-  - COHR
-  - CRDO
+  - BRK-B
+  - ETN
+  - GOOG
+  - GRID
+  - KTOS
+  - MRVL
+  - NVDA
+  - ONDS
+  - PLTR
+  - RDW
+  - RKLB
+  - TSLA
+  - TSM
+  - UUUU
   - XLK
-  - SMH
-  - SOXX
-  - QQQ
-  - SPY
+  - SEMI.AS
+  - 200A.T
+  - 2854.T
+  - 3587.TWO
+  - 00935.TW
+  - ABBN.SW
+  - IART.SW
+  - SMSD.IL
+  - WTAI.L
 default_benchmark: SPY
 default_label_horizon: 20
 default_model: logistic_regression
@@ -50,4 +65,3 @@ profiles:
     max_single_position_exposure: 0.16
     high_drawdown_risk_threshold: 0.70
     moderate_drawdown_risk_threshold: 0.50
-

@@ -15,6 +15,38 @@ from src.decision.user_portfolio import (
 )
 
 
+EXPECTED_DEFAULT_PORTFOLIO = [
+    "AAPL",
+    "AMAT",
+    "ANET",
+    "AVGO",
+    "BRK-B",
+    "ETN",
+    "GOOG",
+    "GRID",
+    "KTOS",
+    "MRVL",
+    "NVDA",
+    "ONDS",
+    "PLTR",
+    "RDW",
+    "RKLB",
+    "TSLA",
+    "TSM",
+    "UUUU",
+    "XLK",
+    "SEMI.AS",
+    "200A.T",
+    "2854.T",
+    "3587.TWO",
+    "00935.TW",
+    "ABBN.SW",
+    "IART.SW",
+    "SMSD.IL",
+    "WTAI.L",
+]
+
+
 def test_parse_comma_separated_tickers() -> None:
     assert parse_portfolio_tickers("aapl, msft, nvda") == ["AAPL", "MSFT", "NVDA"]
 
@@ -29,6 +61,10 @@ def test_parse_removes_duplicates_and_preserves_order() -> None:
 
 def test_parse_uppercases_and_preserves_hyphen_ticker() -> None:
     assert parse_portfolio_tickers("brk-b, goog") == ["BRK-B", "GOOG"]
+
+
+def test_parse_preserves_exchange_suffixes_and_uses_yahoo_style_semiconductor_etf() -> None:
+    assert parse_portfolio_tickers("semi.as, 3587.two, 00935.tw") == ["SEMI.AS", "3587.TWO", "00935.TW"]
 
 
 def test_save_portfolio_list_writes_yaml(tmp_path: Path) -> None:
@@ -58,7 +94,9 @@ def test_resolve_falls_back_to_system_default_when_no_saved_file(tmp_path: Path)
     tickers, saved = resolve_active_portfolio_tickers(config.default_ticker_universe, path=tmp_path / "missing.yaml")
 
     assert saved is None
-    assert tickers == list(config.default_ticker_universe)
+    assert tickers == EXPECTED_DEFAULT_PORTFOLIO
+    assert "SEMI.AS" in tickers
+    assert "SEMI.AEB" not in tickers
 
 
 def test_resolve_uses_saved_portfolio_when_file_exists(tmp_path: Path) -> None:
