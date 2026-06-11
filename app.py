@@ -28,6 +28,13 @@ from src.features.technical import build_technical_features
 from src.features.wavelet import rolling_wavelet_features
 from src.ml.datasets import build_supervised_panel, feature_group_columns
 from src.ml.diagnostics import build_ml_diagnostics
+from src.ml.interpretations import (
+    DiagnosticInterpretation,
+    interpret_drawdown_calibration,
+    interpret_ml_diagnostics_summary,
+    interpret_ml_score_buckets,
+    ml_signal_health_interpretation,
+)
 from src.ml.metrics import calibration_table, confusion_matrix_frame, score_quintile_analysis
 from src.ml.models import MODEL_OPTIONS
 from src.ml.scoring import current_ml_score_table
@@ -57,7 +64,6 @@ DECISION_TABLE_COLUMN_LABELS = {
     "One-line reason": "Reason",
 }
 BENCHMARK_OPTIONS = ["SPY", "QQQ", "SMH", "SOXX"]
-MIN_ML_HEALTH_BUCKET_COUNT = 5
 
 
 @st.cache_data(show_spinner=False)
@@ -201,153 +207,16 @@ def styled_decision_table(table: pd.DataFrame):
     )
 
 
-def _numeric_or_none(value: object) -> float | None:
-    """Return a numeric value when Streamlit diagnostics have one."""
+def show_diagnostic_interpretation(interpretation: DiagnosticInterpretation) -> None:
+    """Render display-only diagnostics interpretation text."""
 
-    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    return float(numeric) if pd.notna(numeric) else None
-
-
-def _format_percent(value: float | None) -> str:
-    return "N/A" if value is None else f"{value:.1%}"
-
-
-def _format_signed_percent(value: float | None) -> str:
-    return "N/A" if value is None else f"{value:+.1%}"
-
-
-def _diagnostic_bucket_row(score_buckets: pd.DataFrame, bucket: str) -> pd.Series | None:
-    if score_buckets.empty or "score_bucket" not in score_buckets:
-        return None
-    bucket_rows = score_buckets[score_buckets["score_bucket"].astype(str) == bucket]
-    return None if bucket_rows.empty else bucket_rows.iloc[0]
-
-
-def _drawdown_risk_calibration_health(calibration: pd.DataFrame) -> str:
-    required = {"average_probability", "observed_drawdown_risk_rate", "count"}
-    if calibration.empty or not required.issubset(calibration.columns):
-        return "Insufficient data"
-
-    data = calibration.dropna(subset=["average_probability", "observed_drawdown_risk_rate"]).copy()
-    data = data[data["count"] > 0].sort_values("average_probability")
-    if len(data) < 2:
-        return "Insufficient data"
-
-    low_risk_rate = _numeric_or_none(data.iloc[0]["observed_drawdown_risk_rate"])
-    high_risk_rate = _numeric_or_none(data.iloc[-1]["observed_drawdown_risk_rate"])
-    if low_risk_rate is None or high_risk_rate is None:
-        return "Insufficient data"
-
-    risk_spread = high_risk_rate - low_risk_rate
-    if risk_spread > 0.02:
-        return "Rises with predicted risk"
-    if risk_spread < -0.02:
-        return "Looks inverted"
-    return "Unclear"
-
-
-def ml_signal_health_interpretation(diagnostics) -> tuple[str, str, pd.DataFrame]:
-    """Summarize existing ML diagnostics without changing production logic."""
-
-    score_buckets = diagnostics.score_buckets
-    low_bucket = _diagnostic_bucket_row(score_buckets, "Low")
-    high_bucket = _diagnostic_bucket_row(score_buckets, "High")
-    calibration_health = _drawdown_risk_calibration_health(diagnostics.drawdown_risk_calibration)
-
-    empty_metrics = pd.DataFrame(
-        [
-            {"Metric": "Top score bucket hit rate", "Value": "N/A"},
-            {"Metric": "Bottom score bucket hit rate", "Value": "N/A"},
-            {"Metric": "Top-minus-bottom hit-rate spread", "Value": "N/A"},
-            {"Metric": "Top score bucket average forward return", "Value": "N/A"},
-            {"Metric": "Bottom score bucket average forward return", "Value": "N/A"},
-            {"Metric": "Return spread", "Value": "N/A"},
-            {"Metric": "Drawdown-risk calibration", "Value": calibration_health},
-        ]
-    )
-    if low_bucket is None or high_bucket is None:
-        return (
-            "Insufficient data",
-            "The diagnostics-only score buckets are missing low or high bucket observations in this walk-forward sample.",
-            empty_metrics,
-        )
-
-    low_count = _numeric_or_none(low_bucket.get("count"))
-    high_count = _numeric_or_none(high_bucket.get("count"))
-    top_hit_rate = _numeric_or_none(high_bucket.get("outperformance_hit_rate"))
-    bottom_hit_rate = _numeric_or_none(low_bucket.get("outperformance_hit_rate"))
-    top_return = _numeric_or_none(high_bucket.get("average_forward_return"))
-    bottom_return = _numeric_or_none(low_bucket.get("average_forward_return"))
-
-    hit_spread = (
-        top_hit_rate - bottom_hit_rate
-        if top_hit_rate is not None and bottom_hit_rate is not None
-        else None
-    )
-    return_spread = (
-        top_return - bottom_return
-        if top_return is not None and bottom_return is not None
-        else None
-    )
-
-    metrics = pd.DataFrame(
-        [
-            {"Metric": "Top score bucket hit rate", "Value": _format_percent(top_hit_rate)},
-            {"Metric": "Bottom score bucket hit rate", "Value": _format_percent(bottom_hit_rate)},
-            {"Metric": "Top-minus-bottom hit-rate spread", "Value": _format_signed_percent(hit_spread)},
-            {"Metric": "Top score bucket average forward return", "Value": _format_percent(top_return)},
-            {"Metric": "Bottom score bucket average forward return", "Value": _format_percent(bottom_return)},
-            {"Metric": "Return spread", "Value": _format_signed_percent(return_spread)},
-            {"Metric": "Drawdown-risk calibration", "Value": calibration_health},
-        ]
-    )
-
-    if (
-        low_count is None
-        or high_count is None
-        or low_count < MIN_ML_HEALTH_BUCKET_COUNT
-        or high_count < MIN_ML_HEALTH_BUCKET_COUNT
-    ):
-        return (
-            "Insufficient data",
-            (
-                "The low and high ML score buckets are too small for a useful diagnostics-only read "
-                f"in this walk-forward sample (minimum {MIN_ML_HEALTH_BUCKET_COUNT} observations each)."
-            ),
-            metrics,
-        )
-
-    hit_positive = hit_spread is not None and hit_spread > 0
-    return_positive = return_spread is not None and return_spread > 0
-    if hit_positive and return_positive:
-        verdict = "Healthy"
-        reason = (
-            "The high ML score bucket appears better than the low bucket on both hit rate and average "
-            "forward return in this walk-forward sample."
-        )
-    elif hit_positive or return_positive:
-        verdict = "Mixed"
-        reason = (
-            "The high ML score bucket appears better on one diagnostics-only outcome, but the other "
-            "outcome is weak, noisy, or unavailable in this walk-forward sample."
-        )
+    message = f"**{interpretation.label}** - {interpretation.message}"
+    if interpretation.level == "success":
+        st.success(message)
+    elif interpretation.level == "warning":
+        st.warning(message)
     else:
-        verdict = "Weak"
-        reason = (
-            "The high ML score bucket does not appear to outperform the low bucket on hit rate or "
-            "average forward return in this walk-forward sample."
-        )
-
-    if calibration_health == "Rises with predicted risk":
-        reason += " Drawdown-risk calibration rises with predicted risk."
-    elif calibration_health == "Looks inverted":
-        reason += " Drawdown-risk calibration looks inverted, so treat the risk read as a caveat."
-    elif calibration_health == "Unclear":
-        reason += " Drawdown-risk calibration is unclear, so treat the risk read as a caveat."
-    else:
-        reason += " Drawdown-risk calibration has insufficient data."
-
-    return verdict, reason, metrics
+        st.info(message)
 
 
 config = load_decision_config()
@@ -739,10 +608,15 @@ with research_tab:
                                 "These tables do not change Decision Mode logic."
                             )
                             st.dataframe(diagnostics.summary, width="stretch")
+                            show_diagnostic_interpretation(interpret_ml_diagnostics_summary(diagnostics.summary))
                             st.write("**ML score buckets**")
                             st.dataframe(diagnostics.score_buckets, width="stretch")
+                            show_diagnostic_interpretation(interpret_ml_score_buckets(diagnostics.score_buckets))
                             st.write("**Drawdown-risk calibration**")
                             st.dataframe(diagnostics.drawdown_risk_calibration, width="stretch")
+                            show_diagnostic_interpretation(
+                                interpret_drawdown_calibration(diagnostics.drawdown_risk_calibration)
+                            )
                     except Exception as exc:
                         st.warning(f"ML diagnostics could not be built: {exc}")
 
