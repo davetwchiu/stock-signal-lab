@@ -19,6 +19,18 @@ class DiagnosticInterpretation:
     level: str = "info"
 
 
+@dataclass(frozen=True)
+class ResearchLabRunInterpretation:
+    """Display-only interpretation of an existing Research Lab run."""
+
+    overall: str
+    walk_forward_validation: str
+    ml_score_buckets: str
+    drawdown_risk_calibration: str
+    use: str
+    level: str = "info"
+
+
 def _numeric_or_none(value: object) -> float | None:
     numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     return float(numeric) if pd.notna(numeric) else None
@@ -213,6 +225,163 @@ def interpret_ml_diagnostics_summary(summary: pd.DataFrame) -> DiagnosticInterpr
         (
             "The summary has enough walk-forward coverage to review the diagnostics, but it only affects "
             "confidence in the research evidence. It does not create buy or sell instructions."
+        ),
+    )
+
+
+def _summary_target_row(summary: pd.DataFrame, target: str) -> pd.Series | None:
+    if summary.empty or "target" not in summary:
+        return None
+    rows = summary[summary["target"].astype(str) == target]
+    return None if rows.empty else rows.iloc[0]
+
+
+def _walk_forward_validation_read(summary: pd.DataFrame) -> tuple[str, str]:
+    row = _summary_target_row(summary, "outperformance")
+    if row is None:
+        return (
+            "insufficient",
+            "The walk-forward validation summary is missing, so this run is inconclusive.",
+        )
+
+    predictions = _numeric_or_none(row.get("predictions"))
+    folds = _numeric_or_none(row.get("folds"))
+    if (
+        predictions is None
+        or folds is None
+        or predictions < MIN_ML_HEALTH_BUCKET_COUNT * 2
+        or folds < 2
+    ):
+        return (
+            "insufficient",
+            "The walk-forward sample is too small for a firm read.",
+        )
+
+    roc_auc = _numeric_or_none(row.get("roc_auc"))
+    f1 = _numeric_or_none(row.get("f1"))
+    if roc_auc is None and f1 is None:
+        return (
+            "mixed",
+            "The walk-forward run has enough coverage to review, but the headline validation metrics are incomplete.",
+        )
+    if (roc_auc is not None and roc_auc >= 0.58) and (f1 is None or f1 >= 0.45):
+        return (
+            "useful",
+            "Walk-forward validation has usable directional evidence in this sample.",
+        )
+    if (roc_auc is not None and roc_auc < 0.50) and (f1 is not None and f1 < 0.35):
+        return (
+            "weak",
+            "Walk-forward validation is weak in this sample.",
+        )
+    return (
+        "mixed",
+        "Walk-forward validation is mixed, so the run is useful for review but not strong evidence by itself.",
+    )
+
+
+def _score_bucket_read(score_buckets: pd.DataFrame) -> tuple[str, str]:
+    interpretation = interpret_ml_score_buckets(score_buckets)
+    if interpretation.label == "Good separation":
+        return (
+            "useful",
+            "High-score buckets outperformed low-score buckets, so the ML score has useful ranking evidence in this sample.",
+        )
+    if interpretation.label == "Insufficient sample":
+        return (
+            "insufficient",
+            "The ML score buckets have too little usable data for a firm read.",
+        )
+    if interpretation.label == "Weak separation":
+        return (
+            "weak",
+            "High-score buckets did not clearly outperform low-score buckets, so the ML score has weak ranking evidence in this sample.",
+        )
+    if interpretation.label == "Treat ML score cautiously":
+        return (
+            "weak",
+            "High-score buckets performed worse than low-score buckets, so the ML score has weak ranking evidence in this sample.",
+        )
+    return (
+        "mixed",
+        "ML score buckets separate on some outcomes but not others, so the ranking evidence is mixed.",
+    )
+
+
+def _drawdown_calibration_read(calibration: pd.DataFrame) -> tuple[str, str]:
+    interpretation = interpret_drawdown_calibration(calibration)
+    if interpretation.label == "Risk calibration looks useful":
+        return (
+            "useful",
+            "Drawdown-risk buckets separate actual drawdowns reasonably well, so the risk signal is useful as a caution flag.",
+        )
+    if interpretation.label == "Insufficient sample":
+        return (
+            "insufficient",
+            "The drawdown-risk calibration sample is too small or incomplete for a firm read.",
+        )
+    return (
+        "weak",
+        "Drawdown-risk buckets do not clearly separate actual drawdowns in this sample.",
+    )
+
+
+def interpret_research_lab_run(
+    diagnostics_summary: pd.DataFrame,
+    score_buckets: pd.DataFrame,
+    drawdown_risk_calibration: pd.DataFrame,
+) -> ResearchLabRunInterpretation:
+    """Summarize an existing walk-forward diagnostics run without changing calculations."""
+
+    validation_status, validation_message = _walk_forward_validation_read(diagnostics_summary)
+    score_status, score_message = _score_bucket_read(score_buckets)
+    drawdown_status, drawdown_message = _drawdown_calibration_read(drawdown_risk_calibration)
+    statuses = [validation_status, score_status, drawdown_status]
+
+    if "insufficient" in statuses:
+        return ResearchLabRunInterpretation(
+            overall="Inconclusive research evidence.",
+            walk_forward_validation=validation_message,
+            ml_score_buckets=score_message,
+            drawdown_risk_calibration=drawdown_message,
+            use=(
+                "The sample is too small or incomplete for confidence. This does not change Decision Mode; "
+                "treat the research evidence cautiously."
+            ),
+            level="warning",
+        )
+    if statuses.count("useful") == 3:
+        return ResearchLabRunInterpretation(
+            overall="Usable but not strong research evidence.",
+            walk_forward_validation=validation_message,
+            ml_score_buckets=score_message,
+            drawdown_risk_calibration=drawdown_message,
+            use=(
+                "This supports using ML score and drawdown risk as secondary research evidence. "
+                "This does not change Decision Mode."
+            ),
+            level="success",
+        )
+    if statuses.count("weak") >= 2:
+        return ResearchLabRunInterpretation(
+            overall="Weak research evidence.",
+            walk_forward_validation=validation_message,
+            ml_score_buckets=score_message,
+            drawdown_risk_calibration=drawdown_message,
+            use=(
+                "The diagnostics are too weak for confidence. This does not change Decision Mode; "
+                "treat the research evidence cautiously."
+            ),
+            level="warning",
+        )
+    return ResearchLabRunInterpretation(
+        overall="Mixed research evidence.",
+        walk_forward_validation=validation_message,
+        ml_score_buckets=score_message,
+        drawdown_risk_calibration=drawdown_message,
+        use=(
+            "Use ML score and drawdown risk only as secondary research context. "
+            "This does not change Decision Mode."
         ),
     )
 

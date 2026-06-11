@@ -30,8 +30,10 @@ from src.ml.datasets import build_supervised_panel, feature_group_columns
 from src.ml.diagnostics import build_ml_diagnostics
 from src.ml.interpretations import (
     DiagnosticInterpretation,
+    ResearchLabRunInterpretation,
     interpret_drawdown_calibration,
     interpret_ml_diagnostics_summary,
+    interpret_research_lab_run,
     interpret_ml_score_buckets,
     ml_signal_health_interpretation,
 )
@@ -225,6 +227,27 @@ def show_diagnostic_interpretation(interpretation: DiagnosticInterpretation) -> 
     """Render display-only diagnostics interpretation text."""
 
     message = f"**{interpretation.label}** - {interpretation.message}"
+    if interpretation.level == "success":
+        st.success(message)
+    elif interpretation.level == "warning":
+        st.warning(message)
+    else:
+        st.info(message)
+
+
+def show_research_lab_run_interpretation(interpretation: ResearchLabRunInterpretation) -> None:
+    """Render a compact whole-run Research Lab interpretation."""
+
+    message = "\n\n".join(
+        [
+            "**How to read this run**",
+            f"**Overall:** {interpretation.overall}",
+            f"**Walk-forward validation:** {interpretation.walk_forward_validation}",
+            f"**ML score buckets:** {interpretation.ml_score_buckets}",
+            f"**Drawdown-risk calibration:** {interpretation.drawdown_risk_calibration}",
+            f"**Use:** {interpretation.use}",
+        ]
+    )
     if interpretation.level == "success":
         st.success(message)
     elif interpretation.level == "warning":
@@ -601,6 +624,13 @@ with research_tab:
                                 risk_result.predictions,
                                 result.overall_metrics,
                                 risk_result.overall_metrics,
+                            )
+                            show_research_lab_run_interpretation(
+                                interpret_research_lab_run(
+                                    diagnostics.summary,
+                                    diagnostics.score_buckets,
+                                    diagnostics.drawdown_risk_calibration,
+                                )
                             )
                             verdict, reason, health_metrics = ml_signal_health_interpretation(diagnostics)
                             st.write("**ML signal health**")
