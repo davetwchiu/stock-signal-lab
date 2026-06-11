@@ -43,32 +43,113 @@ def confidence_from_score(score: float, drawdown_risk_probability: float) -> str
     return "Low"
 
 
+def _clean_float(value: object) -> float | None:
+    if pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _score_phrase(score: object) -> str:
+    value = _clean_float(score)
+    if value is None:
+        return "ML score unavailable"
+    rounded = round(value)
+    if value >= 80:
+        level = "very high"
+    elif value >= 60:
+        level = "constructive"
+    elif value >= 40:
+        level = "mixed"
+    elif value >= 20:
+        level = "weak"
+    else:
+        level = "very weak"
+    return f"{level} ML score {rounded:.0f}"
+
+
+def _risk_phrase(risk: object) -> str:
+    value = _clean_float(risk)
+    if value is None:
+        return "drawdown risk unavailable"
+    if value >= 0.60:
+        level = "high"
+    elif value >= 0.40:
+        level = "elevated"
+    elif value >= 0.25:
+        level = "moderate"
+    else:
+        level = "low"
+    return f"{level} drawdown risk {value:.0%}"
+
+
+def _regime_phrase(regime: object) -> str:
+    text = str(regime).strip()
+    if not text:
+        return "trend regime unavailable"
+    lowered = text.lower()
+    if "downtrend" in lowered:
+        return "weak downtrend regime"
+    if "distribution" in lowered:
+        return "distribution regime"
+    if "sideways" in lowered:
+        return "sideways low-conviction regime"
+    if "uptrend" in lowered and "high" in lowered:
+        return "uptrend with higher volatility"
+    if "uptrend" in lowered and "low" in lowered:
+        return "bullish low-volatility trend"
+    return f"{text} regime"
+
+
+def _relative_strength_phrase(rank: object) -> str | None:
+    value = _clean_float(rank)
+    if value is None:
+        return None
+    if value.is_integer():
+        rank_text = f"#{int(value)}"
+    else:
+        rank_text = f"#{value:.1f}"
+    return f"relative strength rank {rank_text}"
+
+
+def _action_position_phrase(action: object, target_bucket: object) -> str:
+    action_text = str(action or "Watch").strip() or "Watch"
+    bucket = str(target_bucket or "0%").strip() or "0%"
+    if action_text == "Add":
+        return f"Add toward {bucket} of max position"
+    if action_text == "Hold":
+        return f"Hold near {bucket} of max position"
+    if action_text == "Trim":
+        return f"Trim toward {bucket} of max position"
+    if action_text == "Exit":
+        return f"Exit; target {bucket} exposure"
+    if action_text == "Watch":
+        return f"Watch; target {bucket} exposure"
+    return f"{action_text}; target {bucket} exposure"
+
+
 def one_line_reason(row: pd.Series) -> str:
     """Generate a concise reason for the decision table."""
 
     action = row.get("Suggested action", row.get("Suggested Action", "Watch"))
+    target_bucket = row.get("Target exposure bucket", row.get("Target Exposure Bucket", "0%"))
     regime = str(row.get("Rule-based regime", row.get("Rule-Based Regime", "")))
     score = row.get("ML score", row.get("ML Score", pd.NA))
     risk = row.get("Drawdown-risk probability", row.get("ML Drawdown-Risk Probability", pd.NA))
     rs_rank = row.get("Relative strength rank", pd.NA)
 
-    if action == "Add":
-        return "Strong score with acceptable drawdown risk and supportive trend."
-    if action == "Hold":
-        return "Evidence is constructive, but risk or conviction does not justify adding."
-    if action == "Trim":
-        return "Target exposure is lower than current exposure because risk has risen."
-    if action == "Exit":
-        return "Risk controls call for no exposure under the current setup."
-    if "Downtrend" in regime:
-        return "Trend regime is weak, so the ticker stays on watch."
-    if pd.notna(score) and score < 40:
-        return "ML score is not strong enough for fresh exposure."
-    if pd.notna(risk) and risk >= 0.60:
-        return "Drawdown-risk probability is too high for new exposure."
-    if pd.notna(rs_rank):
-        return "Waiting for stronger relative strength or lower drawdown risk."
-    return "Insufficient conviction for active exposure."
+    parts = [
+        _action_position_phrase(action, target_bucket),
+        _regime_phrase(regime),
+        _score_phrase(score),
+        _risk_phrase(risk),
+    ]
+    rs_phrase = _relative_strength_phrase(rs_rank)
+    if rs_phrase:
+        parts.append(rs_phrase)
+    return "; ".join(parts) + "."
 
 
 def build_decision_table(
@@ -143,4 +224,3 @@ def action_counts(decision_table: pd.DataFrame) -> dict[str, int]:
 
     counts = decision_table.get("Suggested action", pd.Series(dtype=str)).value_counts().to_dict()
     return {action: int(counts.get(action, 0)) for action in ACTION_ORDER}
-
