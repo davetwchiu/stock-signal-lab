@@ -27,6 +27,7 @@ from src.features.regime import classify_regime
 from src.features.technical import build_technical_features
 from src.features.wavelet import rolling_wavelet_features
 from src.ml.datasets import build_supervised_panel, feature_group_columns
+from src.ml.diagnostics import build_ml_diagnostics
 from src.ml.metrics import calibration_table, confusion_matrix_frame, score_quintile_analysis
 from src.ml.models import MODEL_OPTIONS
 from src.ml.scoring import current_ml_score_table
@@ -493,6 +494,11 @@ with research_tab:
         step = st.number_input("Step size", min_value=20, max_value=252, value=63, step=21)
         embargo = st.number_input("Embargo gap", min_value=0, max_value=60, value=20, step=5)
         probability_threshold = st.slider("Classification threshold", 0.05, 0.95, 0.50, 0.05)
+        show_ml_diagnostics = st.checkbox(
+            "Show ML signal diagnostics",
+            value=False,
+            help="Run extra research-only diagnostics for existing walk-forward ML signal outputs.",
+        )
         run_validation = st.button("Run walk-forward validation")
 
         if run_validation and benchmark_frame is not None and not supervised.empty:
@@ -534,6 +540,38 @@ with research_tab:
                     probability_threshold=float(probability_threshold),
                 )
                 st.dataframe(comparison, width="stretch")
+
+                if show_ml_diagnostics:
+                    st.write("**ML diagnostics summary**")
+                    st.caption("Research-only diagnostics for existing walk-forward signal outputs. These tables do not change Decision Mode logic.")
+                    try:
+                        risk_result = walk_forward_validate_classifier(
+                            supervised,
+                            columns,
+                            label_column=f"label_drawdown_risk_{config.default_label_horizon}d",
+                            model_name=model_name,
+                            train_window=int(train_window),
+                            test_window=int(test_window),
+                            step=int(step),
+                            embargo=int(embargo),
+                            probability_threshold=float(probability_threshold),
+                        )
+                        if risk_result.predictions.empty:
+                            st.warning("No drawdown-risk predictions were available for ML diagnostics.")
+                        else:
+                            diagnostics = build_ml_diagnostics(
+                                result.predictions,
+                                risk_result.predictions,
+                                result.overall_metrics,
+                                risk_result.overall_metrics,
+                            )
+                            st.dataframe(diagnostics.summary, width="stretch")
+                            st.write("**ML score buckets**")
+                            st.dataframe(diagnostics.score_buckets, width="stretch")
+                            st.write("**Drawdown-risk calibration**")
+                            st.dataframe(diagnostics.drawdown_risk_calibration, width="stretch")
+                    except Exception as exc:
+                        st.warning(f"ML diagnostics could not be built: {exc}")
 
     with st.expander("Feature ablation, portfolio simulation, and robustness", expanded=False):
         run_ablation = st.button("Run feature ablation")
