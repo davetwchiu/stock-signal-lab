@@ -35,6 +35,18 @@ REGIME_SEGMENTED_COLUMNS = [
     "interpretation",
 ]
 
+DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS = [
+    "sample_size",
+    "mean_predicted_risk",
+    "observed_drawdown_rate",
+    "calibration_gap",
+    "mean_absolute_calibration_error",
+    "max_bucket_calibration_gap",
+    "brier_score",
+    "monotonicity",
+    "interpretation",
+]
+
 DEFAULT_REGIME_COLUMNS = (
     "market_regime",
     "regime",
@@ -69,6 +81,7 @@ class MLDiagnostics:
     summary: pd.DataFrame
     baseline_comparison: pd.DataFrame
     regime_segmented: pd.DataFrame
+    drawdown_risk_calibration_quality: pd.DataFrame
 
 
 def _overall_summary(
@@ -130,6 +143,126 @@ def _empty_baseline_comparison() -> pd.DataFrame:
 
 def _empty_regime_segmented_diagnostics() -> pd.DataFrame:
     return pd.DataFrame(columns=REGIME_SEGMENTED_COLUMNS)
+
+
+def _empty_drawdown_risk_calibration_quality() -> pd.DataFrame:
+    return pd.DataFrame(columns=DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS)
+
+
+def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
+    return float((values * weights).sum() / weights.sum())
+
+
+def _brier_score(
+    predictions: pd.DataFrame | None,
+    probability_column: str,
+    label_column: str,
+) -> object:
+    if predictions is None or predictions.empty:
+        return pd.NA
+    if probability_column not in predictions or label_column not in predictions:
+        return pd.NA
+
+    data = predictions.dropna(subset=[probability_column, label_column]).copy()
+    if data.empty:
+        return pd.NA
+    probability = pd.to_numeric(data[probability_column], errors="coerce")
+    actual = pd.to_numeric(data[label_column], errors="coerce")
+    usable = pd.DataFrame({"probability": probability, "actual": actual}).dropna()
+    if usable.empty:
+        return pd.NA
+    return float(((usable["probability"] - usable["actual"]) ** 2).mean())
+
+
+def _calibration_quality_interpretation(
+    sample_size: int,
+    calibration_gap: float,
+    mean_absolute_error: float,
+    max_bucket_gap: float,
+    monotonicity: str,
+    min_sample_size: int,
+) -> str:
+    if sample_size < min_sample_size:
+        return "The sample is too small for reliable calibration quality assessment."
+    if monotonicity == "not clearly monotonic":
+        return "Higher predicted-risk buckets do not show clearly higher realised drawdown rates."
+    if calibration_gap > 0.10:
+        return "The model appears to underestimate realised drawdown risk in this sample."
+    if calibration_gap < -0.10:
+        return "The model appears to overestimate realised drawdown risk in this sample."
+    if mean_absolute_error > 0.15 or max_bucket_gap > 0.25:
+        return "Drawdown-risk calibration is weak in this sample."
+    return "Drawdown-risk calibration looks broadly aligned in this sample."
+
+
+def build_drawdown_risk_calibration_quality(
+    calibration: pd.DataFrame,
+    predictions: pd.DataFrame | None = None,
+    *,
+    probability_column: str = "probability",
+    label_column: str = "actual",
+    min_sample_size: int = 20,
+) -> pd.DataFrame:
+    """Return compact diagnostics describing drawdown-risk calibration quality."""
+
+    required = ["count", "average_probability", "observed_drawdown_risk_rate"]
+    if calibration.empty or any(column not in calibration for column in required):
+        return _empty_drawdown_risk_calibration_quality()
+
+    data = calibration[required].copy()
+    data["count"] = pd.to_numeric(data["count"], errors="coerce")
+    data["average_probability"] = pd.to_numeric(data["average_probability"], errors="coerce")
+    data["observed_drawdown_risk_rate"] = pd.to_numeric(
+        data["observed_drawdown_risk_rate"],
+        errors="coerce",
+    )
+    data = data.dropna(subset=required)
+    data = data[data["count"] > 0]
+    if data.empty:
+        return _empty_drawdown_risk_calibration_quality()
+
+    sample_size = int(data["count"].sum())
+    if sample_size <= 0:
+        return _empty_drawdown_risk_calibration_quality()
+
+    data = data.sort_values("average_probability")
+    mean_predicted = _weighted_average(data["average_probability"], data["count"])
+    observed_rate = _weighted_average(data["observed_drawdown_risk_rate"], data["count"])
+    bucket_gaps = data["observed_drawdown_risk_rate"] - data["average_probability"]
+    mean_absolute_error = _weighted_average(bucket_gaps.abs(), data["count"])
+    max_bucket_gap = float(bucket_gaps.abs().max())
+    observed_diffs = data["observed_drawdown_risk_rate"].diff().dropna()
+    monotonicity = (
+        "higher buckets aligned"
+        if len(data) >= 2 and bool((observed_diffs >= -1e-12).all())
+        else "not clearly monotonic"
+    )
+    calibration_gap = float(observed_rate - mean_predicted)
+    interpretation = _calibration_quality_interpretation(
+        sample_size,
+        calibration_gap,
+        mean_absolute_error,
+        max_bucket_gap,
+        monotonicity,
+        min_sample_size,
+    )
+
+    return pd.DataFrame(
+        [
+            {
+                "sample_size": sample_size,
+                "mean_predicted_risk": mean_predicted,
+                "observed_drawdown_rate": observed_rate,
+                "calibration_gap": calibration_gap,
+                "mean_absolute_calibration_error": mean_absolute_error,
+                "max_bucket_calibration_gap": max_bucket_gap,
+                "brier_score": _brier_score(predictions, probability_column, label_column),
+                "monotonicity": monotonicity,
+                "interpretation": interpretation,
+            }
+        ],
+        columns=DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS,
+    )
 
 
 def _comparison_direction(spread: object) -> str:
@@ -589,6 +722,7 @@ def build_ml_diagnostics(
             summary,
             _empty_baseline_comparison(),
             _empty_regime_segmented_diagnostics(),
+            _empty_drawdown_risk_calibration_quality(),
         )
 
     out_columns = [
@@ -621,6 +755,10 @@ def build_ml_diagnostics(
         label_column="actual",
         bins=risk_bins,
     ).rename(columns={"observed_rate": "observed_drawdown_risk_rate"})
+    risk_calibration_quality = build_drawdown_risk_calibration_quality(
+        risk_calibration,
+        drawdown_risk_predictions,
+    )
     summary = pd.DataFrame(
         [
             _overall_summary(outperformance_predictions, outperformance_metrics, "outperformance"),
@@ -633,4 +771,5 @@ def build_ml_diagnostics(
         summary,
         baseline_comparison,
         regime_segmented,
+        risk_calibration_quality,
     )

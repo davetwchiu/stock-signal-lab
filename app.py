@@ -720,6 +720,17 @@ with research_tab:
                             show_diagnostic_interpretation(
                                 interpret_drawdown_calibration(diagnostics.drawdown_risk_calibration)
                             )
+                            st.write("**Drawdown-risk calibration quality**")
+                            if diagnostics.drawdown_risk_calibration_quality.empty:
+                                st.info(
+                                    "Calibration quality metrics were unavailable for this walk-forward sample."
+                                )
+                            else:
+                                st.dataframe(
+                                    diagnostics.drawdown_risk_calibration_quality,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
                     except Exception as exc:
                         st.warning(f"ML diagnostics could not be built: {exc}")
 
