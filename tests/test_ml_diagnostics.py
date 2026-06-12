@@ -23,7 +23,7 @@ def validation_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
             "Date": dates,
             "Ticker": ["AAA", "BBB", "CCC", "AAA", "BBB", "CCC"],
             "actual": [0, 0, 0, 1, 1, 1],
-            "probability": [0.20, 0.30, 0.60, 0.65, 0.85, 0.90],
+            "probability": [0.90, 0.85, 0.65, 0.60, 0.30, 0.20],
             "prediction": [0, 0, 1, 1, 1, 1],
             "forward_return": [-0.05, -0.02, 0.01, 0.03, 0.08, 0.10],
             "forward_excess_return": [-0.08, -0.04, -0.01, 0.02, 0.06, 0.09],
