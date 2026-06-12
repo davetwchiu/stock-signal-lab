@@ -148,8 +148,10 @@ def load_daily_data(
 
     if use_cache:
         cached = read_cached(ticker, cache_dir)
-        if cached is not None and cache_satisfies(cached, start, end):
-            return filter_dates(cached, start, end)
+        if cached is not None:
+            cached = normalize_ohlcv(cached)
+            if cache_satisfies(cached, start, end):
+                return filter_dates(cached, start, end)
 
     active_provider = provider or YFinanceProvider()
     data = active_provider.fetch_daily(ticker, start, end)
@@ -180,4 +182,3 @@ def load_universe(
             use_cache=use_cache,
         )
     return frames
-
