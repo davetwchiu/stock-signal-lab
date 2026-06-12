@@ -47,6 +47,43 @@ DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS = [
     "interpretation",
 ]
 
+LABEL_PREVALENCE_COLUMNS = [
+    "label",
+    "sample_size",
+    "positive_count",
+    "positive_rate",
+    "missing_count",
+    "missing_rate",
+    "class_balance",
+    "interpretation",
+]
+
+LABEL_THRESHOLD_SENSITIVITY_COLUMNS = [
+    "target_family",
+    "threshold",
+    "sample_size",
+    "positive_count",
+    "positive_rate",
+    "interpretation",
+]
+
+LABEL_DISTRIBUTION_COLUMNS = [
+    "group",
+    "label",
+    "sample_size",
+    "positive_rate",
+    "class_balance",
+    "interpretation",
+]
+
+LABEL_OVERLAP_COLUMNS = [
+    "outperform_label",
+    "drawdown_risk_label",
+    "sample_size",
+    "share_of_total",
+    "interpretation",
+]
+
 DEFAULT_REGIME_COLUMNS = (
     "market_regime",
     "regime",
@@ -70,6 +107,12 @@ MIN_BASELINE_BUCKET_COUNT = 5
 MIN_REGIME_BUCKET_COUNT = 5
 MIN_REGIME_SAMPLE_COUNT = 20
 SPREAD_SIMILARITY_TOLERANCE = 0.0025
+DEFAULT_OUTPERFORMANCE_THRESHOLDS = (0.00, 0.01, 0.02, 0.03, 0.05)
+DEFAULT_DRAWDOWN_THRESHOLDS = (-0.05, -0.10, -0.15, -0.20)
+MIN_LABEL_AUDIT_SAMPLE_SIZE = 20
+LABEL_SPARSE_RATE = 0.10
+LABEL_COMMON_RATE = 0.90
+LABEL_GROUP_VARIATION_THRESHOLD = 0.25
 
 
 @dataclass(frozen=True)
@@ -82,6 +125,18 @@ class MLDiagnostics:
     baseline_comparison: pd.DataFrame
     regime_segmented: pd.DataFrame
     drawdown_risk_calibration_quality: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class MLLabelAudit:
+    """Read-only diagnostics for existing supervised ML labels."""
+
+    prevalence_summary: pd.DataFrame
+    return_threshold_sensitivity: pd.DataFrame
+    drawdown_threshold_sensitivity: pd.DataFrame
+    ticker_distribution: pd.DataFrame
+    regime_distribution: pd.DataFrame
+    label_overlap: pd.DataFrame
 
 
 def _overall_summary(
@@ -149,8 +204,349 @@ def _empty_drawdown_risk_calibration_quality() -> pd.DataFrame:
     return pd.DataFrame(columns=DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS)
 
 
+def _empty_label_prevalence_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=LABEL_PREVALENCE_COLUMNS)
+
+
+def _empty_label_threshold_sensitivity() -> pd.DataFrame:
+    return pd.DataFrame(columns=LABEL_THRESHOLD_SENSITIVITY_COLUMNS)
+
+
+def _empty_label_distribution() -> pd.DataFrame:
+    return pd.DataFrame(columns=LABEL_DISTRIBUTION_COLUMNS)
+
+
+def _empty_label_overlap() -> pd.DataFrame:
+    return pd.DataFrame(columns=LABEL_OVERLAP_COLUMNS)
+
+
 def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
     return float((values * weights).sum() / weights.sum())
+
+
+def _class_balance(positive_rate: object, sample_size: int) -> str:
+    if sample_size < MIN_LABEL_AUDIT_SAMPLE_SIZE or pd.isna(positive_rate):
+        return "insufficient"
+    if positive_rate <= 0.0 or positive_rate >= 1.0:
+        return "single class"
+    if positive_rate < LABEL_SPARSE_RATE:
+        return "sparse positive"
+    if positive_rate > LABEL_COMMON_RATE:
+        return "highly common positive"
+    return "balanced"
+
+
+def _label_balance_interpretation(positive_rate: object, sample_size: int) -> str:
+    balance = _class_balance(positive_rate, sample_size)
+    if balance == "insufficient":
+        return "The sample is too small for reliable label audit."
+    if balance == "single class":
+        return "This label has a single observed class in this sample."
+    if balance == "sparse positive":
+        return "This label is sparse in this sample."
+    if balance == "highly common positive":
+        return "This label is highly common in this sample."
+    return "This label has a balanced positive rate in this sample."
+
+
+def _coerced_label_values(data: pd.DataFrame, label: str) -> pd.Series:
+    return pd.to_numeric(data[label], errors="coerce")
+
+
+def _active_label_columns(data: pd.DataFrame, horizon: int) -> list[str]:
+    candidates = [
+        f"label_outperform_{horizon}d",
+        f"label_drawdown_risk_{horizon}d",
+    ]
+    return [column for column in candidates if column in data]
+
+
+def build_label_prevalence_summary(
+    panel: pd.DataFrame,
+    *,
+    horizon: int = 20,
+    label_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Summarize class balance for active supervised label columns."""
+
+    if panel.empty:
+        return _empty_label_prevalence_summary()
+
+    labels = list(label_columns or _active_label_columns(panel, horizon))
+    rows: list[dict[str, object]] = []
+    total = len(panel)
+    for label in labels:
+        if label not in panel:
+            continue
+        values = _coerced_label_values(panel, label)
+        sample_size = int(values.notna().sum())
+        positive_count = int((values == 1).sum())
+        positive_rate = float(positive_count / sample_size) if sample_size else pd.NA
+        missing_count = int(total - sample_size)
+        missing_rate = float(missing_count / total) if total else pd.NA
+        rows.append(
+            {
+                "label": label,
+                "sample_size": sample_size,
+                "positive_count": positive_count,
+                "positive_rate": positive_rate,
+                "missing_count": missing_count,
+                "missing_rate": missing_rate,
+                "class_balance": _class_balance(positive_rate, sample_size),
+                "interpretation": _label_balance_interpretation(positive_rate, sample_size),
+            }
+        )
+    if not rows:
+        return _empty_label_prevalence_summary()
+    return pd.DataFrame(rows, columns=LABEL_PREVALENCE_COLUMNS)
+
+
+def _threshold_interpretations(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not rows:
+        return rows
+    rates = pd.to_numeric(pd.Series([row["positive_rate"] for row in rows]), errors="coerce").dropna()
+    high_sensitivity = not rates.empty and float(rates.max() - rates.min()) >= LABEL_GROUP_VARIATION_THRESHOLD
+    interpreted: list[dict[str, object]] = []
+    for row in rows:
+        updated = row.copy()
+        sample_size = int(updated["sample_size"])
+        rate = updated["positive_rate"]
+        if sample_size < MIN_LABEL_AUDIT_SAMPLE_SIZE or pd.isna(rate):
+            interpretation = "The sample is too small for reliable label audit."
+        elif updated["target_family"] == "drawdown_risk" and rate < LABEL_SPARSE_RATE:
+            interpretation = "The drawdown-risk label is concentrated in a small number of observations."
+        else:
+            interpretation = _label_balance_interpretation(rate, sample_size)
+        if high_sensitivity and sample_size >= MIN_LABEL_AUDIT_SAMPLE_SIZE:
+            interpretation = "Threshold sensitivity is high; small threshold changes materially change class balance."
+        updated["interpretation"] = interpretation
+        interpreted.append(updated)
+    return interpreted
+
+
+def build_return_label_threshold_sensitivity(
+    panel: pd.DataFrame,
+    *,
+    horizon: int = 20,
+    thresholds: tuple[float, ...] = DEFAULT_OUTPERFORMANCE_THRESHOLDS,
+) -> pd.DataFrame:
+    """Audit how outperformance label prevalence changes across existing forward excess returns."""
+
+    column = f"forward_{horizon}d_excess_return"
+    if panel.empty or column not in panel:
+        return _empty_label_threshold_sensitivity()
+    values = pd.to_numeric(panel[column], errors="coerce").dropna()
+    if values.empty:
+        return _empty_label_threshold_sensitivity()
+
+    rows: list[dict[str, object]] = []
+    sample_size = int(len(values))
+    for threshold in thresholds:
+        positive_count = int((values > threshold).sum())
+        rows.append(
+            {
+                "target_family": "outperformance",
+                "threshold": float(threshold),
+                "sample_size": sample_size,
+                "positive_count": positive_count,
+                "positive_rate": float(positive_count / sample_size),
+                "interpretation": "",
+            }
+        )
+    return pd.DataFrame(_threshold_interpretations(rows), columns=LABEL_THRESHOLD_SENSITIVITY_COLUMNS)
+
+
+def build_drawdown_label_threshold_sensitivity(
+    panel: pd.DataFrame,
+    *,
+    horizon: int = 20,
+    thresholds: tuple[float, ...] = DEFAULT_DRAWDOWN_THRESHOLDS,
+) -> pd.DataFrame:
+    """Audit how drawdown-risk label prevalence changes across existing forward drawdowns."""
+
+    column = f"forward_{horizon}d_drawdown"
+    if panel.empty or column not in panel:
+        return _empty_label_threshold_sensitivity()
+    values = pd.to_numeric(panel[column], errors="coerce").dropna()
+    if values.empty:
+        return _empty_label_threshold_sensitivity()
+
+    rows: list[dict[str, object]] = []
+    sample_size = int(len(values))
+    for threshold in thresholds:
+        positive_count = int((values < threshold).sum())
+        rows.append(
+            {
+                "target_family": "drawdown_risk",
+                "threshold": float(threshold),
+                "sample_size": sample_size,
+                "positive_count": positive_count,
+                "positive_rate": float(positive_count / sample_size),
+                "interpretation": "",
+            }
+        )
+    return pd.DataFrame(_threshold_interpretations(rows), columns=LABEL_THRESHOLD_SENSITIVITY_COLUMNS)
+
+
+def _label_distribution_interpretation(
+    group_dimension: str,
+    positive_rate: object,
+    sample_size: int,
+    material_variation: bool,
+) -> str:
+    if sample_size < MIN_LABEL_AUDIT_SAMPLE_SIZE or pd.isna(positive_rate):
+        return "The sample is too small for reliable label audit."
+    if material_variation and group_dimension == "ticker":
+        return "Positive rates vary materially by ticker."
+    if material_variation and group_dimension == "regime":
+        return "Positive rates vary materially by regime."
+    return _label_balance_interpretation(positive_rate, sample_size)
+
+
+def build_label_distribution(
+    panel: pd.DataFrame,
+    group_column: str,
+    *,
+    group_dimension: str,
+    horizon: int = 20,
+    label_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Return label prevalence grouped by ticker or regime."""
+
+    if panel.empty or group_column not in panel:
+        return _empty_label_distribution()
+    labels = list(label_columns or _active_label_columns(panel, horizon))
+    if not labels:
+        return _empty_label_distribution()
+
+    data = panel.copy()
+    data[group_column] = data[group_column].astype(str).str.strip()
+    data = data[data[group_column] != ""]
+    if data.empty:
+        return _empty_label_distribution()
+
+    rows: list[dict[str, object]] = []
+    for label in labels:
+        if label not in data:
+            continue
+        label_values = _coerced_label_values(data, label)
+        rates_by_group: dict[str, float] = {}
+        group_rows: list[dict[str, object]] = []
+        for group, group_data in data.assign(_label=label_values).groupby(group_column, sort=True):
+            values = pd.to_numeric(group_data["_label"], errors="coerce").dropna()
+            sample_size = int(len(values))
+            if sample_size == 0:
+                continue
+            positive_rate = float((values == 1).sum() / sample_size)
+            rates_by_group[str(group)] = positive_rate
+            group_rows.append(
+                {
+                    "group": str(group),
+                    "label": label,
+                    "sample_size": sample_size,
+                    "positive_rate": positive_rate,
+                    "class_balance": _class_balance(positive_rate, sample_size),
+                    "interpretation": "",
+                }
+            )
+        if not group_rows:
+            continue
+        rates = list(rates_by_group.values())
+        material_variation = len(rates) >= 2 and max(rates) - min(rates) >= LABEL_GROUP_VARIATION_THRESHOLD
+        for row in group_rows:
+            row["interpretation"] = _label_distribution_interpretation(
+                group_dimension,
+                row["positive_rate"],
+                int(row["sample_size"]),
+                material_variation,
+            )
+            rows.append(row)
+    if not rows:
+        return _empty_label_distribution()
+    return pd.DataFrame(rows, columns=LABEL_DISTRIBUTION_COLUMNS)
+
+
+def build_return_drawdown_label_overlap(
+    panel: pd.DataFrame,
+    *,
+    horizon: int = 20,
+) -> pd.DataFrame:
+    """Summarize overlap between active outperformance and drawdown-risk labels."""
+
+    outperform_label = f"label_outperform_{horizon}d"
+    drawdown_label = f"label_drawdown_risk_{horizon}d"
+    if panel.empty or outperform_label not in panel or drawdown_label not in panel:
+        return _empty_label_overlap()
+
+    data = pd.DataFrame(
+        {
+            "outperform_label": _coerced_label_values(panel, outperform_label),
+            "drawdown_risk_label": _coerced_label_values(panel, drawdown_label),
+        }
+    ).dropna()
+    if data.empty:
+        return _empty_label_overlap()
+    data = data[data["outperform_label"].isin([0, 1]) & data["drawdown_risk_label"].isin([0, 1])]
+    if data.empty:
+        return _empty_label_overlap()
+
+    total = len(data)
+    rows: list[dict[str, object]] = []
+    for (out_value, risk_value), group in data.groupby(["outperform_label", "drawdown_risk_label"], sort=True):
+        sample_size = int(len(group))
+        share = float(sample_size / total)
+        if total < MIN_LABEL_AUDIT_SAMPLE_SIZE:
+            interpretation = "The sample is too small for reliable label audit."
+        elif risk_value == 1 and share < LABEL_SPARSE_RATE:
+            interpretation = "The drawdown-risk label is concentrated in a small number of observations."
+        else:
+            interpretation = "Return-vs-drawdown label overlap is available for this sample."
+        rows.append(
+            {
+                "outperform_label": int(out_value),
+                "drawdown_risk_label": int(risk_value),
+                "sample_size": sample_size,
+                "share_of_total": share,
+                "interpretation": interpretation,
+            }
+        )
+    return pd.DataFrame(rows, columns=LABEL_OVERLAP_COLUMNS)
+
+
+def _first_available_regime_column(
+    panel: pd.DataFrame,
+    regime_cols: tuple[str, ...] = DEFAULT_REGIME_COLUMNS,
+) -> str | None:
+    for column in regime_cols:
+        if column in panel and panel[column].notna().any():
+            return column
+    return None
+
+
+def build_ml_label_audit(panel: pd.DataFrame, *, horizon: int = 20) -> MLLabelAudit:
+    """Build compact read-only diagnostics for current supervised ML labels."""
+
+    prevalence = build_label_prevalence_summary(panel, horizon=horizon)
+    ticker_distribution = build_label_distribution(
+        panel,
+        "Ticker",
+        group_dimension="ticker",
+        horizon=horizon,
+    )
+    regime_column = _first_available_regime_column(panel)
+    regime_distribution = (
+        build_label_distribution(panel, regime_column, group_dimension="regime", horizon=horizon)
+        if regime_column is not None
+        else _empty_label_distribution()
+    )
+    return MLLabelAudit(
+        prevalence,
+        build_return_label_threshold_sensitivity(panel, horizon=horizon),
+        build_drawdown_label_threshold_sensitivity(panel, horizon=horizon),
+        ticker_distribution,
+        regime_distribution,
+        build_return_drawdown_label_overlap(panel, horizon=horizon),
+    )
 
 
 def _brier_score(

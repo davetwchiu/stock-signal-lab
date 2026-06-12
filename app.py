@@ -27,7 +27,7 @@ from src.features.regime import classify_regime
 from src.features.technical import build_technical_features
 from src.features.wavelet import rolling_wavelet_features
 from src.ml.datasets import build_supervised_panel, feature_group_columns
-from src.ml.diagnostics import build_ml_diagnostics
+from src.ml.diagnostics import MLLabelAudit, build_ml_diagnostics, build_ml_label_audit
 from src.ml.interpretations import (
     DiagnosticInterpretation,
     ResearchLabRunInterpretation,
@@ -254,6 +254,53 @@ def show_research_lab_run_interpretation(interpretation: ResearchLabRunInterpret
         st.warning(message)
     else:
         st.info(message)
+
+
+def _show_label_audit_table(title: str, data: pd.DataFrame, empty_message: str) -> None:
+    st.write(f"**{title}**")
+    if data.empty:
+        st.info(empty_message)
+    else:
+        st.dataframe(data, width="stretch", hide_index=True)
+
+
+def show_ml_label_audit(audit: MLLabelAudit) -> None:
+    """Render compact read-only supervised label diagnostics."""
+
+    with st.expander("ML label audit", expanded=False):
+        st.caption(
+            "Diagnostics-only review of current supervised labels and existing forward outcome columns."
+        )
+        _show_label_audit_table(
+            "Label prevalence summary",
+            audit.prevalence_summary,
+            "No active supervised label columns were available for this sample.",
+        )
+        _show_label_audit_table(
+            "Return-label threshold sensitivity",
+            audit.return_threshold_sensitivity,
+            "Forward excess-return outcomes were unavailable for threshold sensitivity.",
+        )
+        _show_label_audit_table(
+            "Drawdown-label threshold sensitivity",
+            audit.drawdown_threshold_sensitivity,
+            "Forward drawdown outcomes were unavailable for threshold sensitivity.",
+        )
+        _show_label_audit_table(
+            "Label distribution by ticker",
+            audit.ticker_distribution,
+            "Ticker-level label distribution was unavailable for this sample.",
+        )
+        _show_label_audit_table(
+            "Label distribution by regime",
+            audit.regime_distribution,
+            "Regime-level label distribution was unavailable for this sample.",
+        )
+        _show_label_audit_table(
+            "Return-vs-drawdown label overlap",
+            audit.label_overlap,
+            "Return and drawdown-risk labels were not both available for overlap diagnostics.",
+        )
 
 
 config = load_decision_config()
@@ -731,6 +778,12 @@ with research_tab:
                                     width="stretch",
                                     hide_index=True,
                                 )
+                            show_ml_label_audit(
+                                build_ml_label_audit(
+                                    supervised,
+                                    horizon=config.default_label_horizon,
+                                )
+                            )
                     except Exception as exc:
                         st.warning(f"ML diagnostics could not be built: {exc}")
 
