@@ -66,7 +66,7 @@ from src.utils.config import FeatureConfig
 st.set_page_config(page_title="Stock Signal Lab", layout="wide")
 
 DECISION_HELP = {
-    "ml_score": "A 0-100 read on relative strength and risk conditions. Higher means the setup looks more constructive; it is not a price target or guaranteed forecast.",
+    "ml_score": "Higher means the relative setup looks more constructive under current trend and risk conditions.",
     "drawdown": "Estimated chance of a meaningful pullback over the forward review window.",
     "action": "A plain-English action label based on trend, opportunity, pullback risk, relative strength, and risk controls.",
 }
@@ -208,6 +208,17 @@ def display_decision_table(table: pd.DataFrame) -> pd.DataFrame:
     return table.copy().rename(columns=DECISION_TABLE_COLUMN_LABELS)
 
 
+def _format_percent(value: float) -> str:
+    """Format a probability as a compact percentage for display."""
+
+    if pd.isna(value):
+        return ""
+    percent = float(value) * 100
+    if abs(percent - round(percent)) < 0.05:
+        return f"{percent:.0f}%"
+    return f"{percent:.1f}%"
+
+
 def _decision_display_column(table: pd.DataFrame, internal_column: str) -> str:
     """Resolve the visible column label used for styling."""
 
@@ -222,6 +233,12 @@ def styled_decision_table(table: pd.DataFrame):
         return table
     score_column = _decision_display_column(table, "ML score")
     risk_column = _decision_display_column(table, "Drawdown-risk probability")
+    rank_column = _decision_display_column(table, "Relative strength rank")
+    number_formats = {
+        score_column: "{:.0f}",
+        rank_column: "{:.0f}",
+        risk_column: _format_percent,
+    }
     return table.style.background_gradient(
         subset=[score_column],
         cmap="RdYlGn",
@@ -232,6 +249,8 @@ def styled_decision_table(table: pd.DataFrame):
         cmap="YlOrRd",
         vmin=0,
         vmax=1,
+    ).format(
+        {column: formatter for column, formatter in number_formats.items() if column in table.columns}
     )
 
 
@@ -410,10 +429,13 @@ with st.sidebar:
     default_start = default_end - timedelta(days=365 * 3)
     portfolio_lists = resolve_user_portfolio_lists(config.default_ticker_universe)
     portfolio_names = list(portfolio_lists.names)
+    st.write("**Portfolio lists**")
+    st.caption("Select a saved list, edit its tickers, then save changes to this device.")
     selected_portfolio_name = st.selectbox(
-        "Portfolio list",
+        "Active portfolio list",
         options=portfolio_names,
         index=portfolio_names.index(portfolio_lists.active.name),
+        help="Switch between named portfolio lists. The active list is saved locally.",
     )
     if selected_portfolio_name != portfolio_lists.active.name:
         portfolio_lists = set_active_user_portfolio_list(portfolio_lists, selected_portfolio_name)
@@ -428,18 +450,19 @@ with st.sidebar:
     end_date = default_end
 
     if portfolio_lists.source == "default":
-        st.caption("No saved portfolio stock list found; using system default list")
+        st.caption("No saved portfolio lists yet; using the system default list until you save one.")
     else:
-        st.caption(f"Using saved portfolio list: {active_portfolio.name} ({len(active_tickers)} tickers)")
+        st.caption(f"Using saved list: {active_portfolio.name} ({len(active_tickers)} tickers)")
     if st.session_state.get("portfolio_saved_message"):
         st.success(st.session_state.pop("portfolio_saved_message"))
+    st.write("**Edit active list**")
     portfolio_text = st.text_area(
-        "Portfolio stock list",
+        "Tickers",
         value=", ".join(active_tickers),
         key=f"portfolio_text_{active_portfolio.name}",
-        help="Paste comma-separated or newline-separated tickers. Click Save list to persist them locally.",
+        help="Enter comma-separated or newline-separated tickers for the active list.",
     )
-    if st.button("Save list"):
+    if st.button("Save active list"):
         saved_tickers = parse_portfolio_tickers(portfolio_text)
         if saved_tickers:
             portfolio_lists = save_user_portfolio_list(
@@ -454,11 +477,17 @@ with st.sidebar:
             cached_load.clear()
             st.rerun()
         else:
-            st.error("Enter at least one ticker before saving.")
-    new_portfolio_name = st.text_input("New list", value="", placeholder="Core")
+            st.error("Enter at least one ticker in the active list before saving.")
+    st.write("**Create or delete lists**")
+    new_portfolio_name = st.text_input(
+        "New list name",
+        value="",
+        placeholder="Core",
+        help="Create a named list from the tickers currently shown above.",
+    )
     create_col, delete_col = st.columns(2)
     with create_col:
-        if st.button("Create list"):
+        if st.button("Create list", help="Create a new named list using the tickers above."):
             try:
                 new_tickers = parse_portfolio_tickers(portfolio_text)
                 portfolio_lists = create_user_portfolio_list(
@@ -470,9 +499,13 @@ with st.sidebar:
                 st.session_state["portfolio_saved_message"] = f"Created {portfolio_lists.active.name}"
                 st.rerun()
             except ValueError as error:
-                st.error(str(error))
+                st.error(f"Could not create list: {error}")
     with delete_col:
-        if st.button("Delete list", disabled=len(portfolio_names) <= 1):
+        if st.button(
+            "Delete active list",
+            disabled=len(portfolio_names) <= 1,
+            help="Remove the selected list. At least one list must remain.",
+        ):
             try:
                 deleted_name = active_portfolio.name
                 portfolio_lists = delete_user_portfolio_list(portfolio_lists, deleted_name)
@@ -481,7 +514,7 @@ with st.sidebar:
                 cached_load.clear()
                 st.rerun()
             except ValueError as error:
-                st.error(str(error))
+                st.error(f"Could not delete list: {error}")
 
     if advanced_override:
         st.divider()
@@ -593,7 +626,7 @@ with today_tab:
 
     st.subheader("Today's Decision Table")
     st.caption(
-        "Opportunity score: "
+        "Opportunity score is a 0-100 ranking aid, not a price target, expected return, or buy probability. "
         + DECISION_HELP["ml_score"]
         + " Pullback risk: "
         + DECISION_HELP["drawdown"]
