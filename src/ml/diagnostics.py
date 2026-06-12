@@ -113,6 +113,74 @@ MIN_LABEL_AUDIT_SAMPLE_SIZE = 20
 LABEL_SPARSE_RATE = 0.10
 LABEL_COMMON_RATE = 0.90
 LABEL_GROUP_VARIATION_THRESHOLD = 0.25
+HIGH_MISSING_RATE = 0.30
+NEAR_CONSTANT_DOMINANCE = 0.95
+LOW_SAMPLE_TO_FEATURE_RATIO = 10.0
+COMPLEX_FEATURE_SAMPLE_RATIO = 20.0
+FAMILY_DOMINANCE_SHARE = 0.60
+HIGH_CORRELATION_THRESHOLD = 0.95
+MAX_CORRELATION_PAIRS = 10
+
+FEATURE_INVENTORY_COLUMNS = [
+    "feature_count",
+    "numeric_feature_count",
+    "non_numeric_feature_count",
+    "missing_feature_count",
+    "sample_size",
+    "sample_to_feature_ratio",
+    "mean_missing_rate",
+    "high_missing_feature_count",
+    "constant_or_near_constant_feature_count",
+    "interpretation",
+]
+
+FEATURE_FAMILY_COLUMNS = [
+    "family",
+    "feature_count",
+    "share_of_features",
+    "example_features",
+    "interpretation",
+]
+
+FEATURE_WARNING_COLUMNS = [
+    "warning",
+    "severity",
+    "feature_count",
+    "detail",
+    "interpretation",
+]
+
+FEATURE_REDUNDANCY_SUMMARY_COLUMNS = [
+    "numeric_feature_count",
+    "high_correlation_pair_count",
+    "correlation_threshold",
+    "interpretation",
+]
+
+FEATURE_CORRELATION_PAIR_COLUMNS = [
+    "feature_1",
+    "feature_2",
+    "abs_correlation",
+    "interpretation",
+]
+
+FEATURE_IMPORTANCE_COLUMNS = [
+    "feature",
+    "importance",
+    "rank",
+    "source",
+    "interpretation",
+]
+
+FEATURE_FAMILY_KEYWORDS = (
+    ("momentum / return", ("return", "momentum", "roc")),
+    ("trend / moving average", ("ma_", "moving_average", "sma", "ema", "trend", "dist_ma")),
+    ("volatility", ("volatility", "atr", "drawdown")),
+    ("relative strength / benchmark-relative", ("rs_", "relative_strength", "benchmark", "excess")),
+    ("volume / liquidity", ("volume", "liquidity", "turnover")),
+    ("RSI / technical", ("rsi", "macd", "stoch", "technical")),
+    ("Fourier / wavelet / complex transform", ("fourier", "wavelet")),
+)
 
 
 @dataclass(frozen=True)
@@ -137,6 +205,18 @@ class MLLabelAudit:
     ticker_distribution: pd.DataFrame
     regime_distribution: pd.DataFrame
     label_overlap: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class MLFeatureAudit:
+    """Read-only diagnostics for the current ML feature set."""
+
+    inventory_summary: pd.DataFrame
+    family_summary: pd.DataFrame
+    warnings: pd.DataFrame
+    redundancy_summary: pd.DataFrame
+    high_correlation_pairs: pd.DataFrame
+    feature_importance: pd.DataFrame
 
 
 def _overall_summary(
@@ -220,8 +300,473 @@ def _empty_label_overlap() -> pd.DataFrame:
     return pd.DataFrame(columns=LABEL_OVERLAP_COLUMNS)
 
 
+def _empty_feature_inventory_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_INVENTORY_COLUMNS)
+
+
+def _empty_feature_family_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_FAMILY_COLUMNS)
+
+
+def _empty_feature_warnings() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_WARNING_COLUMNS)
+
+
+def _empty_feature_redundancy_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_REDUNDANCY_SUMMARY_COLUMNS)
+
+
+def _empty_feature_correlation_pairs() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_CORRELATION_PAIR_COLUMNS)
+
+
+def _empty_feature_importance_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_IMPORTANCE_COLUMNS)
+
+
 def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
     return float((values * weights).sum() / weights.sum())
+
+
+def _coerce_feature_columns(panel: pd.DataFrame, feature_columns: list[str] | None) -> list[str]:
+    if feature_columns is not None:
+        return list(dict.fromkeys(feature_columns))
+
+    excluded_prefixes = ("label_", "forward_", "benchmark_forward_")
+    excluded_columns = {
+        "Date",
+        "Ticker",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Adj Close",
+        "Volume",
+        "regime",
+        "regime_rationale",
+        "risk_flags",
+    }
+    return [
+        column
+        for column in panel.columns
+        if column not in excluded_columns
+        and not any(str(column).startswith(prefix) for prefix in excluded_prefixes)
+    ]
+
+
+def _feature_inventory_interpretation(
+    sample_size: int,
+    feature_count: int,
+    sample_to_feature_ratio: object,
+    high_missing_count: int,
+    constant_count: int,
+) -> str:
+    if sample_size == 0 or feature_count == 0:
+        return "Feature audit is unavailable because the sample or feature list is empty."
+    if high_missing_count or constant_count:
+        return "Feature set has missingness or low-variation fields that may weaken validation evidence."
+    if pd.notna(sample_to_feature_ratio) and sample_to_feature_ratio < LOW_SAMPLE_TO_FEATURE_RATIO:
+        return "Feature set is wide relative to the sample, so validation evidence may be fragile."
+    return "Feature inventory looks usable for research diagnostics in this sample."
+
+
+def _feature_family(feature: str) -> str:
+    normalized = feature.lower()
+    for family, keywords in FEATURE_FAMILY_KEYWORDS:
+        if any(keyword in normalized for keyword in keywords):
+            return family
+    return "unknown / other"
+
+
+def _numeric_audit_features(panel: pd.DataFrame, feature_columns: list[str]) -> list[str]:
+    numeric_features: list[str] = []
+    for column in feature_columns:
+        if column not in panel:
+            continue
+        if pd.api.types.is_numeric_dtype(panel[column]):
+            numeric_features.append(column)
+            continue
+        coerced = pd.to_numeric(panel[column], errors="coerce")
+        if coerced.notna().any() or panel[column].isna().all():
+            numeric_features.append(column)
+    return numeric_features
+
+
+def build_feature_family_summary(feature_columns: list[str]) -> pd.DataFrame:
+    """Group feature names into simple diagnostic families."""
+
+    features = list(dict.fromkeys(feature_columns))
+    if not features:
+        return _empty_feature_family_summary()
+
+    rows: list[dict[str, object]] = []
+    total = len(features)
+    family_order = [family for family, _ in FEATURE_FAMILY_KEYWORDS] + ["unknown / other"]
+    for family in family_order:
+        family_features = [feature for feature in features if _feature_family(feature) == family]
+        if not family_features:
+            continue
+        share = float(len(family_features) / total)
+        rows.append(
+            {
+                "family": family,
+                "feature_count": len(family_features),
+                "share_of_features": share,
+                "example_features": ", ".join(family_features[:5]),
+                "interpretation": "This family dominates the feature set."
+                if share >= FAMILY_DOMINANCE_SHARE
+                else "This family is represented in the feature set.",
+            }
+        )
+    return pd.DataFrame(rows, columns=FEATURE_FAMILY_COLUMNS)
+
+
+def _near_constant_features(data: pd.DataFrame) -> list[str]:
+    features: list[str] = []
+    for column in data.columns:
+        values = data[column].dropna()
+        if values.empty:
+            features.append(column)
+            continue
+        if values.nunique(dropna=True) <= 1:
+            features.append(column)
+            continue
+        top_share = float(values.value_counts(normalize=True, dropna=True).iloc[0])
+        if top_share >= NEAR_CONSTANT_DOMINANCE:
+            features.append(column)
+    return features
+
+
+def build_feature_inventory_summary(
+    panel: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Summarize feature count, sample size, missingness, and low-variation fields."""
+
+    if panel.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "feature_count": 0,
+                    "numeric_feature_count": 0,
+                    "non_numeric_feature_count": 0,
+                    "missing_feature_count": 0,
+                    "sample_size": 0,
+                    "sample_to_feature_ratio": pd.NA,
+                    "mean_missing_rate": pd.NA,
+                    "high_missing_feature_count": 0,
+                    "constant_or_near_constant_feature_count": 0,
+                    "interpretation": _feature_inventory_interpretation(0, 0, pd.NA, 0, 0),
+                }
+            ],
+            columns=FEATURE_INVENTORY_COLUMNS,
+        )
+
+    features = _coerce_feature_columns(panel, feature_columns)
+    present_features = [column for column in features if column in panel]
+    missing_feature_count = len([column for column in features if column not in panel])
+    numeric_features = _numeric_audit_features(panel, present_features)
+    non_numeric_count = len(present_features) - len(numeric_features)
+    numeric_data = (
+        panel[numeric_features].apply(pd.to_numeric, errors="coerce")
+        if numeric_features
+        else pd.DataFrame()
+    )
+    missing_rates = numeric_data.isna().mean() if not numeric_data.empty else pd.Series(dtype=float)
+    high_missing_count = int((missing_rates >= HIGH_MISSING_RATE).sum()) if not missing_rates.empty else 0
+    near_constant_count = len(_near_constant_features(numeric_data)) if not numeric_data.empty else 0
+    feature_count = len(features)
+    sample_size = len(panel)
+    sample_to_feature_ratio = float(sample_size / feature_count) if feature_count else pd.NA
+    mean_missing_rate = float(missing_rates.mean()) if not missing_rates.empty else pd.NA
+
+    return pd.DataFrame(
+        [
+            {
+                "feature_count": feature_count,
+                "numeric_feature_count": len(numeric_features),
+                "non_numeric_feature_count": non_numeric_count,
+                "missing_feature_count": missing_feature_count,
+                "sample_size": sample_size,
+                "sample_to_feature_ratio": sample_to_feature_ratio,
+                "mean_missing_rate": mean_missing_rate,
+                "high_missing_feature_count": high_missing_count,
+                "constant_or_near_constant_feature_count": near_constant_count,
+                "interpretation": _feature_inventory_interpretation(
+                    sample_size,
+                    feature_count,
+                    sample_to_feature_ratio,
+                    high_missing_count,
+                    near_constant_count,
+                ),
+            }
+        ],
+        columns=FEATURE_INVENTORY_COLUMNS,
+    )
+
+
+def build_feature_audit_warnings(
+    panel: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+    family_summary: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Return compact warnings for missingness, stability, concentration, and complexity."""
+
+    if panel.empty:
+        return _empty_feature_warnings()
+
+    features = _coerce_feature_columns(panel, feature_columns)
+    present_features = [column for column in features if column in panel]
+    numeric_features = _numeric_audit_features(panel, present_features)
+    numeric_data = (
+        panel[numeric_features].apply(pd.to_numeric, errors="coerce")
+        if numeric_features
+        else pd.DataFrame()
+    )
+    rows: list[dict[str, object]] = []
+
+    missing_features = [column for column in features if column not in panel]
+    if missing_features:
+        rows.append(
+            {
+                "warning": "missing feature columns",
+                "severity": "warning",
+                "feature_count": len(missing_features),
+                "detail": ", ".join(missing_features[:8]),
+                "interpretation": "Configured feature columns were not present in this sample.",
+            }
+        )
+
+    if not numeric_data.empty:
+        missing_rates = numeric_data.isna().mean()
+        high_missing = missing_rates[missing_rates >= HIGH_MISSING_RATE].sort_values(ascending=False)
+        if not high_missing.empty:
+            rows.append(
+                {
+                    "warning": "high missingness",
+                    "severity": "warning",
+                    "feature_count": int(len(high_missing)),
+                    "detail": ", ".join(high_missing.index[:8]),
+                    "interpretation": "Some features have high missingness and may weaken validation evidence.",
+                }
+            )
+
+        near_constant = _near_constant_features(numeric_data)
+        if near_constant:
+            rows.append(
+                {
+                    "warning": "constant or near-constant features",
+                    "severity": "warning",
+                    "feature_count": len(near_constant),
+                    "detail": ", ".join(near_constant[:8]),
+                    "interpretation": "Some features show little variation in this sample.",
+                }
+            )
+
+    feature_count = len(features)
+    sample_to_feature_ratio = len(panel) / feature_count if feature_count else None
+    if sample_to_feature_ratio is not None and sample_to_feature_ratio < LOW_SAMPLE_TO_FEATURE_RATIO:
+        rows.append(
+            {
+                "warning": "low sample-to-feature ratio",
+                "severity": "warning",
+                "feature_count": feature_count,
+                "detail": f"{sample_to_feature_ratio:.2f} samples per feature",
+                "interpretation": "The feature set is wide relative to the sample, so overfit risk is higher.",
+            }
+        )
+
+    families = family_summary if family_summary is not None else build_feature_family_summary(features)
+    if not families.empty:
+        dominant = families[families["share_of_features"] >= FAMILY_DOMINANCE_SHARE]
+        if not dominant.empty:
+            row = dominant.sort_values("share_of_features", ascending=False).iloc[0]
+            rows.append(
+                {
+                    "warning": "feature family concentration",
+                    "severity": "info",
+                    "feature_count": int(row["feature_count"]),
+                    "detail": str(row["family"]),
+                    "interpretation": "One feature family represents most of the feature set.",
+                }
+            )
+
+    complex_features = [
+        feature for feature in features if _feature_family(feature) == "Fourier / wavelet / complex transform"
+    ]
+    complex_ratio = len(panel) / len(complex_features) if complex_features else None
+    if complex_ratio is not None and complex_ratio < COMPLEX_FEATURE_SAMPLE_RATIO:
+        rows.append(
+            {
+                "warning": "complex transform features with limited sample",
+                "severity": "warning",
+                "feature_count": len(complex_features),
+                "detail": ", ".join(complex_features[:8]),
+                "interpretation": "Complex transform features may be overfit-prone when sample depth is limited.",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            [
+                {
+                    "warning": "no material feature audit warnings",
+                    "severity": "info",
+                    "feature_count": 0,
+                    "detail": "",
+                    "interpretation": "No material feature audit warnings were detected in this sample.",
+                }
+            ],
+            columns=FEATURE_WARNING_COLUMNS,
+        )
+    return pd.DataFrame(rows, columns=FEATURE_WARNING_COLUMNS)
+
+
+def build_feature_redundancy_summary(
+    panel: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+    *,
+    correlation_threshold: float = HIGH_CORRELATION_THRESHOLD,
+    max_pairs: int = MAX_CORRELATION_PAIRS,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return high-correlation feature-pair diagnostics without dumping a full matrix."""
+
+    if panel.empty:
+        return _empty_feature_redundancy_summary(), _empty_feature_correlation_pairs()
+
+    features = _coerce_feature_columns(panel, feature_columns)
+    numeric_features = _numeric_audit_features(panel, features)
+    if len(numeric_features) < 2:
+        summary = pd.DataFrame(
+            [
+                {
+                    "numeric_feature_count": len(numeric_features),
+                    "high_correlation_pair_count": 0,
+                    "correlation_threshold": correlation_threshold,
+                    "interpretation": "Not enough numeric features were available for redundancy diagnostics.",
+                }
+            ],
+            columns=FEATURE_REDUNDANCY_SUMMARY_COLUMNS,
+        )
+        return summary, _empty_feature_correlation_pairs()
+
+    data = panel[numeric_features].apply(pd.to_numeric, errors="coerce")
+    corr = data.corr(numeric_only=True).abs()
+    pairs: list[dict[str, object]] = []
+    for left_index, left in enumerate(numeric_features):
+        for right in numeric_features[left_index + 1 :]:
+            value = corr.loc[left, right]
+            if pd.notna(value) and value >= correlation_threshold:
+                pairs.append(
+                    {
+                        "feature_1": left,
+                        "feature_2": right,
+                        "abs_correlation": float(value),
+                        "interpretation": "These features are highly correlated in this sample.",
+                    }
+                )
+    pairs = sorted(pairs, key=lambda row: row["abs_correlation"], reverse=True)
+    pair_count = len(pairs)
+    interpretation = (
+        "High-correlation feature pairs were detected; the feature set may contain redundant signals."
+        if pair_count
+        else "No high-correlation feature pairs were detected at this threshold."
+    )
+    summary = pd.DataFrame(
+        [
+            {
+                "numeric_feature_count": len(numeric_features),
+                "high_correlation_pair_count": pair_count,
+                "correlation_threshold": correlation_threshold,
+                "interpretation": interpretation,
+            }
+        ],
+        columns=FEATURE_REDUNDANCY_SUMMARY_COLUMNS,
+    )
+    pair_frame = pd.DataFrame(pairs[:max_pairs], columns=FEATURE_CORRELATION_PAIR_COLUMNS)
+    return summary, pair_frame
+
+
+def _extract_model_step(model: object) -> object | None:
+    if model is None:
+        return None
+    named_steps = getattr(model, "named_steps", None)
+    if isinstance(named_steps, dict) and "model" in named_steps:
+        return named_steps["model"]
+    return model
+
+
+def build_feature_importance_summary(
+    model: object | None,
+    feature_columns: list[str],
+    *,
+    max_features: int = 20,
+) -> pd.DataFrame:
+    """Summarize feature importance from fitted models that expose simple attributes."""
+
+    model_step = _extract_model_step(model)
+    if model_step is None or not feature_columns:
+        return _empty_feature_importance_summary()
+
+    source = ""
+    values: list[float] | None = None
+    importances = getattr(model_step, "feature_importances_", None)
+    if importances is not None:
+        values = [float(value) for value in importances]
+        source = "feature_importances_"
+    else:
+        coefficients = getattr(model_step, "coef_", None)
+        if coefficients is not None:
+            frame = pd.DataFrame(coefficients)
+            if not frame.empty:
+                values = frame.abs().mean(axis=0).astype(float).tolist()
+                source = "coef_"
+
+    if values is None or len(values) != len(feature_columns):
+        return _empty_feature_importance_summary()
+
+    rows = [
+        {
+            "feature": feature,
+            "importance": importance,
+            "rank": rank,
+            "source": source,
+            "interpretation": "Higher values indicate stronger model reliance in the fitted estimator.",
+        }
+        for rank, (feature, importance) in enumerate(
+            sorted(
+                zip(feature_columns, values, strict=False),
+                key=lambda item: item[1],
+                reverse=True,
+            ),
+            start=1,
+        )
+    ]
+    return pd.DataFrame(rows[:max_features], columns=FEATURE_IMPORTANCE_COLUMNS)
+
+
+def build_ml_feature_audit(
+    panel: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+    *,
+    model: object | None = None,
+) -> MLFeatureAudit:
+    """Build read-only diagnostics for current ML feature columns."""
+
+    features = _coerce_feature_columns(panel, feature_columns)
+    inventory = build_feature_inventory_summary(panel, features)
+    family_summary = build_feature_family_summary(features)
+    warnings = build_feature_audit_warnings(panel, features, family_summary)
+    redundancy_summary, high_correlation_pairs = build_feature_redundancy_summary(panel, features)
+    present_numeric_features = _numeric_audit_features(panel, features)
+    return MLFeatureAudit(
+        inventory,
+        family_summary,
+        warnings,
+        redundancy_summary,
+        high_correlation_pairs,
+        build_feature_importance_summary(model, present_numeric_features),
+    )
 
 
 def _class_balance(positive_rate: object, sample_size: int) -> str:

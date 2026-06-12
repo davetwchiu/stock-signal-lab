@@ -27,7 +27,13 @@ from src.features.regime import classify_regime
 from src.features.technical import build_technical_features
 from src.features.wavelet import rolling_wavelet_features
 from src.ml.datasets import build_supervised_panel, feature_group_columns
-from src.ml.diagnostics import MLLabelAudit, build_ml_diagnostics, build_ml_label_audit
+from src.ml.diagnostics import (
+    MLFeatureAudit,
+    MLLabelAudit,
+    build_ml_diagnostics,
+    build_ml_feature_audit,
+    build_ml_label_audit,
+)
 from src.ml.interpretations import (
     DiagnosticInterpretation,
     ResearchLabRunInterpretation,
@@ -301,6 +307,49 @@ def show_ml_label_audit(audit: MLLabelAudit) -> None:
             audit.label_overlap,
             "Return and drawdown-risk labels were not both available for overlap diagnostics.",
         )
+
+
+def show_ml_feature_audit(audit: MLFeatureAudit) -> None:
+    """Render compact read-only ML feature diagnostics."""
+
+    with st.expander("ML feature audit and importance", expanded=False):
+        st.caption(
+            "Diagnostics-only review of current feature columns, sample shape, missingness, "
+            "feature family mix, redundancy, and available fitted-model importance."
+        )
+        _show_label_audit_table(
+            "Feature inventory summary",
+            audit.inventory_summary,
+            "No feature inventory was available for this sample.",
+        )
+        _show_label_audit_table(
+            "Feature family summary",
+            audit.family_summary,
+            "Feature names did not support a family summary.",
+        )
+        _show_label_audit_table(
+            "Missingness and stability warnings",
+            audit.warnings,
+            "No feature warnings were available for this sample.",
+        )
+        _show_label_audit_table(
+            "Redundancy summary",
+            audit.redundancy_summary,
+            "No redundancy summary was available for this sample.",
+        )
+        _show_label_audit_table(
+            "Top highly correlated feature pairs",
+            audit.high_correlation_pairs,
+            "No high-correlation feature pairs were detected at the configured threshold.",
+        )
+        st.write("**Feature importance**")
+        if audit.feature_importance.empty:
+            st.info(
+                "Feature importance is unavailable because the current validation output does not expose "
+                "a fitted estimator with simple importance or coefficient attributes."
+            )
+        else:
+            st.dataframe(audit.feature_importance, width="stretch", hide_index=True)
 
 
 config = load_decision_config()
@@ -652,6 +701,18 @@ with research_tab:
                         "actions, sizing, ranking, allocation, saved portfolio, benchmark, or cache."
                     )
                     try:
+                        show_ml_label_audit(
+                            build_ml_label_audit(
+                                supervised,
+                                horizon=config.default_label_horizon,
+                            )
+                        )
+                        show_ml_feature_audit(
+                            build_ml_feature_audit(
+                                supervised,
+                                columns,
+                            )
+                        )
                         risk_result = walk_forward_validate_classifier(
                             supervised,
                             columns,
@@ -778,12 +839,6 @@ with research_tab:
                                     width="stretch",
                                     hide_index=True,
                                 )
-                            show_ml_label_audit(
-                                build_ml_label_audit(
-                                    supervised,
-                                    horizon=config.default_label_horizon,
-                                )
-                            )
                     except Exception as exc:
                         st.warning(f"ML diagnostics could not be built: {exc}")
 
