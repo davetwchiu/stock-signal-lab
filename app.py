@@ -17,9 +17,13 @@ from src.decision.report import generate_markdown_report, main_warning, portfoli
 from src.decision.table import action_counts, build_decision_table
 from src.decision.user_benchmark import resolve_active_benchmark, save_user_benchmark
 from src.decision.user_portfolio import (
+    create_user_portfolio_list,
+    delete_user_portfolio_list,
     parse_portfolio_tickers,
-    resolve_active_portfolio_tickers,
-    save_user_portfolio,
+    resolve_user_portfolio_lists,
+    save_user_portfolio_list,
+    save_user_portfolio_lists,
+    set_active_user_portfolio_list,
     select_active_portfolio_frames,
 )
 from src.features.fourier import rolling_fourier_features
@@ -404,34 +408,80 @@ with st.sidebar:
 
     default_end = date.today()
     default_start = default_end - timedelta(days=365 * 3)
-    active_tickers, saved_portfolio = resolve_active_portfolio_tickers(config.default_ticker_universe)
+    portfolio_lists = resolve_user_portfolio_lists(config.default_ticker_universe)
+    portfolio_names = list(portfolio_lists.names)
+    selected_portfolio_name = st.selectbox(
+        "Portfolio list",
+        options=portfolio_names,
+        index=portfolio_names.index(portfolio_lists.active.name),
+    )
+    if selected_portfolio_name != portfolio_lists.active.name:
+        portfolio_lists = set_active_user_portfolio_list(portfolio_lists, selected_portfolio_name)
+        save_user_portfolio_lists(portfolio_lists)
+        st.rerun()
+
+    active_portfolio = portfolio_lists.active
+    active_tickers = list(active_portfolio.tickers)
     tickers = list(active_tickers)
     benchmark = resolve_active_benchmark(config.default_benchmark, allowed_benchmarks=BENCHMARK_OPTIONS)
     start_date = default_start
     end_date = default_end
 
-    if saved_portfolio is not None:
-        st.caption(f"Using saved portfolio stock list: {len(active_tickers)} tickers")
-    else:
+    if portfolio_lists.source == "default":
         st.caption("No saved portfolio stock list found; using system default list")
+    else:
+        st.caption(f"Using saved portfolio list: {active_portfolio.name} ({len(active_tickers)} tickers)")
     if st.session_state.get("portfolio_saved_message"):
         st.success(st.session_state.pop("portfolio_saved_message"))
     portfolio_text = st.text_area(
         "Portfolio stock list",
         value=", ".join(active_tickers),
-        help="Paste comma-separated or newline-separated tickers. Click Save portfolio stock list to persist them locally.",
+        key=f"portfolio_text_{active_portfolio.name}",
+        help="Paste comma-separated or newline-separated tickers. Click Save list to persist them locally.",
     )
-    if st.button("Save portfolio stock list"):
+    if st.button("Save list"):
         saved_tickers = parse_portfolio_tickers(portfolio_text)
         if saved_tickers:
-            save_user_portfolio(saved_tickers)
+            portfolio_lists = save_user_portfolio_list(
+                portfolio_lists,
+                active_portfolio.name,
+                saved_tickers,
+            )
+            save_user_portfolio_lists(portfolio_lists)
             st.session_state["portfolio_saved_message"] = (
-                f"Using saved portfolio stock list: {len(saved_tickers)} tickers"
+                f"Saved {active_portfolio.name}: {len(saved_tickers)} tickers"
             )
             cached_load.clear()
             st.rerun()
         else:
             st.error("Enter at least one ticker before saving.")
+    new_portfolio_name = st.text_input("New list", value="", placeholder="Core")
+    create_col, delete_col = st.columns(2)
+    with create_col:
+        if st.button("Create list"):
+            try:
+                new_tickers = parse_portfolio_tickers(portfolio_text)
+                portfolio_lists = create_user_portfolio_list(
+                    portfolio_lists,
+                    new_portfolio_name,
+                    new_tickers,
+                )
+                save_user_portfolio_lists(portfolio_lists)
+                st.session_state["portfolio_saved_message"] = f"Created {portfolio_lists.active.name}"
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+    with delete_col:
+        if st.button("Delete list", disabled=len(portfolio_names) <= 1):
+            try:
+                deleted_name = active_portfolio.name
+                portfolio_lists = delete_user_portfolio_list(portfolio_lists, deleted_name)
+                save_user_portfolio_lists(portfolio_lists)
+                st.session_state["portfolio_saved_message"] = f"Deleted {deleted_name}"
+                cached_load.clear()
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
 
     if advanced_override:
         st.divider()
