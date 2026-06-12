@@ -29,29 +29,92 @@ class MarketDataProvider(Protocol):
         """Fetch daily OHLCV data indexed by date."""
 
 
+REQUIRED_OHLCV_COLUMNS = tuple(CSV_COLUMNS[1:])
+
+
+def _canonical_ohlcv_label(label: object) -> str | None:
+    """Return a canonical OHLCV label for common provider/cache variants."""
+
+    text = str(label).strip()
+    while "." in text and text.rsplit(".", maxsplit=1)[-1].isdigit():
+        text = text.rsplit(".", maxsplit=1)[0].strip()
+
+    normalized = " ".join(text.replace("_", " ").replace("-", " ").lower().split())
+    aliases = {
+        "date": "Date",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "adj close": "Adj Close",
+        "adjclose": "Adj Close",
+        "adjusted close": "Adj Close",
+        "volume": "Volume",
+    }
+    return aliases.get(normalized)
+
+
+def _flatten_ohlcv_columns(columns: pd.Index) -> list[object]:
+    """Choose the MultiIndex level that contains OHLCV field names."""
+
+    if not isinstance(columns, pd.MultiIndex):
+        return list(columns)
+
+    expected = set(CSV_COLUMNS)
+    level_scores = [
+        sum(
+            _canonical_ohlcv_label(value) in expected
+            for value in columns.get_level_values(level)
+        )
+        for level in range(columns.nlevels)
+    ]
+    best_level = max(range(columns.nlevels), key=lambda level: level_scores[level])
+    if level_scores[best_level] == 0:
+        return list(columns)
+    return list(columns.get_level_values(best_level))
+
+
 def normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
     """Normalize daily OHLCV columns and index."""
 
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
     frame = data.copy()
-    if "Date" in frame.columns:
-        frame["Date"] = pd.to_datetime(frame["Date"])
-        frame = frame.set_index("Date")
+    frame.columns = _flatten_ohlcv_columns(frame.columns)
+    canonical_labels = [_canonical_ohlcv_label(column) for column in frame.columns]
+
+    date_positions = [
+        position for position, column in enumerate(canonical_labels) if column == "Date"
+    ]
+    if date_positions:
+        frame.index = pd.to_datetime(frame.iloc[:, date_positions[-1]])
+    else:
+        frame.index = pd.to_datetime(frame.index)
     frame.index = pd.to_datetime(frame.index)
     frame.index.name = "Date"
 
-    missing = [column for column in CSV_COLUMNS[1:] if column not in frame.columns]
+    column_positions: dict[str, int] = {}
+    for position, column in enumerate(canonical_labels):
+        if column in REQUIRED_OHLCV_COLUMNS:
+            # Duplicate OHLCV fields can come from cached CSV headers or yfinance
+            # MultiIndex frames; keep the last normalized occurrence deterministically.
+            column_positions[column] = position
+
+    missing = [column for column in REQUIRED_OHLCV_COLUMNS if column not in column_positions]
     if missing:
         raise ValueError(f"OHLCV data missing required columns: {missing}")
 
-    frame = frame.loc[:, list(CSV_COLUMNS[1:])]
-    numeric_columns = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-    frame[numeric_columns] = frame[numeric_columns].apply(pd.to_numeric, errors="coerce")
-    frame = frame.sort_index()
-    frame = frame[~frame.index.duplicated(keep="last")]
-    return frame.dropna(subset=["Adj Close"])
+    output = pd.DataFrame(index=frame.index)
+    for column in REQUIRED_OHLCV_COLUMNS:
+        output[column] = pd.to_numeric(
+            frame.iloc[:, column_positions[column]],
+            errors="coerce",
+        )
+
+    if not output.columns.is_unique:
+        raise ValueError("OHLCV data has duplicate columns after normalization.")
+
+    output = output.sort_index()
+    output = output[~output.index.duplicated(keep="last")]
+    return output.dropna(subset=["Adj Close"])
 
 
 @dataclass
