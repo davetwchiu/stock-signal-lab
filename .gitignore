@@ -17,4 +17,5 @@ notebooks/.ipynb_checkpoints/
 
 # Local runtime state
 /data/user_portfolio.yaml
+/data/user_portfolios.yaml
 /data/user_benchmark.yaml
