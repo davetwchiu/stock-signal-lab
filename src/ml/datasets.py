@@ -31,6 +31,24 @@ BASE_EXCLUDE = {
     "regime_rationale",
     "risk_flags",
 }
+MODEL_FEATURE_EXCLUDE = {
+    "daily_return",
+    "return_5d",
+    "return_120d",
+    "rs_spy_120d",
+    "rs_qqq_120d",
+    "fourier_freq_1",
+    "fourier_period_1",
+    "fourier_freq_2",
+    "fourier_period_2",
+    "fourier_amp_2",
+    "fourier_freq_3",
+    "fourier_period_3",
+    "fourier_amp_3",
+    "wavelet_available",
+    "wavelet_energy_scale_2",
+    "wavelet_energy_scale_3",
+}
 
 
 def feature_group_columns(frame: pd.DataFrame, group: str = "all") -> list[str]:
@@ -40,7 +58,9 @@ def feature_group_columns(frame: pd.DataFrame, group: str = "all") -> list[str]:
     candidates = [
         column
         for column in numeric_columns
-        if column not in BASE_EXCLUDE and not LABEL_PATTERN.match(column)
+        if column not in BASE_EXCLUDE
+        and column not in MODEL_FEATURE_EXCLUDE
+        and not LABEL_PATTERN.match(column)
         and not frame[column].isna().all()
     ]
 

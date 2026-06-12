@@ -316,11 +316,11 @@ def show_ml_feature_audit(audit: MLFeatureAudit) -> None:
 
     with st.expander("ML feature audit and importance", expanded=False):
         st.caption(
-            "Diagnostics-only review of current feature columns, sample shape, missingness, "
+            "Diagnostics-only review of selected model feature columns, sample shape, missingness, "
             "feature family mix, redundancy, and available fitted-model importance."
         )
         _show_label_audit_table(
-            "Feature inventory summary",
+            "Selected model feature inventory summary",
             audit.inventory_summary,
             "No feature inventory was available for this sample.",
         )
@@ -359,7 +359,7 @@ def show_ml_feature_signal_diagnostics(diagnostics: MLFeatureSignalDiagnostics) 
 
     with st.expander("ML feature signal diagnostics", expanded=False):
         st.caption(
-            "Diagnostics-only review of simple historical feature relations to current supervised targets."
+            "Diagnostics-only review of simple historical selected-feature relations to current supervised targets."
         )
         _show_label_audit_table(
             "Feature signal summary",

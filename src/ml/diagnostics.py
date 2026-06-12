@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from src.ml.datasets import feature_group_columns
 from src.ml.metrics import calibration_table
 from src.ml.scoring import ml_score
 
@@ -398,26 +399,7 @@ def _coerce_feature_columns(panel: pd.DataFrame, feature_columns: list[str] | No
     if feature_columns is not None:
         return list(dict.fromkeys(feature_columns))
 
-    excluded_prefixes = ("label_", "forward_", "benchmark_forward_")
-    excluded_columns = {
-        "Date",
-        "Ticker",
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Adj Close",
-        "Volume",
-        "regime",
-        "regime_rationale",
-        "risk_flags",
-    }
-    return [
-        column
-        for column in panel.columns
-        if column not in excluded_columns
-        and not any(str(column).startswith(prefix) for prefix in excluded_prefixes)
-    ]
+    return feature_group_columns(panel, "all")
 
 
 def _feature_inventory_interpretation(
