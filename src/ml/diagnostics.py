@@ -20,6 +20,30 @@ BASELINE_COMPARISON_COLUMNS = [
     "interpretation",
 ]
 
+REGIME_SEGMENTED_COLUMNS = [
+    "regime_dimension",
+    "regime",
+    "sample_size",
+    "top_bucket_sample_size",
+    "bottom_bucket_sample_size",
+    "middle_bucket_forward_return",
+    "top_bucket_forward_return",
+    "bottom_bucket_forward_return",
+    "spread",
+    "direction",
+    "evidence_quality",
+    "interpretation",
+]
+
+DEFAULT_REGIME_COLUMNS = (
+    "market_regime",
+    "regime",
+    "trend_regime",
+    "risk_regime",
+    "volatility_regime",
+    "drawdown_regime",
+)
+
 SIMPLE_BASELINE_CANDIDATES = (
     ("return_60d", "Momentum (60d)"),
     ("return_20d", "Momentum (20d)"),
@@ -31,6 +55,8 @@ SIMPLE_BASELINE_CANDIDATES = (
 )
 
 MIN_BASELINE_BUCKET_COUNT = 5
+MIN_REGIME_BUCKET_COUNT = 5
+MIN_REGIME_SAMPLE_COUNT = 20
 SPREAD_SIMILARITY_TOLERANCE = 0.0025
 
 
@@ -42,6 +68,7 @@ class MLDiagnostics:
     drawdown_risk_calibration: pd.DataFrame
     summary: pd.DataFrame
     baseline_comparison: pd.DataFrame
+    regime_segmented: pd.DataFrame
 
 
 def _overall_summary(
@@ -99,6 +126,10 @@ def _score_bucket_summary(score_panel: pd.DataFrame) -> pd.DataFrame:
 
 def _empty_baseline_comparison() -> pd.DataFrame:
     return pd.DataFrame(columns=BASELINE_COMPARISON_COLUMNS)
+
+
+def _empty_regime_segmented_diagnostics() -> pd.DataFrame:
+    return pd.DataFrame(columns=REGIME_SEGMENTED_COLUMNS)
 
 
 def _comparison_direction(spread: object) -> str:
@@ -345,6 +376,191 @@ def build_ml_baseline_comparison(
     return pd.DataFrame(_add_baseline_interpretations(rows), columns=BASELINE_COMPARISON_COLUMNS)
 
 
+def _merge_regime_panel(
+    score_panel: pd.DataFrame,
+    baseline_panel: pd.DataFrame | None,
+    regime_columns: list[str],
+) -> pd.DataFrame:
+    data = score_panel.copy()
+    missing_columns = [column for column in regime_columns if column not in data]
+    if not missing_columns:
+        return data
+    if baseline_panel is None or baseline_panel.empty:
+        return data
+    if "Date" not in data or "Ticker" not in data:
+        return data
+    if "Date" not in baseline_panel or "Ticker" not in baseline_panel:
+        return data
+
+    available_columns = [column for column in missing_columns if column in baseline_panel]
+    if not available_columns:
+        return data
+
+    right = baseline_panel[["Date", "Ticker", *available_columns]].copy()
+    data["Date"] = pd.to_datetime(data["Date"])
+    right["Date"] = pd.to_datetime(right["Date"])
+    right = right.drop_duplicates(subset=["Date", "Ticker"], keep="last")
+    return data.merge(right, on=["Date", "Ticker"], how="left")
+
+
+def _regime_interpretation(
+    spread: object,
+    sample_size: int,
+    *,
+    min_samples: int,
+    concentrated: bool,
+) -> tuple[str, str]:
+    if sample_size < min_samples or pd.isna(spread):
+        return (
+            "insufficient",
+            "The regime sample is too small for reliable interpretation.",
+        )
+
+    concentration_note = (
+        " Regime comparison is limited because the sample is concentrated in one regime."
+        if concentrated
+        else ""
+    )
+    if spread > SPREAD_SIMILARITY_TOLERANCE:
+        return (
+            "usable",
+            "ML score shows positive separation in this regime." + concentration_note,
+        )
+    if spread < -SPREAD_SIMILARITY_TOLERANCE:
+        return (
+            "inverted",
+            "ML score separation is inverted in this regime." + concentration_note,
+        )
+    return (
+        "mixed",
+        "ML score separation is weak or inconclusive in this regime." + concentration_note,
+    )
+
+
+def _regime_segment_row(
+    data: pd.DataFrame,
+    *,
+    regime_dimension: str,
+    regime: object,
+    score_col: str,
+    forward_return_col: str,
+    min_bucket_size: int,
+    min_samples: int,
+    concentrated: bool,
+) -> dict[str, object]:
+    sample_size = int(len(data))
+    row = {
+        "regime_dimension": regime_dimension,
+        "regime": regime,
+        "sample_size": sample_size,
+        "top_bucket_sample_size": 0,
+        "bottom_bucket_sample_size": 0,
+        "middle_bucket_forward_return": pd.NA,
+        "top_bucket_forward_return": pd.NA,
+        "bottom_bucket_forward_return": pd.NA,
+        "spread": pd.NA,
+        "direction": "insufficient",
+        "evidence_quality": "insufficient",
+        "interpretation": "The regime sample is too small for reliable interpretation.",
+    }
+    if sample_size < min_samples or data[score_col].nunique() < 2:
+        return row
+
+    bucketed = data.copy()
+    bucketed["score_bucket"] = pd.cut(
+        bucketed[score_col],
+        bins=[-float("inf"), 40.0, 70.0, float("inf")],
+        labels=["Low", "Medium", "High"],
+    )
+    low = bucketed[bucketed["score_bucket"] == "Low"]
+    medium = bucketed[bucketed["score_bucket"] == "Medium"]
+    high = bucketed[bucketed["score_bucket"] == "High"]
+    row["top_bucket_sample_size"] = int(len(high))
+    row["bottom_bucket_sample_size"] = int(len(low))
+    if not medium.empty:
+        row["middle_bucket_forward_return"] = float(medium[forward_return_col].mean())
+    if len(low) < min_bucket_size or len(high) < min_bucket_size:
+        return row
+
+    top_return = float(high[forward_return_col].mean())
+    bottom_return = float(low[forward_return_col].mean())
+    spread = top_return - bottom_return
+    evidence_quality, interpretation = _regime_interpretation(
+        spread,
+        sample_size,
+        min_samples=min_samples,
+        concentrated=concentrated,
+    )
+    row.update(
+        {
+            "top_bucket_forward_return": top_return,
+            "bottom_bucket_forward_return": bottom_return,
+            "spread": spread,
+            "direction": _comparison_direction(spread),
+            "evidence_quality": evidence_quality,
+            "interpretation": interpretation,
+        }
+    )
+    return row
+
+
+def build_regime_segmented_ml_diagnostics(
+    score_panel: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    score_col: str = "ML Score",
+    forward_return_col: str = "forward_return",
+    regime_cols: list[str] | None = None,
+    min_bucket_size: int = MIN_REGIME_BUCKET_COUNT,
+    min_samples: int = MIN_REGIME_SAMPLE_COUNT,
+) -> pd.DataFrame:
+    """Return ML score bucket separation grouped by existing regime columns."""
+
+    if score_panel.empty:
+        return _empty_regime_segmented_diagnostics()
+
+    candidate_regime_cols = list(regime_cols or DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(score_panel, baseline_panel, candidate_regime_cols)
+    required = [score_col, forward_return_col]
+    if any(column not in data for column in required):
+        return _empty_regime_segmented_diagnostics()
+
+    available_regime_cols = [column for column in candidate_regime_cols if column in data]
+    if not available_regime_cols:
+        return _empty_regime_segmented_diagnostics()
+
+    usable = data.dropna(subset=[score_col, forward_return_col]).copy()
+    if usable.empty:
+        return _empty_regime_segmented_diagnostics()
+
+    rows: list[dict[str, object]] = []
+    for regime_col in available_regime_cols:
+        regime_data = usable.dropna(subset=[regime_col]).copy()
+        if regime_data.empty:
+            continue
+        regime_data[regime_col] = regime_data[regime_col].astype(str).str.strip()
+        regime_data = regime_data[regime_data[regime_col] != ""]
+        if regime_data.empty:
+            continue
+
+        concentrated = regime_data[regime_col].nunique() <= 1
+        for regime, group in regime_data.groupby(regime_col, sort=True):
+            rows.append(
+                _regime_segment_row(
+                    group,
+                    regime_dimension=regime_col,
+                    regime=regime,
+                    score_col=score_col,
+                    forward_return_col=forward_return_col,
+                    min_bucket_size=min_bucket_size,
+                    min_samples=min_samples,
+                    concentrated=concentrated,
+                )
+            )
+
+    return pd.DataFrame(rows, columns=REGIME_SEGMENTED_COLUMNS)
+
+
 def build_ml_diagnostics(
     outperformance_predictions: pd.DataFrame,
     drawdown_risk_predictions: pd.DataFrame,
@@ -367,7 +583,13 @@ def build_ml_diagnostics(
                 _overall_summary(drawdown_risk_predictions, drawdown_risk_metrics, "drawdown_risk"),
             ]
         )
-        return MLDiagnostics(pd.DataFrame(), pd.DataFrame(), summary, _empty_baseline_comparison())
+        return MLDiagnostics(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            summary,
+            _empty_baseline_comparison(),
+            _empty_regime_segmented_diagnostics(),
+        )
 
     out_columns = [
         "Date",
@@ -391,6 +613,7 @@ def build_ml_diagnostics(
     if not score_panel.empty:
         score_panel["ML Score"] = ml_score(score_panel["probability_out"], score_panel["probability_risk"])
     baseline_comparison = build_ml_baseline_comparison(score_panel, baseline_panel)
+    regime_segmented = build_regime_segmented_ml_diagnostics(score_panel, baseline_panel=baseline_panel)
 
     risk_calibration = calibration_table(
         drawdown_risk_predictions,
@@ -404,4 +627,10 @@ def build_ml_diagnostics(
             _overall_summary(drawdown_risk_predictions, drawdown_risk_metrics, "drawdown_risk"),
         ]
     )
-    return MLDiagnostics(_score_bucket_summary(score_panel), risk_calibration, summary, baseline_comparison)
+    return MLDiagnostics(
+        _score_bucket_summary(score_panel),
+        risk_calibration,
+        summary,
+        baseline_comparison,
+        regime_segmented,
+    )

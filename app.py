@@ -693,6 +693,17 @@ with research_tab:
                                 st.info("No baseline comparison was available for this walk-forward sample.")
                             else:
                                 st.dataframe(diagnostics.baseline_comparison, width="stretch")
+                            st.write("**Regime-segmented ML diagnostics**")
+                            st.caption(
+                                "Diagnostics-only view of existing ML score bucket separation grouped "
+                                "by available regime labels."
+                            )
+                            if diagnostics.regime_segmented.empty:
+                                st.info(
+                                    "No regime-segmented diagnostics were available for this walk-forward sample."
+                                )
+                            else:
+                                st.dataframe(diagnostics.regime_segmented, width="stretch")
                             st.write("**Drawdown-risk calibration**")
                             st.dataframe(diagnostics.drawdown_risk_calibration, width="stretch")
                             drawdown_calibration_export = diagnostic_export_frame(
