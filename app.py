@@ -29,9 +29,11 @@ from src.features.wavelet import rolling_wavelet_features
 from src.ml.datasets import build_supervised_panel, feature_group_columns
 from src.ml.diagnostics import (
     MLFeatureAudit,
+    MLFeatureSignalDiagnostics,
     MLLabelAudit,
     build_ml_diagnostics,
     build_ml_feature_audit,
+    build_ml_feature_signal_diagnostics,
     build_ml_label_audit,
 )
 from src.ml.interpretations import (
@@ -350,6 +352,35 @@ def show_ml_feature_audit(audit: MLFeatureAudit) -> None:
             )
         else:
             st.dataframe(audit.feature_importance, width="stretch", hide_index=True)
+
+
+def show_ml_feature_signal_diagnostics(diagnostics: MLFeatureSignalDiagnostics) -> None:
+    """Render compact read-only univariate feature signal diagnostics."""
+
+    with st.expander("ML feature signal diagnostics", expanded=False):
+        st.caption(
+            "Diagnostics-only review of simple historical feature relations to current supervised targets."
+        )
+        _show_label_audit_table(
+            "Feature signal summary",
+            diagnostics.signal_table,
+            "No feature signal summary was available for this sample.",
+        )
+        _show_label_audit_table(
+            "Feature family signal summary",
+            diagnostics.family_summary,
+            "No feature family signal summary was available for this sample.",
+        )
+        _show_label_audit_table(
+            "Top quantile target spreads",
+            diagnostics.quantile_summary,
+            "Quantile target-spread diagnostics were unavailable for this sample.",
+        )
+        _show_label_audit_table(
+            "Signal caution warnings",
+            diagnostics.warnings,
+            "No feature signal warnings were available for this sample.",
+        )
 
 
 config = load_decision_config()
@@ -707,10 +738,17 @@ with research_tab:
                                 horizon=config.default_label_horizon,
                             )
                         )
-                        show_ml_feature_audit(
-                            build_ml_feature_audit(
+                        feature_audit = build_ml_feature_audit(
+                            supervised,
+                            columns,
+                        )
+                        show_ml_feature_audit(feature_audit)
+                        show_ml_feature_signal_diagnostics(
+                            build_ml_feature_signal_diagnostics(
                                 supervised,
                                 columns,
+                                horizon=config.default_label_horizon,
+                                high_correlation_pairs=feature_audit.high_correlation_pairs,
                             )
                         )
                         risk_result = walk_forward_validate_classifier(

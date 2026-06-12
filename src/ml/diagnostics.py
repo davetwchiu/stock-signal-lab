@@ -120,6 +120,12 @@ COMPLEX_FEATURE_SAMPLE_RATIO = 20.0
 FAMILY_DOMINANCE_SHARE = 0.60
 HIGH_CORRELATION_THRESHOLD = 0.95
 MAX_CORRELATION_PAIRS = 10
+MIN_FEATURE_SIGNAL_SAMPLE_SIZE = 20
+MIN_FEATURE_SIGNAL_UNIQUE_VALUES = 3
+FEATURE_SIGNAL_TOP_N = 15
+FEATURE_SIGNAL_QUANTILE_COUNT = 5
+NEAR_ZERO_FEATURE_SIGNAL = 0.05
+COMPLEX_TOP_SIGNAL_SHARE = 0.50
 
 FEATURE_INVENTORY_COLUMNS = [
     "feature_count",
@@ -172,6 +178,44 @@ FEATURE_IMPORTANCE_COLUMNS = [
     "interpretation",
 ]
 
+FEATURE_SIGNAL_COLUMNS = [
+    "feature",
+    "family",
+    "valid_sample_count",
+    "missing_rate",
+    "unique_value_count",
+    "abs_spearman_to_return_target",
+    "spearman_to_return_target",
+    "abs_spearman_to_return_label",
+    "abs_spearman_to_drawdown_label",
+    "top_quantile_target_mean",
+    "bottom_quantile_target_mean",
+    "quantile_spread",
+    "interpretation",
+]
+
+FEATURE_FAMILY_SIGNAL_COLUMNS = [
+    "family",
+    "feature_count",
+    "median_abs_signal",
+    "max_abs_signal",
+    "top_feature",
+    "top_feature_signal",
+    "share_of_top_features",
+    "interpretation",
+]
+
+FEATURE_QUANTILE_SIGNAL_COLUMNS = [
+    "feature",
+    "family",
+    "valid_sample_count",
+    "bottom_quantile_target_mean",
+    "top_quantile_target_mean",
+    "quantile_spread",
+    "abs_quantile_spread",
+    "interpretation",
+]
+
 FEATURE_FAMILY_KEYWORDS = (
     ("momentum / return", ("return", "momentum", "roc")),
     ("trend / moving average", ("ma_", "moving_average", "sma", "ema", "trend", "dist_ma")),
@@ -217,6 +261,16 @@ class MLFeatureAudit:
     redundancy_summary: pd.DataFrame
     high_correlation_pairs: pd.DataFrame
     feature_importance: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class MLFeatureSignalDiagnostics:
+    """Read-only univariate signal diagnostics for the current ML feature set."""
+
+    signal_table: pd.DataFrame
+    family_summary: pd.DataFrame
+    quantile_summary: pd.DataFrame
+    warnings: pd.DataFrame
 
 
 def _overall_summary(
@@ -322,6 +376,18 @@ def _empty_feature_correlation_pairs() -> pd.DataFrame:
 
 def _empty_feature_importance_summary() -> pd.DataFrame:
     return pd.DataFrame(columns=FEATURE_IMPORTANCE_COLUMNS)
+
+
+def _empty_feature_signal_table() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_SIGNAL_COLUMNS)
+
+
+def _empty_feature_family_signal_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_FAMILY_SIGNAL_COLUMNS)
+
+
+def _empty_feature_quantile_signal_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_QUANTILE_SIGNAL_COLUMNS)
 
 
 def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
@@ -767,6 +833,465 @@ def build_ml_feature_audit(
         high_correlation_pairs,
         build_feature_importance_summary(model, present_numeric_features),
     )
+
+
+def _return_target_column(panel: pd.DataFrame, horizon: int) -> str | None:
+    for column in (f"forward_{horizon}d_excess_return", f"forward_{horizon}d_return"):
+        if column in panel:
+            return column
+    return None
+
+
+def _return_label_column(panel: pd.DataFrame, horizon: int) -> str | None:
+    column = f"label_outperform_{horizon}d"
+    return column if column in panel else None
+
+
+def _drawdown_label_column(panel: pd.DataFrame, horizon: int) -> str | None:
+    column = f"label_drawdown_risk_{horizon}d"
+    return column if column in panel else None
+
+
+def _spearman_relation(left: pd.Series, right: pd.Series) -> object:
+    data = pd.DataFrame(
+        {
+            "left": pd.to_numeric(left, errors="coerce"),
+            "right": pd.to_numeric(right, errors="coerce"),
+        }
+    ).dropna()
+    if (
+        len(data) < MIN_FEATURE_SIGNAL_SAMPLE_SIZE
+        or data["left"].nunique(dropna=True) < 2
+        or data["right"].nunique(dropna=True) < 2
+    ):
+        return pd.NA
+    value = data["left"].corr(data["right"], method="spearman")
+    return float(value) if pd.notna(value) else pd.NA
+
+
+def _abs_or_na(value: object) -> object:
+    return abs(float(value)) if pd.notna(value) else pd.NA
+
+
+def _feature_signal_strength(row: pd.Series) -> object:
+    values = pd.to_numeric(
+        pd.Series(
+            [
+                row.get("abs_spearman_to_return_target"),
+                row.get("abs_spearman_to_return_label"),
+                row.get("abs_spearman_to_drawdown_label"),
+            ]
+        ),
+        errors="coerce",
+    ).dropna()
+    return float(values.max()) if not values.empty else pd.NA
+
+
+def _quantile_signal_stats(feature: pd.Series, target: pd.Series) -> dict[str, object]:
+    data = pd.DataFrame(
+        {
+            "feature": pd.to_numeric(feature, errors="coerce"),
+            "target": pd.to_numeric(target, errors="coerce"),
+        }
+    ).dropna()
+    if (
+        len(data) < MIN_FEATURE_SIGNAL_SAMPLE_SIZE
+        or data["feature"].nunique(dropna=True) < MIN_FEATURE_SIGNAL_UNIQUE_VALUES
+        or data["target"].nunique(dropna=True) < 2
+    ):
+        return {
+            "valid_sample_count": int(len(data)),
+            "bottom_quantile_target_mean": pd.NA,
+            "top_quantile_target_mean": pd.NA,
+            "quantile_spread": pd.NA,
+            "abs_quantile_spread": pd.NA,
+        }
+
+    bucket_count = min(FEATURE_SIGNAL_QUANTILE_COUNT, int(data["feature"].nunique(dropna=True)))
+    try:
+        buckets = pd.qcut(data["feature"], q=bucket_count, duplicates="drop")
+    except ValueError:
+        return {
+            "valid_sample_count": int(len(data)),
+            "bottom_quantile_target_mean": pd.NA,
+            "top_quantile_target_mean": pd.NA,
+            "quantile_spread": pd.NA,
+            "abs_quantile_spread": pd.NA,
+        }
+    if buckets.nunique(dropna=True) < 2:
+        return {
+            "valid_sample_count": int(len(data)),
+            "bottom_quantile_target_mean": pd.NA,
+            "top_quantile_target_mean": pd.NA,
+            "quantile_spread": pd.NA,
+            "abs_quantile_spread": pd.NA,
+        }
+
+    means = data.assign(_bucket=buckets).groupby("_bucket", observed=True)["target"].mean()
+    bottom_mean = float(means.iloc[0])
+    top_mean = float(means.iloc[-1])
+    spread = top_mean - bottom_mean
+    return {
+        "valid_sample_count": int(len(data)),
+        "bottom_quantile_target_mean": bottom_mean,
+        "top_quantile_target_mean": top_mean,
+        "quantile_spread": float(spread),
+        "abs_quantile_spread": abs(float(spread)),
+    }
+
+
+def _feature_signal_interpretation(
+    valid_sample_count: int,
+    unique_value_count: int,
+    signal_strength: object,
+) -> str:
+    if valid_sample_count < MIN_FEATURE_SIGNAL_SAMPLE_SIZE:
+        return "Too few valid observations for univariate signal diagnostics."
+    if unique_value_count < MIN_FEATURE_SIGNAL_UNIQUE_VALUES:
+        return "Feature has too few distinct values for stable univariate diagnostics."
+    if pd.isna(signal_strength):
+        return "Target or label relation was unavailable for this feature."
+    if float(signal_strength) < NEAR_ZERO_FEATURE_SIGNAL:
+        return "Univariate relation is near zero in this sample."
+    if float(signal_strength) >= 0.20:
+        return "Feature has stronger univariate relation in this sample."
+    return "Feature shows a modest univariate relation in this sample."
+
+
+def build_feature_signal_table(
+    panel: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+    *,
+    horizon: int = 20,
+    max_features: int | None = FEATURE_SIGNAL_TOP_N,
+) -> pd.DataFrame:
+    """Summarize simple univariate feature relation to existing targets and labels."""
+
+    if panel.empty:
+        return _empty_feature_signal_table()
+
+    features = _coerce_feature_columns(panel, feature_columns)
+    numeric_features = _numeric_audit_features(panel, features)
+    if not numeric_features:
+        return _empty_feature_signal_table()
+
+    return_target = _return_target_column(panel, horizon)
+    return_label = _return_label_column(panel, horizon)
+    drawdown_label = _drawdown_label_column(panel, horizon)
+    rows: list[dict[str, object]] = []
+    for feature in numeric_features:
+        feature_values = pd.to_numeric(panel[feature], errors="coerce")
+        valid_sample_count = int(feature_values.notna().sum())
+        unique_value_count = int(feature_values.nunique(dropna=True))
+        missing_rate = float(feature_values.isna().mean())
+
+        spearman_to_target = (
+            _spearman_relation(feature_values, panel[return_target]) if return_target is not None else pd.NA
+        )
+        abs_spearman_to_return_label = (
+            _abs_or_na(_spearman_relation(feature_values, panel[return_label]))
+            if return_label is not None
+            else pd.NA
+        )
+        abs_spearman_to_drawdown_label = (
+            _abs_or_na(_spearman_relation(feature_values, panel[drawdown_label]))
+            if drawdown_label is not None
+            else pd.NA
+        )
+        quantile_stats = (
+            _quantile_signal_stats(feature_values, panel[return_target])
+            if return_target is not None
+            else {
+                "bottom_quantile_target_mean": pd.NA,
+                "top_quantile_target_mean": pd.NA,
+                "quantile_spread": pd.NA,
+            }
+        )
+        row = {
+            "feature": feature,
+            "family": _feature_family(feature),
+            "valid_sample_count": valid_sample_count,
+            "missing_rate": missing_rate,
+            "unique_value_count": unique_value_count,
+            "abs_spearman_to_return_target": _abs_or_na(spearman_to_target),
+            "spearman_to_return_target": spearman_to_target,
+            "abs_spearman_to_return_label": abs_spearman_to_return_label,
+            "abs_spearman_to_drawdown_label": abs_spearman_to_drawdown_label,
+            "top_quantile_target_mean": quantile_stats["top_quantile_target_mean"],
+            "bottom_quantile_target_mean": quantile_stats["bottom_quantile_target_mean"],
+            "quantile_spread": quantile_stats["quantile_spread"],
+        }
+        row["interpretation"] = _feature_signal_interpretation(
+            valid_sample_count,
+            unique_value_count,
+            _feature_signal_strength(pd.Series(row)),
+        )
+        rows.append(row)
+
+    if not rows:
+        return _empty_feature_signal_table()
+    signal_table = pd.DataFrame(rows, columns=FEATURE_SIGNAL_COLUMNS)
+    strengths = signal_table.apply(_feature_signal_strength, axis=1)
+    sorted_table = (
+        signal_table.assign(_signal_strength=pd.to_numeric(strengths, errors="coerce"))
+        .sort_values(["_signal_strength", "feature"], ascending=[False, True], na_position="last")
+        .drop(columns="_signal_strength")
+        .reset_index(drop=True)
+    )
+    return sorted_table if max_features is None else sorted_table.head(max_features)
+
+
+def build_feature_family_signal_summary(
+    signal_table: pd.DataFrame,
+    *,
+    top_feature_count: int = FEATURE_SIGNAL_TOP_N,
+) -> pd.DataFrame:
+    """Group feature signal diagnostics by existing feature-name families."""
+
+    if signal_table.empty:
+        return _empty_feature_family_signal_summary()
+
+    data = signal_table.copy()
+    data["_signal_strength"] = pd.to_numeric(data.apply(_feature_signal_strength, axis=1), errors="coerce")
+    ranked = data.dropna(subset=["_signal_strength"]).sort_values("_signal_strength", ascending=False)
+    top_features = set(ranked.head(top_feature_count)["feature"])
+    rows: list[dict[str, object]] = []
+    for family, group in data.groupby("family", sort=False):
+        strengths = group["_signal_strength"].dropna()
+        if strengths.empty:
+            top_feature = ""
+            top_signal = pd.NA
+            median_signal = pd.NA
+            max_signal = pd.NA
+            interpretation = "Feature-family signal was unavailable in this sample."
+        else:
+            top_row = group.sort_values("_signal_strength", ascending=False).iloc[0]
+            top_feature = str(top_row["feature"])
+            top_signal = float(top_row["_signal_strength"])
+            median_signal = float(strengths.median())
+            max_signal = float(strengths.max())
+            interpretation = (
+                "This family contains one of the stronger univariate signals."
+                if top_signal >= 0.20
+                else "This family shows modest or weak univariate signal in this sample."
+            )
+        rows.append(
+            {
+                "family": family,
+                "feature_count": int(len(group)),
+                "median_abs_signal": median_signal,
+                "max_abs_signal": max_signal,
+                "top_feature": top_feature,
+                "top_feature_signal": top_signal,
+                "share_of_top_features": (
+                    float(group["feature"].isin(top_features).sum() / len(top_features))
+                    if top_features
+                    else pd.NA
+                ),
+                "interpretation": interpretation,
+            }
+        )
+    return (
+        pd.DataFrame(rows, columns=FEATURE_FAMILY_SIGNAL_COLUMNS)
+        .sort_values(["max_abs_signal", "family"], ascending=[False, True], na_position="last")
+        .reset_index(drop=True)
+    )
+
+
+def build_feature_quantile_signal_summary(
+    panel: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+    *,
+    horizon: int = 20,
+    max_features: int = 10,
+) -> pd.DataFrame:
+    """Return top feature quantile target-spread diagnostics where a numeric target exists."""
+
+    if panel.empty:
+        return _empty_feature_quantile_signal_summary()
+
+    return_target = _return_target_column(panel, horizon)
+    if return_target is None:
+        return _empty_feature_quantile_signal_summary()
+
+    features = _coerce_feature_columns(panel, feature_columns)
+    numeric_features = _numeric_audit_features(panel, features)
+    rows: list[dict[str, object]] = []
+    for feature in numeric_features:
+        stats = _quantile_signal_stats(panel[feature], panel[return_target])
+        if pd.isna(stats["quantile_spread"]):
+            continue
+        rows.append(
+            {
+                "feature": feature,
+                "family": _feature_family(feature),
+                "valid_sample_count": stats["valid_sample_count"],
+                "bottom_quantile_target_mean": stats["bottom_quantile_target_mean"],
+                "top_quantile_target_mean": stats["top_quantile_target_mean"],
+                "quantile_spread": stats["quantile_spread"],
+                "abs_quantile_spread": stats["abs_quantile_spread"],
+                "interpretation": "High-minus-low feature quantiles show numeric target separation.",
+            }
+        )
+    if not rows:
+        return _empty_feature_quantile_signal_summary()
+    return (
+        pd.DataFrame(rows, columns=FEATURE_QUANTILE_SIGNAL_COLUMNS)
+        .sort_values(["abs_quantile_spread", "feature"], ascending=[False, True])
+        .head(max_features)
+        .reset_index(drop=True)
+    )
+
+
+def build_feature_signal_warnings(
+    panel: pd.DataFrame,
+    signal_table: pd.DataFrame,
+    family_summary: pd.DataFrame,
+    high_correlation_pairs: pd.DataFrame | None = None,
+    *,
+    horizon: int = 20,
+) -> pd.DataFrame:
+    """Return compact caution rows for univariate feature-signal diagnostics."""
+
+    rows: list[dict[str, object]] = []
+    if panel.empty or signal_table.empty:
+        rows.append(
+            {
+                "warning": "feature signal unavailable",
+                "severity": "warning",
+                "feature_count": 0,
+                "detail": "empty sample or no numeric features",
+                "interpretation": "No suitable feature-signal diagnostics were available.",
+            }
+        )
+        return pd.DataFrame(rows, columns=FEATURE_WARNING_COLUMNS)
+
+    if (
+        _return_target_column(panel, horizon) is None
+        and _return_label_column(panel, horizon) is None
+        and _drawdown_label_column(panel, horizon) is None
+    ):
+        rows.append(
+            {
+                "warning": "no suitable target or label",
+                "severity": "warning",
+                "feature_count": int(len(signal_table)),
+                "detail": f"horizon={horizon}",
+                "interpretation": "No existing return target or supervised label was available.",
+            }
+        )
+
+    too_few_samples = signal_table[signal_table["valid_sample_count"] < MIN_FEATURE_SIGNAL_SAMPLE_SIZE]
+    if not too_few_samples.empty:
+        rows.append(
+            {
+                "warning": "too few valid samples",
+                "severity": "warning",
+                "feature_count": int(len(too_few_samples)),
+                "detail": ", ".join(too_few_samples["feature"].head(8)),
+                "interpretation": "Some features lack enough valid observations for stable signal diagnostics.",
+            }
+        )
+
+    too_few_values = signal_table[signal_table["unique_value_count"] < MIN_FEATURE_SIGNAL_UNIQUE_VALUES]
+    if not too_few_values.empty:
+        rows.append(
+            {
+                "warning": "too few unique values",
+                "severity": "warning",
+                "feature_count": int(len(too_few_values)),
+                "detail": ", ".join(too_few_values["feature"].head(8)),
+                "interpretation": "Some features have too few distinct values for stable signal diagnostics.",
+            }
+        )
+
+    strengths = pd.to_numeric(signal_table.apply(_feature_signal_strength, axis=1), errors="coerce").dropna()
+    if strengths.empty:
+        rows.append(
+            {
+                "warning": "target relation unavailable",
+                "severity": "warning",
+                "feature_count": int(len(signal_table)),
+                "detail": "",
+                "interpretation": "Target or label relation was unavailable for the current feature set.",
+            }
+        )
+    elif float((strengths < NEAR_ZERO_FEATURE_SIGNAL).mean()) >= 0.75:
+        rows.append(
+            {
+                "warning": "near-zero univariate signal",
+                "severity": "info",
+                "feature_count": int((strengths < NEAR_ZERO_FEATURE_SIGNAL).sum()),
+                "detail": f"threshold={NEAR_ZERO_FEATURE_SIGNAL:.2f}",
+                "interpretation": "Most features show near-zero univariate signal in this sample.",
+            }
+        )
+
+    if not family_summary.empty and "share_of_top_features" in family_summary:
+        complex_rows = family_summary[
+            family_summary["family"].eq("Fourier / wavelet / complex transform")
+            & (pd.to_numeric(family_summary["share_of_top_features"], errors="coerce") >= COMPLEX_TOP_SIGNAL_SHARE)
+        ]
+        if not complex_rows.empty:
+            rows.append(
+                {
+                    "warning": "complex feature signal concentration",
+                    "severity": "info",
+                    "feature_count": int(complex_rows["feature_count"].iloc[0]),
+                    "detail": "Fourier / wavelet / complex transform",
+                    "interpretation": "Top univariate signal is concentrated in complex transform features.",
+                }
+            )
+
+    if high_correlation_pairs is not None and not high_correlation_pairs.empty:
+        top_signal_features = set(signal_table.head(5)["feature"])
+        redundant_features = set(high_correlation_pairs["feature_1"]).union(set(high_correlation_pairs["feature_2"]))
+        overlap = sorted(top_signal_features & redundant_features)
+        if overlap:
+            rows.append(
+                {
+                    "warning": "top signal features are redundant",
+                    "severity": "info",
+                    "feature_count": len(overlap),
+                    "detail": ", ".join(overlap[:8]),
+                    "interpretation": "Some top-ranked univariate features are also highly correlated with peers.",
+                }
+            )
+
+    if not rows:
+        rows.append(
+            {
+                "warning": "no material feature signal warnings",
+                "severity": "info",
+                "feature_count": 0,
+                "detail": "",
+                "interpretation": "No material feature signal warnings were detected in this sample.",
+            }
+        )
+    return pd.DataFrame(rows, columns=FEATURE_WARNING_COLUMNS)
+
+
+def build_ml_feature_signal_diagnostics(
+    panel: pd.DataFrame,
+    feature_columns: list[str] | None = None,
+    *,
+    horizon: int = 20,
+    high_correlation_pairs: pd.DataFrame | None = None,
+) -> MLFeatureSignalDiagnostics:
+    """Build read-only univariate signal diagnostics for current ML features."""
+
+    full_signal_table = build_feature_signal_table(panel, feature_columns, horizon=horizon, max_features=None)
+    signal_table = full_signal_table.head(FEATURE_SIGNAL_TOP_N)
+    family_summary = build_feature_family_signal_summary(full_signal_table)
+    quantile_summary = build_feature_quantile_signal_summary(panel, feature_columns, horizon=horizon)
+    warnings = build_feature_signal_warnings(
+        panel,
+        full_signal_table,
+        family_summary,
+        high_correlation_pairs,
+        horizon=horizon,
+    )
+    return MLFeatureSignalDiagnostics(signal_table, family_summary, quantile_summary, warnings)
 
 
 def _class_balance(positive_rate: object, sample_size: int) -> str:
