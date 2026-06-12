@@ -36,6 +36,64 @@ REGIME_SEGMENTED_COLUMNS = [
     "interpretation",
 ]
 
+SCORE_DIRECTION_SUMMARY_COLUMNS = [
+    "sample_size",
+    "score_column",
+    "target_column",
+    "label_column",
+    "drawdown_label_column",
+    "score_to_forward_return_spearman",
+    "score_to_return_label_spearman",
+    "score_to_drawdown_label_spearman",
+    "top_bucket_forward_return",
+    "bottom_bucket_forward_return",
+    "top_minus_bottom_spread",
+    "direction",
+    "interpretation",
+]
+
+PROBABILITY_LABEL_ALIGNMENT_COLUMNS = [
+    "diagnostic",
+    "sample_size",
+    "bottom_score_bucket_mean",
+    "top_score_bucket_mean",
+    "top_minus_bottom_spread",
+    "higher_score_corresponds_to",
+    "interpretation",
+]
+
+SCORE_BUCKET_MONOTONICITY_COLUMNS = [
+    "bucket",
+    "sample_size",
+    "mean_score",
+    "mean_forward_return",
+    "return_label_rate",
+    "drawdown_label_rate",
+    "monotonicity_result",
+    "interpretation",
+]
+
+SCORE_INVERSION_COLUMNS = [
+    "score_direction",
+    "sample_size",
+    "top_bucket_forward_return",
+    "bottom_bucket_forward_return",
+    "top_minus_bottom_spread",
+    "better_forward_return_separation",
+    "interpretation",
+]
+
+REGIME_SCORE_DIRECTION_COLUMNS = [
+    "regime_dimension",
+    "regime",
+    "sample_size",
+    "top_bucket_forward_return",
+    "bottom_bucket_forward_return",
+    "top_minus_bottom_spread",
+    "direction",
+    "interpretation",
+]
+
 DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS = [
     "sample_size",
     "mean_predicted_risk",
@@ -108,6 +166,8 @@ MIN_BASELINE_BUCKET_COUNT = 5
 MIN_REGIME_BUCKET_COUNT = 5
 MIN_REGIME_SAMPLE_COUNT = 20
 SPREAD_SIMILARITY_TOLERANCE = 0.0025
+MIN_SCORE_DIRECTION_BUCKET_COUNT = 5
+MIN_SCORE_DIRECTION_SAMPLE_COUNT = 20
 DEFAULT_OUTPERFORMANCE_THRESHOLDS = (0.00, 0.01, 0.02, 0.03, 0.05)
 DEFAULT_DRAWDOWN_THRESHOLDS = (-0.05, -0.10, -0.15, -0.20)
 MIN_LABEL_AUDIT_SAMPLE_SIZE = 20
@@ -237,6 +297,11 @@ class MLDiagnostics:
     summary: pd.DataFrame
     baseline_comparison: pd.DataFrame
     regime_segmented: pd.DataFrame
+    score_direction_summary: pd.DataFrame
+    probability_label_alignment: pd.DataFrame
+    score_bucket_monotonicity: pd.DataFrame
+    score_inversion: pd.DataFrame
+    regime_score_direction: pd.DataFrame
     drawdown_risk_calibration_quality: pd.DataFrame
 
 
@@ -333,6 +398,26 @@ def _empty_baseline_comparison() -> pd.DataFrame:
 
 def _empty_regime_segmented_diagnostics() -> pd.DataFrame:
     return pd.DataFrame(columns=REGIME_SEGMENTED_COLUMNS)
+
+
+def _empty_score_direction_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=SCORE_DIRECTION_SUMMARY_COLUMNS)
+
+
+def _empty_probability_label_alignment() -> pd.DataFrame:
+    return pd.DataFrame(columns=PROBABILITY_LABEL_ALIGNMENT_COLUMNS)
+
+
+def _empty_score_bucket_monotonicity() -> pd.DataFrame:
+    return pd.DataFrame(columns=SCORE_BUCKET_MONOTONICITY_COLUMNS)
+
+
+def _empty_score_inversion_diagnostics() -> pd.DataFrame:
+    return pd.DataFrame(columns=SCORE_INVERSION_COLUMNS)
+
+
+def _empty_regime_score_direction_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=REGIME_SCORE_DIRECTION_COLUMNS)
 
 
 def _empty_drawdown_risk_calibration_quality() -> pd.DataFrame:
@@ -2142,6 +2227,468 @@ def build_regime_segmented_ml_diagnostics(
     return pd.DataFrame(rows, columns=REGIME_SEGMENTED_COLUMNS)
 
 
+def _numeric_column(data: pd.DataFrame, column: str) -> pd.Series:
+    return pd.to_numeric(data[column], errors="coerce")
+
+
+def _spearman(data: pd.DataFrame, left: str, right: str) -> object:
+    if left not in data or right not in data:
+        return pd.NA
+    usable = data[[left, right]].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(usable) < 2 or usable[left].nunique() < 2 or usable[right].nunique() < 2:
+        return pd.NA
+    value = usable[left].corr(usable[right], method="spearman")
+    return pd.NA if pd.isna(value) else float(value)
+
+
+def _score_direction(spread: object, sample_size: int, min_samples: int) -> str:
+    if sample_size < min_samples or pd.isna(spread):
+        return "insufficient"
+    if spread > SPREAD_SIMILARITY_TOLERANCE:
+        return "aligned"
+    if spread < -SPREAD_SIMILARITY_TOLERANCE:
+        return "inverted"
+    return "flat"
+
+
+def _score_direction_interpretation(direction: str) -> str:
+    if direction == "aligned":
+        return "Higher ML scores correspond to stronger realised forward returns in this sample."
+    if direction == "inverted":
+        return "Higher ML scores correspond to weaker realised forward returns in this sample."
+    if direction == "flat":
+        return "Forward returns are similar across high and low ML score buckets in this sample."
+    return "The usable sample is too small or incomplete for a score-direction read."
+
+
+def _bucket_score_data(
+    data: pd.DataFrame,
+    score_col: str,
+    *,
+    bucket_col: str = "score_bucket",
+) -> pd.DataFrame:
+    bucketed = data.copy()
+    bucketed[bucket_col] = pd.cut(
+        bucketed[score_col],
+        bins=[-float("inf"), 40.0, 70.0, float("inf")],
+        labels=["Low", "Medium", "High"],
+    )
+    return bucketed
+
+
+def _bucket_spread(
+    data: pd.DataFrame,
+    score_col: str,
+    target_col: str,
+    min_bucket_size: int,
+) -> tuple[int, object, object, object]:
+    if score_col not in data or target_col not in data:
+        return 0, pd.NA, pd.NA, pd.NA
+
+    usable = data[[score_col, target_col]].apply(pd.to_numeric, errors="coerce").dropna()
+    if usable.empty:
+        return 0, pd.NA, pd.NA, pd.NA
+
+    bucketed = _bucket_score_data(usable, score_col)
+    bottom = bucketed[bucketed["score_bucket"] == "Low"]
+    top = bucketed[bucketed["score_bucket"] == "High"]
+    if len(bottom) < min_bucket_size or len(top) < min_bucket_size:
+        return len(usable), pd.NA, pd.NA, pd.NA
+
+    top_return = float(top[target_col].mean())
+    bottom_return = float(bottom[target_col].mean())
+    return len(usable), top_return, bottom_return, top_return - bottom_return
+
+
+def build_ml_score_direction_diagnostics(
+    score_panel: pd.DataFrame,
+    *,
+    score_col: str = "ML Score",
+    target_col: str = "forward_return",
+    label_col: str = "actual_out",
+    drawdown_label_col: str = "actual_risk",
+    min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
+    min_samples: int = MIN_SCORE_DIRECTION_SAMPLE_COUNT,
+) -> pd.DataFrame:
+    """Summarize whether the existing ML score direction matches realised outcomes."""
+
+    if score_panel.empty or score_col not in score_panel:
+        return _empty_score_direction_summary()
+
+    sample_size, top_return, bottom_return, spread = _bucket_spread(
+        score_panel,
+        score_col,
+        target_col,
+        min_bucket_size,
+    )
+    direction = _score_direction(spread, sample_size, min_samples)
+    return pd.DataFrame(
+        [
+            {
+                "sample_size": sample_size,
+                "score_column": score_col if score_col in score_panel else pd.NA,
+                "target_column": target_col if target_col in score_panel else pd.NA,
+                "label_column": label_col if label_col in score_panel else pd.NA,
+                "drawdown_label_column": drawdown_label_col if drawdown_label_col in score_panel else pd.NA,
+                "score_to_forward_return_spearman": _spearman(score_panel, score_col, target_col),
+                "score_to_return_label_spearman": _spearman(score_panel, score_col, label_col),
+                "score_to_drawdown_label_spearman": _spearman(
+                    score_panel,
+                    score_col,
+                    drawdown_label_col,
+                ),
+                "top_bucket_forward_return": top_return,
+                "bottom_bucket_forward_return": bottom_return,
+                "top_minus_bottom_spread": spread,
+                "direction": direction,
+                "interpretation": _score_direction_interpretation(direction),
+            }
+        ],
+        columns=SCORE_DIRECTION_SUMMARY_COLUMNS,
+    )
+
+
+def _alignment_row(
+    data: pd.DataFrame,
+    *,
+    diagnostic: str,
+    score_col: str,
+    value_col: str,
+    positive_text: str,
+    negative_text: str,
+    min_bucket_size: int,
+) -> dict[str, object] | None:
+    if score_col not in data or value_col not in data:
+        return None
+
+    usable = data[[score_col, value_col]].apply(pd.to_numeric, errors="coerce").dropna()
+    if usable.empty:
+        return None
+
+    bucketed = _bucket_score_data(usable, score_col)
+    bottom = bucketed[bucketed["score_bucket"] == "Low"]
+    top = bucketed[bucketed["score_bucket"] == "High"]
+    if len(bottom) < min_bucket_size or len(top) < min_bucket_size:
+        return {
+            "diagnostic": diagnostic,
+            "sample_size": int(len(usable)),
+            "bottom_score_bucket_mean": pd.NA,
+            "top_score_bucket_mean": pd.NA,
+            "top_minus_bottom_spread": pd.NA,
+            "higher_score_corresponds_to": "insufficient",
+            "interpretation": "The score buckets are too small for this alignment check.",
+        }
+
+    bottom_mean = float(bottom[value_col].mean())
+    top_mean = float(top[value_col].mean())
+    spread = top_mean - bottom_mean
+    if spread > SPREAD_SIMILARITY_TOLERANCE:
+        corresponds_to = positive_text
+    elif spread < -SPREAD_SIMILARITY_TOLERANCE:
+        corresponds_to = negative_text
+    else:
+        corresponds_to = "similar values"
+
+    return {
+        "diagnostic": diagnostic,
+        "sample_size": int(len(usable)),
+        "bottom_score_bucket_mean": bottom_mean,
+        "top_score_bucket_mean": top_mean,
+        "top_minus_bottom_spread": spread,
+        "higher_score_corresponds_to": corresponds_to,
+        "interpretation": f"Higher score buckets show {corresponds_to} in this sample.",
+    }
+
+
+def build_probability_label_alignment(
+    score_panel: pd.DataFrame,
+    *,
+    score_col: str = "ML Score",
+    return_probability_col: str = "probability_out",
+    target_col: str = "forward_return",
+    return_label_col: str = "actual_out",
+    drawdown_label_col: str = "actual_risk",
+    forward_drawdown_col: str = "forward_drawdown",
+    min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Show how higher existing ML scores line up with probabilities, labels, and realised outcomes."""
+
+    if score_panel.empty or score_col not in score_panel:
+        return _empty_probability_label_alignment()
+
+    rows = [
+        _alignment_row(
+            score_panel,
+            diagnostic="positive return probability",
+            score_col=score_col,
+            value_col=return_probability_col,
+            positive_text="higher positive-return probability",
+            negative_text="lower positive-return probability",
+            min_bucket_size=min_bucket_size,
+        ),
+        _alignment_row(
+            score_panel,
+            diagnostic="realised forward return",
+            score_col=score_col,
+            value_col=target_col,
+            positive_text="higher realised forward return",
+            negative_text="lower realised forward return",
+            min_bucket_size=min_bucket_size,
+        ),
+        _alignment_row(
+            score_panel,
+            diagnostic="positive return label rate",
+            score_col=score_col,
+            value_col=return_label_col,
+            positive_text="higher positive-return label rate",
+            negative_text="lower positive-return label rate",
+            min_bucket_size=min_bucket_size,
+        ),
+        _alignment_row(
+            score_panel,
+            diagnostic="drawdown-risk label rate",
+            score_col=score_col,
+            value_col=drawdown_label_col,
+            positive_text="higher drawdown-risk label rate",
+            negative_text="lower drawdown-risk label rate",
+            min_bucket_size=min_bucket_size,
+        ),
+        _alignment_row(
+            score_panel,
+            diagnostic="realised drawdown event rate",
+            score_col=score_col,
+            value_col=drawdown_label_col,
+            positive_text="higher realised drawdown event rate",
+            negative_text="lower realised drawdown event rate",
+            min_bucket_size=min_bucket_size,
+        ),
+        _alignment_row(
+            score_panel,
+            diagnostic="realised forward drawdown",
+            score_col=score_col,
+            value_col=forward_drawdown_col,
+            positive_text="less severe realised drawdowns",
+            negative_text="more severe realised drawdowns",
+            min_bucket_size=min_bucket_size,
+        ),
+    ]
+    present_rows = [row for row in rows if row is not None]
+    if not present_rows:
+        return _empty_probability_label_alignment()
+    return pd.DataFrame(present_rows, columns=PROBABILITY_LABEL_ALIGNMENT_COLUMNS)
+
+
+def _monotonicity_result(values: list[float]) -> str:
+    if len(values) < 2:
+        return "insufficient"
+    diffs = pd.Series(values).diff().dropna()
+    if bool((diffs > SPREAD_SIMILARITY_TOLERANCE).all()):
+        return "aligned"
+    if bool((diffs < -SPREAD_SIMILARITY_TOLERANCE).all()):
+        return "inverted"
+    if bool((diffs.abs() <= SPREAD_SIMILARITY_TOLERANCE).all()):
+        return "flat"
+    return "mixed"
+
+
+def _monotonicity_interpretation(result: str) -> str:
+    if result == "aligned":
+        return "Forward returns rise across the ML score buckets in this sample."
+    if result == "inverted":
+        return "Forward returns fall across the ML score buckets in this sample."
+    if result == "flat":
+        return "Forward returns are similar across ML score buckets in this sample."
+    if result == "mixed":
+        return "Forward returns are not monotonic across ML score buckets in this sample."
+    return "There is too little usable bucket data for a monotonicity read."
+
+
+def build_score_bucket_monotonicity(
+    score_panel: pd.DataFrame,
+    *,
+    score_col: str = "ML Score",
+    target_col: str = "forward_return",
+    return_label_col: str = "actual_out",
+    drawdown_label_col: str = "actual_risk",
+) -> pd.DataFrame:
+    """Return per-bucket outcome rates and a compact monotonicity read."""
+
+    if score_panel.empty or score_col not in score_panel:
+        return _empty_score_bucket_monotonicity()
+
+    data = score_panel.copy()
+    required = [score_col, target_col]
+    if any(column not in data for column in required):
+        return _empty_score_bucket_monotonicity()
+    data[score_col] = _numeric_column(data, score_col)
+    data[target_col] = _numeric_column(data, target_col)
+    data = data.dropna(subset=[score_col, target_col])
+    if data.empty:
+        return _empty_score_bucket_monotonicity()
+
+    data = _bucket_score_data(data, score_col)
+    grouped = data.groupby("score_bucket", observed=True)
+    rows: list[dict[str, object]] = []
+    bucket_returns: list[float] = []
+    for bucket in ("Low", "Medium", "High"):
+        if bucket not in grouped.groups:
+            continue
+        group = grouped.get_group(bucket)
+        mean_return = float(group[target_col].mean())
+        bucket_returns.append(mean_return)
+        rows.append(
+            {
+                "bucket": bucket,
+                "sample_size": int(len(group)),
+                "mean_score": float(group[score_col].mean()),
+                "mean_forward_return": mean_return,
+                "return_label_rate": float(_numeric_column(group, return_label_col).mean())
+                if return_label_col in group
+                else pd.NA,
+                "drawdown_label_rate": float(_numeric_column(group, drawdown_label_col).mean())
+                if drawdown_label_col in group
+                else pd.NA,
+                "monotonicity_result": "",
+                "interpretation": "",
+            }
+        )
+
+    result = _monotonicity_result(bucket_returns)
+    interpretation = _monotonicity_interpretation(result)
+    for row in rows:
+        row["monotonicity_result"] = result
+        row["interpretation"] = interpretation
+
+    return pd.DataFrame(rows, columns=SCORE_BUCKET_MONOTONICITY_COLUMNS)
+
+
+def build_score_inversion_diagnostics(
+    score_panel: pd.DataFrame,
+    *,
+    score_col: str = "ML Score",
+    target_col: str = "forward_return",
+    min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Compare current score buckets with an inverted score used only inside this diagnostic."""
+
+    if score_panel.empty or score_col not in score_panel or target_col not in score_panel:
+        return _empty_score_inversion_diagnostics()
+
+    data = score_panel[[score_col, target_col]].apply(pd.to_numeric, errors="coerce").dropna()
+    if data.empty:
+        return _empty_score_inversion_diagnostics()
+
+    score_max = data[score_col].max()
+    inverted_max = 100.0 if pd.notna(score_max) and score_max > 1.0 else 1.0
+    data = data.copy()
+    data["_inverted_score"] = inverted_max - data[score_col]
+
+    rows: list[dict[str, object]] = []
+    for direction_label, column in (("current ML score", score_col), ("inverted score", "_inverted_score")):
+        sample_size, top_return, bottom_return, spread = _bucket_spread(
+            data,
+            column,
+            target_col,
+            min_bucket_size,
+        )
+        rows.append(
+            {
+                "score_direction": direction_label,
+                "sample_size": sample_size,
+                "top_bucket_forward_return": top_return,
+                "bottom_bucket_forward_return": bottom_return,
+                "top_minus_bottom_spread": spread,
+                "better_forward_return_separation": "",
+                "interpretation": "",
+            }
+        )
+
+    current_spread = pd.to_numeric(pd.Series([rows[0]["top_minus_bottom_spread"]]), errors="coerce").iloc[0]
+    inverted_spread = pd.to_numeric(pd.Series([rows[1]["top_minus_bottom_spread"]]), errors="coerce").iloc[0]
+    if pd.isna(current_spread) or pd.isna(inverted_spread):
+        better = "insufficient"
+        interpretation = "The score buckets are too small for an inversion comparison."
+    elif current_spread > inverted_spread + SPREAD_SIMILARITY_TOLERANCE:
+        better = "current ML score"
+        interpretation = "The current score direction gives better forward-return separation in this sample."
+    elif inverted_spread > current_spread + SPREAD_SIMILARITY_TOLERANCE:
+        better = "inverted score"
+        interpretation = "The inverted score direction gives better forward-return separation in this sample."
+    else:
+        better = "similar"
+        interpretation = "Current and inverted score directions show similar forward-return separation."
+
+    for row in rows:
+        row["better_forward_return_separation"] = better
+        row["interpretation"] = interpretation
+
+    return pd.DataFrame(rows, columns=SCORE_INVERSION_COLUMNS)
+
+
+def build_regime_score_direction_summary(
+    score_panel: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    score_col: str = "ML Score",
+    target_col: str = "forward_return",
+    regime_cols: list[str] | None = None,
+    min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
+    min_samples: int = MIN_REGIME_SAMPLE_COUNT,
+) -> pd.DataFrame:
+    """Summarize existing score direction by available regime labels."""
+
+    if score_panel.empty:
+        return _empty_regime_score_direction_summary()
+
+    candidate_regime_cols = list(regime_cols or DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(score_panel, baseline_panel, candidate_regime_cols)
+    if score_col not in data or target_col not in data:
+        return _empty_regime_score_direction_summary()
+
+    available_regime_cols = [column for column in candidate_regime_cols if column in data]
+    if not available_regime_cols:
+        return _empty_regime_score_direction_summary()
+
+    data = data.copy()
+    data[score_col] = _numeric_column(data, score_col)
+    data[target_col] = _numeric_column(data, target_col)
+    data = data.dropna(subset=[score_col, target_col])
+    if data.empty:
+        return _empty_regime_score_direction_summary()
+
+    rows: list[dict[str, object]] = []
+    for regime_col in available_regime_cols:
+        regime_data = data.dropna(subset=[regime_col]).copy()
+        if regime_data.empty:
+            continue
+        regime_data[regime_col] = regime_data[regime_col].astype(str).str.strip()
+        regime_data = regime_data[regime_data[regime_col] != ""]
+        for regime, group in regime_data.groupby(regime_col, sort=True):
+            sample_size, top_return, bottom_return, spread = _bucket_spread(
+                group,
+                score_col,
+                target_col,
+                min_bucket_size,
+            )
+            direction = _score_direction(spread, sample_size, min_samples)
+            rows.append(
+                {
+                    "regime_dimension": regime_col,
+                    "regime": regime,
+                    "sample_size": sample_size,
+                    "top_bucket_forward_return": top_return,
+                    "bottom_bucket_forward_return": bottom_return,
+                    "top_minus_bottom_spread": spread,
+                    "direction": direction,
+                    "interpretation": _score_direction_interpretation(direction),
+                }
+            )
+
+    if not rows:
+        return _empty_regime_score_direction_summary()
+    return pd.DataFrame(rows, columns=REGIME_SCORE_DIRECTION_COLUMNS)
+
+
 def build_ml_diagnostics(
     outperformance_predictions: pd.DataFrame,
     drawdown_risk_predictions: pd.DataFrame,
@@ -2170,6 +2717,11 @@ def build_ml_diagnostics(
             summary,
             _empty_baseline_comparison(),
             _empty_regime_segmented_diagnostics(),
+            _empty_score_direction_summary(),
+            _empty_probability_label_alignment(),
+            _empty_score_bucket_monotonicity(),
+            _empty_score_inversion_diagnostics(),
+            _empty_regime_score_direction_summary(),
             _empty_drawdown_risk_calibration_quality(),
         )
 
@@ -2196,6 +2748,11 @@ def build_ml_diagnostics(
         score_panel["ML Score"] = ml_score(score_panel["probability_out"], score_panel["probability_risk"])
     baseline_comparison = build_ml_baseline_comparison(score_panel, baseline_panel)
     regime_segmented = build_regime_segmented_ml_diagnostics(score_panel, baseline_panel=baseline_panel)
+    score_direction_summary = build_ml_score_direction_diagnostics(score_panel)
+    probability_label_alignment = build_probability_label_alignment(score_panel)
+    score_bucket_monotonicity = build_score_bucket_monotonicity(score_panel)
+    score_inversion = build_score_inversion_diagnostics(score_panel)
+    regime_score_direction = build_regime_score_direction_summary(score_panel, baseline_panel=baseline_panel)
 
     risk_calibration = calibration_table(
         drawdown_risk_predictions,
@@ -2219,5 +2776,10 @@ def build_ml_diagnostics(
         summary,
         baseline_comparison,
         regime_segmented,
+        score_direction_summary,
+        probability_label_alignment,
+        score_bucket_monotonicity,
+        score_inversion,
+        regime_score_direction,
         risk_calibration_quality,
     )

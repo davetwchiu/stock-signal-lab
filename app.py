@@ -727,9 +727,9 @@ with research_tab:
                 if show_ml_diagnostics:
                     st.info(
                         "ML signal health is research-only. It checks whether past out-of-sample "
-                        "ML predictions separated stronger and weaker signals. Healthy does not mean buy; "
-                        "Weak does not mean sell. This panel does not affect Decision Mode, scores, "
-                        "actions, sizing, ranking, allocation, saved portfolio, benchmark, or cache."
+                        "ML predictions separated stronger and weaker signals. The labels are historical "
+                        "diagnostics only. This panel does not affect Decision Mode, scores, sizing, "
+                        "ranking, allocation, saved portfolio, benchmark, or cache."
                     )
                     try:
                         show_ml_label_audit(
@@ -783,7 +783,7 @@ with research_tab:
                             st.write("**ML signal health**")
                             st.caption(
                                 "Research-only interpretation of existing walk-forward diagnostics. "
-                                "This does not affect Decision Mode, scores, actions, or position sizing."
+                                "This does not affect Decision Mode, scores, sizing, ranking, or allocation."
                             )
                             verdict_message = f"**{verdict}** - {reason}"
                             if verdict == "Healthy":
@@ -839,6 +839,35 @@ with research_tab:
                                 st.info("No baseline comparison was available for this walk-forward sample.")
                             else:
                                 st.dataframe(diagnostics.baseline_comparison, width="stretch")
+                            st.write("**ML score direction diagnostics**")
+                            st.caption(
+                                "Diagnostics-only checks for score direction, label alignment, bucket "
+                                "monotonicity, inverted-score separation, and regime-specific direction."
+                            )
+                            if diagnostics.score_direction_summary.empty:
+                                st.info("No score-direction summary was available for this walk-forward sample.")
+                            else:
+                                st.dataframe(
+                                    diagnostics.score_direction_summary,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                            if diagnostics.probability_label_alignment.empty:
+                                st.info("No probability or label alignment table was available.")
+                            else:
+                                st.dataframe(diagnostics.probability_label_alignment, width="stretch")
+                            if diagnostics.score_bucket_monotonicity.empty:
+                                st.info("No score-bucket monotonicity table was available.")
+                            else:
+                                st.dataframe(diagnostics.score_bucket_monotonicity, width="stretch")
+                            if diagnostics.score_inversion.empty:
+                                st.info("No score inversion comparison was available.")
+                            else:
+                                st.dataframe(diagnostics.score_inversion, width="stretch")
+                            if diagnostics.regime_score_direction.empty:
+                                st.info("No regime score-direction summary was available.")
+                            else:
+                                st.dataframe(diagnostics.regime_score_direction, width="stretch")
                             st.write("**Regime-segmented ML diagnostics**")
                             st.caption(
                                 "Diagnostics-only view of existing ML score bucket separation grouped "
