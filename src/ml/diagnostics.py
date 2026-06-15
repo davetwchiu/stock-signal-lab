@@ -96,6 +96,21 @@ ML_PROBABILITY_DIRECTION_COLUMNS = [
     "interpretation",
 ]
 
+ML_FORMULA_CANDIDATE_COLUMNS = [
+    "candidate_name",
+    "sample_size",
+    "low_bucket_forward_excess_return",
+    "mid_bucket_forward_excess_return",
+    "high_bucket_forward_excess_return",
+    "high_minus_low_spread",
+    "monotonicity",
+    "low_bucket_label_rate",
+    "high_bucket_label_rate",
+    "low_bucket_drawdown_event_rate",
+    "high_bucket_drawdown_event_rate",
+    "interpretation",
+]
+
 REGIME_SCORE_DIRECTION_COLUMNS = [
     "regime_dimension",
     "regime",
@@ -346,6 +361,7 @@ class MLDiagnostics:
     target_comparison: pd.DataFrame
     opportunity_risk_joint_validation: pd.DataFrame
     probability_direction_check: pd.DataFrame
+    formula_candidate_comparison: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -461,6 +477,10 @@ def _empty_score_inversion_diagnostics() -> pd.DataFrame:
 
 def _empty_ml_probability_direction_check() -> pd.DataFrame:
     return pd.DataFrame(columns=ML_PROBABILITY_DIRECTION_COLUMNS)
+
+
+def _empty_ml_formula_candidate_comparison() -> pd.DataFrame:
+    return pd.DataFrame(columns=ML_FORMULA_CANDIDATE_COLUMNS)
 
 
 def _empty_regime_score_direction_summary() -> pd.DataFrame:
@@ -3181,6 +3201,261 @@ def build_ml_probability_direction_check(
     return pd.DataFrame(rows, columns=ML_PROBABILITY_DIRECTION_COLUMNS)
 
 
+def _risk_haircut_score(opportunity_score: pd.Series, risk_probability: pd.Series) -> pd.Series:
+    haircut = pd.Series(1.0, index=opportunity_score.index)
+    haircut = haircut.mask(risk_probability >= 0.40, 0.85)
+    haircut = haircut.mask(risk_probability >= 0.60, 0.70)
+    return (opportunity_score * haircut).clip(lower=0.0, upper=100.0)
+
+
+def _score_formula_interpretation(
+    *,
+    spread: object,
+    monotonicity: str,
+    low_label_rate: object,
+    high_label_rate: object,
+    low_drawdown_event_rate: object,
+    high_drawdown_event_rate: object,
+) -> str:
+    if pd.isna(spread) or monotonicity == "insufficient":
+        return "insufficient data"
+    if float(spread) < -SPREAD_SIMILARITY_TOLERANCE or monotonicity == "inverted":
+        return "candidate is inverted"
+
+    label_support = True
+    if pd.notna(low_label_rate) and pd.notna(high_label_rate):
+        label_support = high_label_rate > low_label_rate + SPREAD_SIMILARITY_TOLERANCE
+
+    drawdown_acceptable = True
+    if pd.notna(low_drawdown_event_rate) and pd.notna(high_drawdown_event_rate):
+        drawdown_acceptable = high_drawdown_event_rate <= low_drawdown_event_rate + 0.20
+
+    if (
+        float(spread) > SPREAD_SIMILARITY_TOLERANCE
+        and monotonicity == "aligned"
+        and label_support
+        and drawdown_acceptable
+    ):
+        return "candidate looks strong"
+    if float(spread) <= SPREAD_SIMILARITY_TOLERANCE or not label_support:
+        return "candidate looks weak"
+    return "candidate is mixed"
+
+
+def _formula_candidate_row(
+    data: pd.DataFrame,
+    *,
+    candidate_name: str,
+    score_col: str,
+    return_col: str,
+    label_col: str,
+    drawdown_event_col: str | None,
+    min_bucket_size: int,
+    min_samples: int,
+) -> dict[str, object]:
+    empty_row = {
+        "candidate_name": candidate_name,
+        "sample_size": 0,
+        "low_bucket_forward_excess_return": pd.NA,
+        "mid_bucket_forward_excess_return": pd.NA,
+        "high_bucket_forward_excess_return": pd.NA,
+        "high_minus_low_spread": pd.NA,
+        "monotonicity": "insufficient",
+        "low_bucket_label_rate": pd.NA,
+        "high_bucket_label_rate": pd.NA,
+        "low_bucket_drawdown_event_rate": pd.NA,
+        "high_bucket_drawdown_event_rate": pd.NA,
+        "interpretation": "insufficient data",
+    }
+    if score_col not in data or return_col not in data:
+        return empty_row
+
+    columns = [score_col, return_col]
+    has_label = label_col in data
+    if has_label:
+        columns.append(label_col)
+    has_drawdown_event = drawdown_event_col is not None and drawdown_event_col in data
+    if has_drawdown_event:
+        columns.append(drawdown_event_col)
+
+    usable = data[columns].apply(pd.to_numeric, errors="coerce").dropna(subset=[score_col, return_col])
+    if len(usable) < min_samples or usable[score_col].nunique(dropna=True) < 3:
+        row = empty_row.copy()
+        row["sample_size"] = int(len(usable))
+        return row
+
+    bucketed = usable.copy()
+    try:
+        bucketed["_candidate_bucket"] = pd.qcut(
+            bucketed[score_col].rank(method="first"),
+            q=3,
+            labels=["Low", "Mid", "High"],
+        )
+    except ValueError:
+        row = empty_row.copy()
+        row["sample_size"] = int(len(usable))
+        return row
+
+    grouped = bucketed.groupby("_candidate_bucket", observed=True)
+    bucket_returns: dict[str, object] = {}
+    label_rates: dict[str, object] = {}
+    drawdown_event_rates: dict[str, object] = {}
+    for bucket in ("Low", "Mid", "High"):
+        if bucket not in grouped.groups:
+            bucket_returns[bucket] = pd.NA
+            label_rates[bucket] = pd.NA
+            drawdown_event_rates[bucket] = pd.NA
+            continue
+        group = grouped.get_group(bucket)
+        if len(group) < min_bucket_size:
+            bucket_returns[bucket] = pd.NA
+            label_rates[bucket] = pd.NA
+            drawdown_event_rates[bucket] = pd.NA
+            continue
+        bucket_returns[bucket] = float(group[return_col].mean())
+        label_rates[bucket] = float(group[label_col].mean()) if has_label else pd.NA
+        drawdown_event_rates[bucket] = (
+            float(group[drawdown_event_col].mean()) if has_drawdown_event and drawdown_event_col else pd.NA
+        )
+
+    low_return = bucket_returns["Low"]
+    mid_return = bucket_returns["Mid"]
+    high_return = bucket_returns["High"]
+    if pd.isna(low_return) or pd.isna(mid_return) or pd.isna(high_return):
+        spread = pd.NA
+        monotonicity = "insufficient"
+    else:
+        spread = float(high_return - low_return)
+        monotonicity = _monotonicity_result([float(low_return), float(mid_return), float(high_return)])
+
+    interpretation = _score_formula_interpretation(
+        spread=spread,
+        monotonicity=monotonicity,
+        low_label_rate=label_rates["Low"],
+        high_label_rate=label_rates["High"],
+        low_drawdown_event_rate=drawdown_event_rates["Low"],
+        high_drawdown_event_rate=drawdown_event_rates["High"],
+    )
+    return {
+        "candidate_name": candidate_name,
+        "sample_size": int(len(usable)),
+        "low_bucket_forward_excess_return": low_return,
+        "mid_bucket_forward_excess_return": mid_return,
+        "high_bucket_forward_excess_return": high_return,
+        "high_minus_low_spread": spread,
+        "monotonicity": monotonicity,
+        "low_bucket_label_rate": label_rates["Low"],
+        "high_bucket_label_rate": label_rates["High"],
+        "low_bucket_drawdown_event_rate": drawdown_event_rates["Low"],
+        "high_bucket_drawdown_event_rate": drawdown_event_rates["High"],
+        "interpretation": interpretation,
+    }
+
+
+def build_ml_score_formula_candidate_comparison(
+    score_panel: pd.DataFrame,
+    *,
+    probability_col: str = "probability_out",
+    risk_probability_col: str = "probability_risk",
+    return_col: str = "forward_excess_return",
+    label_col: str = "actual_out",
+    drawdown_label_col: str = "actual_risk",
+    forward_drawdown_col: str = "forward_drawdown",
+    drawdown_event_threshold: float = -0.10,
+    min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
+    min_samples: int = MIN_SCORE_DIRECTION_SAMPLE_COUNT,
+) -> pd.DataFrame:
+    """Compare diagnostics-only ML score formula candidates on one validation panel."""
+
+    if score_panel.empty or probability_col not in score_panel or risk_probability_col not in score_panel:
+        return _empty_ml_formula_candidate_comparison()
+    if return_col not in score_panel:
+        return _empty_ml_formula_candidate_comparison()
+
+    data = score_panel.copy()
+    probability = _numeric_column(data, probability_col).clip(lower=0.0, upper=1.0)
+    risk_probability = _numeric_column(data, risk_probability_col).clip(lower=0.0, upper=1.0)
+    sqrt_opportunity = probability.pow(0.5)
+
+    data["_raw_probability_score"] = 100.0 * probability
+    data["_sqrt_opportunity_only_score"] = 100.0 * sqrt_opportunity
+    data["_current_production_score"] = ml_score(probability, risk_probability)
+    data["_light_risk_penalty_score"] = 100.0 * (0.85 * sqrt_opportunity + 0.15 * (1.0 - risk_probability))
+    data["_risk_haircut_score"] = _risk_haircut_score(data["_sqrt_opportunity_only_score"], risk_probability)
+    drawdown_event_col = None
+    if drawdown_label_col in data:
+        drawdown_event_col = drawdown_label_col
+    elif forward_drawdown_col in data:
+        drawdown_event_col = "_drawdown_event"
+        data[drawdown_event_col] = (_numeric_column(data, forward_drawdown_col) <= drawdown_event_threshold).astype(float)
+
+    candidate_specs = [
+        ("raw_probability", "_raw_probability_score"),
+        ("sqrt_opportunity_only", "_sqrt_opportunity_only_score"),
+        ("current_production_score", "_current_production_score"),
+        ("light_risk_penalty", "_light_risk_penalty_score"),
+        ("risk_haircut_score", "_risk_haircut_score"),
+    ]
+    rows = [
+        _formula_candidate_row(
+            data,
+            candidate_name=candidate_name,
+            score_col=score_col,
+            return_col=return_col,
+            label_col=label_col,
+            drawdown_event_col=drawdown_event_col,
+            min_bucket_size=min_bucket_size,
+            min_samples=min_samples,
+        )
+        for candidate_name, score_col in candidate_specs
+    ]
+    return pd.DataFrame(rows, columns=ML_FORMULA_CANDIDATE_COLUMNS)
+
+
+def interpret_ml_score_formula_candidate_comparison(comparison: pd.DataFrame) -> str:
+    """Return one conservative conclusion for the formula candidate comparison."""
+
+    if comparison.empty or "candidate_name" not in comparison:
+        return "insufficient data"
+    usable = comparison[comparison["interpretation"] != "insufficient data"].copy()
+    if usable.empty:
+        return "insufficient data"
+
+    strong = usable[usable["interpretation"] == "candidate looks strong"].copy()
+    if strong.empty:
+        return "formula evidence is mixed"
+    strong["high_minus_low_spread"] = pd.to_numeric(strong["high_minus_low_spread"], errors="coerce")
+    strong = strong.dropna(subset=["high_minus_low_spread"]).sort_values(
+        ["high_minus_low_spread", "candidate_name"],
+        ascending=[False, True],
+    )
+    if strong.empty:
+        return "formula evidence is mixed"
+
+    def candidate_group(name: str) -> str:
+        if name in {"raw_probability", "sqrt_opportunity_only"}:
+            return "opportunity_only"
+        return name
+
+    best = strong.iloc[0]
+    best_spread = float(best["high_minus_low_spread"])
+    near_best = strong[strong["high_minus_low_spread"] >= best_spread - SPREAD_SIMILARITY_TOLERANCE]
+    near_best_groups = {candidate_group(str(name)) for name in near_best["candidate_name"]}
+    if len(near_best_groups) > 1:
+        return "formula evidence is mixed"
+
+    candidate_name = str(best["candidate_name"])
+    if candidate_name in {"raw_probability", "sqrt_opportunity_only"}:
+        return "opportunity-only scoring looks strongest"
+    if candidate_name == "light_risk_penalty":
+        return "light risk penalty looks strongest"
+    if candidate_name == "risk_haircut_score":
+        return "risk haircut scoring looks strongest"
+    if candidate_name == "current_production_score":
+        return "current production score looks strongest"
+    return "formula evidence is mixed"
+
+
 def _probability_direction_row_supported(row: pd.Series, *, require_label: bool) -> bool:
     if row.get("monotonicity") != "aligned":
         return False
@@ -3340,6 +3615,7 @@ def build_ml_diagnostics(
             probability_direction_panel["probability_risk"],
         )
     probability_direction_check = build_ml_probability_direction_check(probability_direction_panel)
+    formula_candidate_comparison = build_ml_score_formula_candidate_comparison(probability_direction_panel)
 
     if outperformance_predictions.empty or drawdown_risk_predictions.empty:
         summary = pd.DataFrame(
@@ -3363,6 +3639,7 @@ def build_ml_diagnostics(
             _empty_target_comparison(),
             _empty_opportunity_risk_joint_validation(),
             probability_direction_check,
+            formula_candidate_comparison,
         )
 
     score_panel = out.merge(risk, on=["Date", "Ticker"], how="inner")
@@ -3417,4 +3694,5 @@ def build_ml_diagnostics(
         target_comparison,
         opportunity_risk_joint_validation,
         probability_direction_check,
+        formula_candidate_comparison,
     )

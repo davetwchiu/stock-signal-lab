@@ -6,12 +6,15 @@ import pandas as pd
 import pytest
 
 from src.ml.diagnostics import (
+    _risk_haircut_score,
     build_opportunity_risk_joint_validation,
     build_ml_diagnostics,
     build_ml_probability_direction_check,
+    build_ml_score_formula_candidate_comparison,
     build_ml_score_direction_diagnostics,
     build_ml_target_comparison,
     interpret_ml_probability_direction_check,
+    interpret_ml_score_formula_candidate_comparison,
     interpret_opportunity_risk_joint_validation,
     build_probability_label_alignment,
     build_regime_score_direction_summary,
@@ -256,6 +259,109 @@ def test_probability_direction_check_does_not_mutate_input() -> None:
     pd.testing.assert_frame_equal(panel, original)
 
 
+def formula_candidate_panel(
+    *,
+    rows_per_bucket: int = 10,
+    flat: bool = False,
+    include_drawdown_label: bool = True,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    dates = pd.date_range("2024-04-01", periods=rows_per_bucket * 3, freq="B")
+    scenarios = [
+        (0.30, 0.00, 0.00, 0, 0),
+        (0.40, 0.50, 0.03, 1, 0),
+        (0.50, 1.00, 0.08, 1, 1),
+    ]
+    row_index = 0
+    for probability, risk, forward_excess_return, actual, drawdown_event in scenarios:
+        for bucket_index in range(rows_per_bucket):
+            row = {
+                "Date": dates[row_index],
+                "Ticker": f"F{row_index:02d}",
+                "probability_out": 0.40 if flat else probability + bucket_index * 0.0001,
+                "probability_risk": 0.50 if flat else risk,
+                "actual_out": actual,
+                "forward_excess_return": forward_excess_return,
+            }
+            if include_drawdown_label:
+                row["actual_risk"] = drawdown_event
+            rows.append(row)
+            row_index += 1
+    return pd.DataFrame(rows)
+
+
+def test_formula_candidate_comparison_includes_expected_candidate_rows() -> None:
+    comparison = build_ml_score_formula_candidate_comparison(formula_candidate_panel(include_drawdown_label=False))
+
+    assert comparison["candidate_name"].tolist() == [
+        "raw_probability",
+        "sqrt_opportunity_only",
+        "current_production_score",
+        "light_risk_penalty",
+        "risk_haircut_score",
+    ]
+
+
+def test_formula_candidate_comparison_uses_quantile_low_mid_high_groups() -> None:
+    comparison = build_ml_score_formula_candidate_comparison(formula_candidate_panel(include_drawdown_label=False))
+    raw = comparison.set_index("candidate_name").loc["raw_probability"]
+
+    assert raw["low_bucket_forward_excess_return"] == pytest.approx(0.00)
+    assert raw["mid_bucket_forward_excess_return"] == pytest.approx(0.03)
+    assert raw["high_bucket_forward_excess_return"] == pytest.approx(0.08)
+    assert raw["monotonicity"] == "aligned"
+
+
+def test_formula_candidate_comparison_identifies_opportunity_only_as_strong() -> None:
+    comparison = build_ml_score_formula_candidate_comparison(formula_candidate_panel(include_drawdown_label=False))
+    indexed = comparison.set_index("candidate_name")
+
+    assert indexed.loc["raw_probability", "interpretation"] == "candidate looks strong"
+    assert indexed.loc["sqrt_opportunity_only", "interpretation"] == "candidate looks strong"
+    assert interpret_ml_score_formula_candidate_comparison(comparison) == (
+        "opportunity-only scoring looks strongest"
+    )
+
+
+def test_formula_candidate_comparison_can_identify_current_score_as_inverted() -> None:
+    comparison = build_ml_score_formula_candidate_comparison(formula_candidate_panel(include_drawdown_label=False))
+    current = comparison.set_index("candidate_name").loc["current_production_score"]
+
+    assert current["monotonicity"] == "inverted"
+    assert current["interpretation"] == "candidate is inverted"
+
+
+def test_formula_candidate_comparison_computes_risk_haircut_score() -> None:
+    opportunity_score = pd.Series([50.0, 50.0, 50.0])
+    risk_probability = pd.Series([0.39, 0.40, 0.60])
+
+    score = _risk_haircut_score(opportunity_score, risk_probability)
+
+    assert score.tolist() == pytest.approx([50.0, 42.5, 35.0])
+
+
+def test_formula_candidate_comparison_handles_insufficient_flat_and_missing_data() -> None:
+    flat = build_ml_score_formula_candidate_comparison(formula_candidate_panel(flat=True))
+    missing = build_ml_score_formula_candidate_comparison(
+        formula_candidate_panel().drop(columns=["forward_excess_return"])
+    )
+    tiny = build_ml_score_formula_candidate_comparison(formula_candidate_panel(rows_per_bucket=1))
+
+    assert set(flat["interpretation"]) == {"insufficient data"}
+    assert missing.empty
+    assert set(tiny["interpretation"]) == {"insufficient data"}
+    assert interpret_ml_score_formula_candidate_comparison(flat) == "insufficient data"
+
+
+def test_formula_candidate_comparison_does_not_mutate_input() -> None:
+    panel = formula_candidate_panel()
+    original = panel.copy(deep=True)
+
+    build_ml_score_formula_candidate_comparison(panel)
+
+    pd.testing.assert_frame_equal(panel, original)
+
+
 def test_score_direction_diagnostics_identify_aligned_direction() -> None:
     summary = build_ml_score_direction_diagnostics(score_direction_panel())
 
@@ -393,6 +499,7 @@ def test_build_ml_diagnostics_includes_score_direction_tables() -> None:
     assert not diagnostics.score_bucket_monotonicity.empty
     assert not diagnostics.score_inversion.empty
     assert not diagnostics.probability_direction_check.empty
+    assert not diagnostics.formula_candidate_comparison.empty
 
 
 def opportunity_risk_panel(rows_per_cell: int = 5) -> pd.DataFrame:

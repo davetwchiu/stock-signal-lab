@@ -41,6 +41,7 @@ from src.ml.diagnostics import (
     build_ml_feature_signal_diagnostics,
     build_ml_label_audit,
     interpret_ml_probability_direction_check,
+    interpret_ml_score_formula_candidate_comparison,
     interpret_opportunity_risk_joint_validation,
 )
 from src.ml.interpretations import (
@@ -1005,6 +1006,24 @@ with research_tab:
                             else:
                                 st.dataframe(
                                     diagnostics.probability_direction_check,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                            st.write("**ML score formula candidate comparison**")
+                            st.caption(
+                                interpret_ml_score_formula_candidate_comparison(
+                                    diagnostics.formula_candidate_comparison
+                                )
+                            )
+                            st.caption(
+                                "Diagnostics-only formula comparison using quantile buckets on the same "
+                                "walk-forward validation predictions. This does not change production scoring."
+                            )
+                            if diagnostics.formula_candidate_comparison.empty:
+                                st.info("No formula candidate comparison was available for this walk-forward sample.")
+                            else:
+                                st.dataframe(
+                                    diagnostics.formula_candidate_comparison,
                                     width="stretch",
                                     hide_index=True,
                                 )
