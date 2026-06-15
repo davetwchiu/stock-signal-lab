@@ -53,6 +53,26 @@ def date_walk_forward_splits(
     return splits
 
 
+def prediction_merge_keys(left: pd.DataFrame, right: pd.DataFrame) -> list[str]:
+    """Return the safest common key set for validation prediction merges."""
+
+    base_keys = ["Date", "Ticker"]
+    if all(key in left and key in right for key in ["fold", *base_keys]):
+        return ["fold", *base_keys]
+    return base_keys
+
+
+def deduplicate_prediction_keys(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    """Deduplicate prediction rows before joining fold outputs."""
+
+    if frame.empty or any(key not in frame for key in keys):
+        return frame.copy()
+    output = frame.copy()
+    if "Date" in keys:
+        output["Date"] = pd.to_datetime(output["Date"])
+    return output.drop_duplicates(subset=keys, keep="last")
+
+
 def walk_forward_validate_classifier(
     dataset: pd.DataFrame,
     feature_columns: list[str],
@@ -71,13 +91,14 @@ def walk_forward_validate_classifier(
     if dataset.empty:
         return MLValidationResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
     horizon = infer_horizon(label_column)
+    effective_embargo = max(int(embargo), int(horizon))
 
     splits = date_walk_forward_splits(
         dataset["Date"],
         train_window=train_window,
         test_window=test_window,
         step=step,
-        embargo=embargo,
+        embargo=effective_embargo,
     )
     prediction_frames: list[pd.DataFrame] = []
     metric_rows: list[dict[str, object]] = []
@@ -128,6 +149,8 @@ def walk_forward_validate_classifier(
                 "train_rows": len(train),
                 "test_rows": len(test),
                 "positive_rate": float(fold_predictions["actual"].mean()),
+                "requested_embargo": int(embargo),
+                "effective_embargo": effective_embargo,
             }
         )
         metric_rows.append(row)

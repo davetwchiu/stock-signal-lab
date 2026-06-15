@@ -15,7 +15,7 @@ from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config,
 from src.decision.explain import ticker_explanation
 from src.decision.report import generate_markdown_report, main_warning, portfolio_summary_text
 from src.decision.shortlist import SHORTLIST_VIEW_OPTIONS, filter_decision_shortlist
-from src.decision.table import action_counts, build_decision_table
+from src.decision.table import action_counts, build_decision_table, parse_current_weights_input
 from src.decision.user_benchmark import resolve_active_benchmark, save_user_benchmark
 from src.decision.user_portfolio import (
     create_user_portfolio_list,
@@ -56,7 +56,12 @@ from src.ml.interpretations import (
 from src.ml.metrics import calibration_table, confusion_matrix_frame, score_quintile_analysis
 from src.ml.models import MODEL_OPTIONS
 from src.ml.scoring import current_ml_score_table
-from src.ml.validation import compare_feature_groups, walk_forward_validate_classifier
+from src.ml.validation import (
+    compare_feature_groups,
+    deduplicate_prediction_keys,
+    prediction_merge_keys,
+    walk_forward_validate_classifier,
+)
 from src.portfolio.allocation import AllocationConfig
 from src.portfolio.risk import RiskControlConfig
 from src.portfolio.simulator import simulate_portfolio
@@ -128,13 +133,14 @@ def build_features_for_universe(
     include_fourier: bool,
     include_wavelet: bool,
     feature_config: FeatureConfig,
+    benchmark: str = "SPY",
 ) -> dict[str, pd.DataFrame]:
     """Build feature frames for every ticker."""
 
     benchmark_frames = {
-        benchmark: frames[benchmark]
-        for benchmark in ("SPY", "QQQ")
-        if benchmark in frames
+        name: frames[name]
+        for name in dict.fromkeys(("SPY", "QQQ", benchmark.upper()))
+        if name in frames
     }
     output: dict[str, pd.DataFrame] = {}
     for ticker, frame in frames.items():
@@ -190,7 +196,10 @@ def score_panel_from_validation(out_predictions: pd.DataFrame, risk_predictions:
 
     from src.ml.scoring import ml_score
 
-    merged = out_predictions.merge(risk_predictions, on=["Date", "Ticker"], suffixes=("_out", "_risk"))
+    keys = prediction_merge_keys(out_predictions, risk_predictions)
+    out = deduplicate_prediction_keys(out_predictions, keys)
+    risk = deduplicate_prediction_keys(risk_predictions, keys)
+    merged = out.merge(risk, on=keys, suffixes=("_out", "_risk"))
     if merged.empty:
         return pd.DataFrame()
     out_prob = merged["probability_out"]
@@ -199,6 +208,7 @@ def score_panel_from_validation(out_predictions: pd.DataFrame, risk_predictions:
         {
             "Date": pd.to_datetime(merged["Date"]),
             "Ticker": merged["Ticker"],
+            **({"fold": merged["fold"]} if "fold" in merged else {}),
             "ML Outperformance Probability": out_prob,
             "ML Drawdown-Risk Probability": risk_prob,
             "ML Score": ml_score(out_prob, risk_prob),
@@ -452,6 +462,7 @@ with st.sidebar:
     benchmark = resolve_active_benchmark(config.default_benchmark, allowed_benchmarks=BENCHMARK_OPTIONS)
     start_date = default_start
     end_date = default_end
+    current_weights = pd.Series(dtype=float)
 
     if portfolio_lists.source == "default":
         st.caption("No saved portfolio lists yet; using the system default list until you save one.")
@@ -534,6 +545,17 @@ with st.sidebar:
             save_user_benchmark(benchmark)
             st.session_state["benchmark_saved_message"] = f"Using saved benchmark: {benchmark}"
             st.rerun()
+        weights_text = st.text_area(
+            "Current weights",
+            value="",
+            placeholder="NVDA 0.12\nTSLA=0.08",
+            help="Optional current portfolio weights for action labels. Not saved.",
+        )
+        try:
+            current_weights = parse_current_weights_input(weights_text)
+        except ValueError as error:
+            st.warning(f"Current weights ignored: {error}")
+            current_weights = pd.Series(dtype=float)
         start_date = st.date_input("Start date", value=default_start, help="Historical data start date.")
         end_date = st.date_input("End date", value=default_end, help="Historical data end date.")
 
@@ -561,6 +583,7 @@ with st.spinner("Loading data and preparing today's decision view..."):
         include_fourier=True,
         include_wavelet=True,
         feature_config=feature_config,
+        benchmark=benchmark,
     )
 
 benchmark_frame = frames.get(benchmark)
@@ -585,7 +608,14 @@ else:
     current_scores = pd.DataFrame()
 
 latest_features = latest_feature_table(decision_feature_frames)
-decision_table = build_decision_table(current_scores, latest_features, config, profile)
+decision_table = build_decision_table(
+    current_scores,
+    latest_features,
+    config,
+    profile,
+    current_weights=current_weights,
+    benchmark=benchmark,
+)
 market_regime = ""
 if benchmark in feature_frames and not feature_frames[benchmark].empty:
     market_regime = str(feature_frames[benchmark].iloc[-1].get("regime", ""))
@@ -635,6 +665,13 @@ with today_tab:
         + " Pullback risk: "
         + DECISION_HELP["drawdown"]
     )
+    if current_weights.empty:
+        st.caption(
+            "Suggested action labels assume zero current holdings; read them as target-position stances "
+            "or watchlist actions unless optional current weights are supplied."
+        )
+    else:
+        st.caption("Suggested action labels use the optional current weights entered in advanced settings.")
     cockpit_view = st.selectbox(
         "Cockpit view",
         SHORTLIST_VIEW_OPTIONS,
@@ -776,6 +813,11 @@ with research_tab:
         test_window = st.number_input("Test window", min_value=20, max_value=252, value=63, step=21)
         step = st.number_input("Step size", min_value=20, max_value=252, value=63, step=21)
         embargo = st.number_input("Embargo gap", min_value=0, max_value=60, value=20, step=5)
+        if int(embargo) < int(config.default_label_horizon):
+            st.caption(
+                f"Validation uses a minimum embargo of {config.default_label_horizon} trading days to match "
+                "the label horizon."
+            )
         probability_threshold = st.slider("Classification threshold", 0.05, 0.95, 0.50, 0.05)
         show_ml_diagnostics = st.checkbox(
             "Show ML signal diagnostics",

@@ -87,6 +87,36 @@ def test_ml_diagnostics_include_drawdown_risk_calibration_and_summary() -> None:
     assert diagnostics.drawdown_risk_calibration["count"].sum() == 6
 
 
+def test_ml_diagnostics_merge_overlapping_folds_without_row_explosion() -> None:
+    date = pd.Timestamp("2024-01-02")
+    outperformance = pd.DataFrame(
+        {
+            "fold": [1, 2],
+            "Date": [date, date],
+            "Ticker": ["AAA", "AAA"],
+            "actual": [0, 1],
+            "probability": [0.20, 0.80],
+            "forward_return": [0.01, 0.02],
+            "forward_excess_return": [-0.01, 0.04],
+            "forward_drawdown": [-0.08, -0.04],
+        }
+    )
+    drawdown_risk = pd.DataFrame(
+        {
+            "fold": [1, 2],
+            "Date": [date, date],
+            "Ticker": ["AAA", "AAA"],
+            "actual": [1, 0],
+            "probability": [0.70, 0.20],
+        }
+    )
+
+    diagnostics = build_ml_diagnostics(outperformance, drawdown_risk, risk_bins=2)
+
+    assert diagnostics.score_buckets["count"].sum() == 2
+    assert diagnostics.drawdown_risk_calibration["count"].sum() == 2
+
+
 def test_ml_diagnostics_handle_empty_predictions() -> None:
     diagnostics = build_ml_diagnostics(pd.DataFrame(), pd.DataFrame())
 
@@ -122,6 +152,7 @@ def score_direction_panel(
                     "actual_out": return_label,
                     "actual_risk": risk_label,
                     "forward_return": forward_return,
+                    "forward_excess_return": forward_return,
                     "forward_drawdown": drawdown,
                 }
             )
@@ -369,7 +400,7 @@ def test_score_direction_diagnostics_identify_aligned_direction() -> None:
     row = summary.iloc[0]
     assert row["sample_size"] == 30
     assert row["score_column"] == "ML Score"
-    assert row["target_column"] == "forward_return"
+    assert row["target_column"] == "forward_excess_return"
     assert row["label_column"] == "actual_out"
     assert row["drawdown_label_column"] == "actual_risk"
     assert row["top_minus_bottom_spread"] == pytest.approx(0.08)
@@ -408,13 +439,13 @@ def test_probability_label_alignment_shows_score_relationships() -> None:
     alignment = build_probability_label_alignment(score_direction_panel()).set_index("diagnostic")
 
     assert alignment.loc[
-        "positive return probability",
+        "outperformance probability",
         "higher_score_corresponds_to",
-    ] == "higher positive-return probability"
+    ] == "higher outperformance probability"
     assert alignment.loc[
-        "realised forward return",
+        "realised forward excess return",
         "higher_score_corresponds_to",
-    ] == "higher realised forward return"
+    ] == "higher realised forward excess return"
     assert alignment.loc[
         "drawdown-risk label rate",
         "higher_score_corresponds_to",
@@ -462,13 +493,13 @@ def test_score_inversion_diagnostics_compare_current_and_inverted_direction() ->
 def test_score_direction_helpers_handle_missing_target_or_label_columns() -> None:
     panel = score_direction_panel()
 
-    missing_target = build_ml_score_direction_diagnostics(panel.drop(columns=["forward_return"]))
+    missing_target = build_ml_score_direction_diagnostics(panel.drop(columns=["forward_excess_return"]))
     missing_label_alignment = build_probability_label_alignment(panel.drop(columns=["actual_out", "actual_risk"]))
-    missing_monotonicity = build_score_bucket_monotonicity(panel.drop(columns=["forward_return"]))
+    missing_monotonicity = build_score_bucket_monotonicity(panel.drop(columns=["forward_excess_return"]))
 
     assert missing_target.iloc[0]["direction"] == "insufficient"
     assert pd.isna(missing_target.iloc[0]["target_column"])
-    assert "positive return label rate" not in set(missing_label_alignment["diagnostic"])
+    assert "outperformance label rate" not in set(missing_label_alignment["diagnostic"])
     assert "drawdown-risk label rate" not in set(missing_label_alignment["diagnostic"])
     assert "realised drawdown event rate" not in set(missing_label_alignment["diagnostic"])
     assert missing_monotonicity.empty

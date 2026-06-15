@@ -36,6 +36,7 @@ def score_panel(
                         "Ticker": ticker,
                         "ML Score": ml_score_value,
                         "forward_return": forward_return,
+                        "forward_excess_return": forward_return,
                     }
                 )
                 baseline_rows.append(
@@ -119,7 +120,7 @@ def test_regime_segmented_diagnostics_handles_missing_required_columns() -> None
 
     missing_score = build_regime_segmented_ml_diagnostics(panel.drop(columns=["ML Score"]), baseline_panel=baseline)
     missing_forward_return = build_regime_segmented_ml_diagnostics(
-        panel.drop(columns=["forward_return"]),
+        panel.drop(columns=["forward_excess_return"]),
         baseline_panel=baseline,
     )
 
@@ -129,7 +130,7 @@ def test_regime_segmented_diagnostics_handles_missing_required_columns() -> None
 
 def test_regime_segmented_diagnostics_handles_nan_heavy_input() -> None:
     panel, baseline = score_panel()
-    panel.loc[:42, "forward_return"] = pd.NA
+    panel.loc[:42, "forward_excess_return"] = pd.NA
 
     diagnostics = build_regime_segmented_ml_diagnostics(panel, baseline_panel=baseline)
 

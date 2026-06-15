@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from src.features.regime import UPTREND_LOW_VOL
-from src.robustness.runner import run_robustness_tests
+from src.robustness.runner import _score_panel_from_predictions, run_robustness_tests
 from src.robustness.ablation import conclusion_from_metrics
 from src.robustness.stability import stability_score, summarize_robustness, warning_flags
 
@@ -23,6 +23,31 @@ def test_ablation_conclusion_fields() -> None:
     quintiles = pd.DataFrame({"score_quintile": ["Q1", "Q5"], "average_forward_excess_return": [-0.01, 0.02]})
 
     assert conclusion_from_metrics(metrics, quintiles) == "adds value"
+
+
+def test_robustness_score_panel_merge_is_fold_safe_for_overlapping_tests() -> None:
+    date = pd.Timestamp("2024-01-02")
+    out_predictions = pd.DataFrame(
+        {
+            "fold": [1, 2],
+            "Date": [date, date],
+            "Ticker": ["AAA", "AAA"],
+            "probability": [0.20, 0.80],
+        }
+    )
+    risk_predictions = pd.DataFrame(
+        {
+            "fold": [1, 2],
+            "Date": [date, date],
+            "Ticker": ["AAA", "AAA"],
+            "probability": [0.70, 0.20],
+        }
+    )
+
+    panel = _score_panel_from_predictions(out_predictions, risk_predictions)
+
+    assert len(panel) == 2
+    assert panel["fold"].tolist() == [1, 2]
 
 
 def test_robustness_runner_smoke() -> None:

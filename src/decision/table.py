@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from src.decision.config import DecisionConfig, DecisionProfile
@@ -9,6 +11,34 @@ from src.portfolio.allocation import AllocationConfig, allocate_from_scores
 
 
 ACTION_ORDER = ("Add", "Hold", "Trim", "Exit", "Watch")
+ACTION_RANK = {action: index for index, action in enumerate(ACTION_ORDER)}
+
+
+def parse_current_weights_input(raw: str) -> pd.Series:
+    """Parse optional ticker weights from sidebar text."""
+
+    text = str(raw or "").strip()
+    if not text:
+        return pd.Series(dtype=float)
+
+    weights: dict[str, float] = {}
+    entries = [part.strip() for part in re.split(r"[\n,;]+", text) if part.strip()]
+    for entry in entries:
+        if "=" in entry:
+            ticker, value = [part.strip() for part in entry.split("=", maxsplit=1)]
+        else:
+            pieces = entry.split()
+            if len(pieces) != 2:
+                raise ValueError(f"Use TICKER weight pairs, for example NVDA 0.12: {entry}")
+            ticker, value = pieces
+        ticker = ticker.upper()
+        if not ticker:
+            raise ValueError("Ticker is required for each current weight.")
+        try:
+            weights[ticker] = float(value)
+        except ValueError as error:
+            raise ValueError(f"Weight for {ticker} must be numeric.") from error
+    return pd.Series(weights, dtype=float)
 
 
 def target_exposure_bucket(target_weight: float, max_position_size: float) -> str:
@@ -158,6 +188,7 @@ def build_decision_table(
     config: DecisionConfig,
     profile: DecisionProfile,
     current_weights: pd.Series | None = None,
+    benchmark: str = "SPY",
 ) -> pd.DataFrame:
     """Build the simplified one-row-per-ticker Decision Cockpit table."""
 
@@ -191,7 +222,13 @@ def build_decision_table(
     )
     allocated = allocate_from_scores(scores, allocation_config, current_weights=current_weights)
 
-    rs_column = "rs_spy_60d" if "rs_spy_60d" in allocated else "RS vs SPY 60d"
+    benchmark_column = f"rs_{benchmark.lower()}_60d"
+    if benchmark_column in allocated:
+        rs_column = benchmark_column
+    elif "rs_spy_60d" in allocated:
+        rs_column = "rs_spy_60d"
+    else:
+        rs_column = "RS vs SPY 60d"
     allocated["Relative strength rank"] = allocated.get(rs_column, pd.Series(index=allocated.index, dtype=float)).rank(
         ascending=False,
         method="min",
@@ -216,7 +253,10 @@ def build_decision_table(
         }
     )
     output["One-line reason"] = [one_line_reason(row) for _, row in output.iterrows()]
-    return output.sort_values(["Suggested action", "ML score"], ascending=[True, False]).reset_index(drop=True)
+    output["_action_order"] = output["Suggested action"].map(ACTION_RANK).fillna(len(ACTION_RANK))
+    return output.sort_values(["_action_order", "ML score"], ascending=[True, False]).drop(
+        columns=["_action_order"]
+    ).reset_index(drop=True)
 
 
 def action_counts(decision_table: pd.DataFrame) -> dict[str, int]:

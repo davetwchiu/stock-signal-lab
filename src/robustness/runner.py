@@ -9,7 +9,7 @@ import pandas as pd
 
 from src.ml.datasets import build_supervised_panel, feature_group_columns
 from src.ml.scoring import ml_score
-from src.ml.validation import walk_forward_validate_classifier
+from src.ml.validation import deduplicate_prediction_keys, prediction_merge_keys, walk_forward_validate_classifier
 from src.portfolio.allocation import AllocationConfig
 from src.portfolio.risk import RiskControlConfig
 from src.portfolio.simulator import simulate_portfolio
@@ -31,9 +31,12 @@ class RobustnessCase:
 
 
 def _score_panel_from_predictions(out_predictions: pd.DataFrame, risk_predictions: pd.DataFrame) -> pd.DataFrame:
-    merged = out_predictions.merge(
-        risk_predictions,
-        on=["Date", "Ticker"],
+    keys = prediction_merge_keys(out_predictions, risk_predictions)
+    out = deduplicate_prediction_keys(out_predictions, keys)
+    risk = deduplicate_prediction_keys(risk_predictions, keys)
+    merged = out.merge(
+        risk,
+        on=keys,
         suffixes=("_out", "_risk"),
     )
     if merged.empty:
@@ -44,6 +47,7 @@ def _score_panel_from_predictions(out_predictions: pd.DataFrame, risk_prediction
         {
             "Date": pd.to_datetime(merged["Date"]),
             "Ticker": merged["Ticker"],
+            **({"fold": merged["fold"]} if "fold" in merged else {}),
             "ML Outperformance Probability": out_prob,
             "ML Drawdown-Risk Probability": risk_prob,
             "ML Score": ml_score(out_prob, risk_prob),

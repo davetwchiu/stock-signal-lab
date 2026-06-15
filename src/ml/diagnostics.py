@@ -9,6 +9,7 @@ import pandas as pd
 from src.ml.datasets import feature_group_columns
 from src.ml.metrics import calibration_table
 from src.ml.scoring import ml_score
+from src.ml.validation import deduplicate_prediction_keys, prediction_merge_keys
 
 
 BASELINE_COMPARISON_COLUMNS = [
@@ -2088,7 +2089,7 @@ def _add_baseline_interpretations(rows: list[dict[str, object]]) -> list[dict[st
 def build_ml_baseline_comparison(
     score_panel: pd.DataFrame,
     baseline_panel: pd.DataFrame | None = None,
-    forward_return_column: str = "forward_return",
+    forward_return_column: str = "forward_excess_return",
     min_bucket_size: int = MIN_BASELINE_BUCKET_COUNT,
 ) -> pd.DataFrame:
     """Return a compact DataFrame comparing ML score bucket separation with simple baselines."""
@@ -2250,7 +2251,7 @@ def build_regime_segmented_ml_diagnostics(
     *,
     baseline_panel: pd.DataFrame | None = None,
     score_col: str = "ML Score",
-    forward_return_col: str = "forward_return",
+    forward_return_col: str = "forward_excess_return",
     regime_cols: list[str] | None = None,
     min_bucket_size: int = MIN_REGIME_BUCKET_COUNT,
     min_samples: int = MIN_REGIME_SAMPLE_COUNT,
@@ -2328,11 +2329,11 @@ def _score_direction(spread: object, sample_size: int, min_samples: int) -> str:
 
 def _score_direction_interpretation(direction: str) -> str:
     if direction == "aligned":
-        return "Higher ML scores correspond to stronger realised forward returns in this sample."
+        return "Higher ML scores correspond to stronger realised forward excess returns in this sample."
     if direction == "inverted":
-        return "Higher ML scores correspond to weaker realised forward returns in this sample."
+        return "Higher ML scores correspond to weaker realised forward excess returns in this sample."
     if direction == "flat":
-        return "Forward returns are similar across high and low ML score buckets in this sample."
+        return "Forward excess returns are similar across high and low ML score buckets in this sample."
     return "The usable sample is too small or incomplete for a score-direction read."
 
 
@@ -2379,7 +2380,7 @@ def build_ml_score_direction_diagnostics(
     score_panel: pd.DataFrame,
     *,
     score_col: str = "ML Score",
-    target_col: str = "forward_return",
+    target_col: str = "forward_excess_return",
     label_col: str = "actual_out",
     drawdown_label_col: str = "actual_risk",
     min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
@@ -2480,7 +2481,7 @@ def build_probability_label_alignment(
     *,
     score_col: str = "ML Score",
     return_probability_col: str = "probability_out",
-    target_col: str = "forward_return",
+    target_col: str = "forward_excess_return",
     return_label_col: str = "actual_out",
     drawdown_label_col: str = "actual_risk",
     forward_drawdown_col: str = "forward_drawdown",
@@ -2494,29 +2495,29 @@ def build_probability_label_alignment(
     rows = [
         _alignment_row(
             score_panel,
-            diagnostic="positive return probability",
+            diagnostic="outperformance probability",
             score_col=score_col,
             value_col=return_probability_col,
-            positive_text="higher positive-return probability",
-            negative_text="lower positive-return probability",
+            positive_text="higher outperformance probability",
+            negative_text="lower outperformance probability",
             min_bucket_size=min_bucket_size,
         ),
         _alignment_row(
             score_panel,
-            diagnostic="realised forward return",
+            diagnostic="realised forward excess return",
             score_col=score_col,
             value_col=target_col,
-            positive_text="higher realised forward return",
-            negative_text="lower realised forward return",
+            positive_text="higher realised forward excess return",
+            negative_text="lower realised forward excess return",
             min_bucket_size=min_bucket_size,
         ),
         _alignment_row(
             score_panel,
-            diagnostic="positive return label rate",
+            diagnostic="outperformance label rate",
             score_col=score_col,
             value_col=return_label_col,
-            positive_text="higher positive-return label rate",
-            negative_text="lower positive-return label rate",
+            positive_text="higher outperformance label rate",
+            negative_text="lower outperformance label rate",
             min_bucket_size=min_bucket_size,
         ),
         _alignment_row(
@@ -2568,13 +2569,13 @@ def _monotonicity_result(values: list[float]) -> str:
 
 def _monotonicity_interpretation(result: str) -> str:
     if result == "aligned":
-        return "Forward returns rise across the ML score buckets in this sample."
+        return "Forward excess returns rise across the ML score buckets in this sample."
     if result == "inverted":
-        return "Forward returns fall across the ML score buckets in this sample."
+        return "Forward excess returns fall across the ML score buckets in this sample."
     if result == "flat":
-        return "Forward returns are similar across ML score buckets in this sample."
+        return "Forward excess returns are similar across ML score buckets in this sample."
     if result == "mixed":
-        return "Forward returns are not monotonic across ML score buckets in this sample."
+        return "Forward excess returns are not monotonic across ML score buckets in this sample."
     return "There is too little usable bucket data for a monotonicity read."
 
 
@@ -2582,7 +2583,7 @@ def build_score_bucket_monotonicity(
     score_panel: pd.DataFrame,
     *,
     score_col: str = "ML Score",
-    target_col: str = "forward_return",
+    target_col: str = "forward_excess_return",
     return_label_col: str = "actual_out",
     drawdown_label_col: str = "actual_risk",
 ) -> pd.DataFrame:
@@ -2988,7 +2989,7 @@ def build_score_inversion_diagnostics(
     score_panel: pd.DataFrame,
     *,
     score_col: str = "ML Score",
-    target_col: str = "forward_return",
+    target_col: str = "forward_excess_return",
     min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
 ) -> pd.DataFrame:
     """Compare current score buckets with an inverted score used only inside this diagnostic."""
@@ -3032,13 +3033,13 @@ def build_score_inversion_diagnostics(
         interpretation = "The score buckets are too small for an inversion comparison."
     elif current_spread > inverted_spread + SPREAD_SIMILARITY_TOLERANCE:
         better = "current ML score"
-        interpretation = "The current score direction gives better forward-return separation in this sample."
+        interpretation = "The current score direction gives better forward-excess-return separation in this sample."
     elif inverted_spread > current_spread + SPREAD_SIMILARITY_TOLERANCE:
         better = "inverted score"
-        interpretation = "The inverted score direction gives better forward-return separation in this sample."
+        interpretation = "The inverted score direction gives better forward-excess-return separation in this sample."
     else:
         better = "similar"
-        interpretation = "Current and inverted score directions show similar forward-return separation."
+        interpretation = "Current and inverted score directions show similar forward-excess-return separation."
 
     for row in rows:
         row["better_forward_return_separation"] = better
@@ -3507,7 +3508,7 @@ def build_regime_score_direction_summary(
     *,
     baseline_panel: pd.DataFrame | None = None,
     score_col: str = "ML Score",
-    target_col: str = "forward_return",
+    target_col: str = "forward_excess_return",
     regime_cols: list[str] | None = None,
     min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
     min_samples: int = MIN_REGIME_SAMPLE_COUNT,
@@ -3592,7 +3593,11 @@ def build_ml_diagnostics(
         "forward_excess_return",
         "forward_drawdown",
     ]
+    if "fold" in outperformance_predictions:
+        out_columns.insert(0, "fold")
     risk_columns = ["Date", "Ticker", "actual", "probability"]
+    if "fold" in drawdown_risk_predictions:
+        risk_columns.insert(0, "fold")
     out = outperformance_predictions[
         [column for column in out_columns if column in outperformance_predictions]
     ].rename(columns={"actual": "actual_out", "probability": "probability_out"})
@@ -3608,7 +3613,15 @@ def build_ml_diagnostics(
         and {"Date", "Ticker"}.issubset(probability_direction_panel.columns)
         and {"Date", "Ticker"}.issubset(risk.columns)
     ):
-        probability_direction_panel = probability_direction_panel.merge(risk, on=["Date", "Ticker"], how="left")
+        keys = prediction_merge_keys(probability_direction_panel, risk)
+        probability_direction_panel = deduplicate_prediction_keys(
+            probability_direction_panel,
+            keys,
+        ).merge(
+            deduplicate_prediction_keys(risk, keys),
+            on=keys,
+            how="left",
+        )
     if not probability_direction_panel.empty and "probability_risk" in probability_direction_panel:
         probability_direction_panel["ML Score"] = ml_score(
             probability_direction_panel["probability_out"],
@@ -3642,7 +3655,12 @@ def build_ml_diagnostics(
             formula_candidate_comparison,
         )
 
-    score_panel = out.merge(risk, on=["Date", "Ticker"], how="inner")
+    keys = prediction_merge_keys(out, risk)
+    score_panel = deduplicate_prediction_keys(out, keys).merge(
+        deduplicate_prediction_keys(risk, keys),
+        on=keys,
+        how="inner",
+    )
     if not score_panel.empty:
         score_panel["ML Score"] = ml_score(score_panel["probability_out"], score_panel["probability_risk"])
     baseline_comparison = build_ml_baseline_comparison(score_panel, baseline_panel)

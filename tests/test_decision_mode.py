@@ -12,7 +12,13 @@ from src.decision.shortlist import (
     SHORTLIST_VIEW_WEAK,
     filter_decision_shortlist,
 )
-from src.decision.table import build_decision_table, confidence_from_score, one_line_reason, target_exposure_bucket
+from src.decision.table import (
+    build_decision_table,
+    confidence_from_score,
+    one_line_reason,
+    parse_current_weights_input,
+    target_exposure_bucket,
+)
 from src.features.regime import DOWNTREND_HIGH_RISK, UPTREND_LOW_VOL
 from src.portfolio.allocation import suggested_action
 
@@ -121,6 +127,99 @@ def test_decision_mode_table_output_shape() -> None:
         "One-line reason",
     ]
     assert len(table) == 2
+
+
+def test_decision_table_uses_active_benchmark_relative_strength_rank() -> None:
+    config = load_decision_config()
+    profile = profile_settings(config, "Balanced")
+    current_scores = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB"],
+            "Rule-Based Regime": [UPTREND_LOW_VOL, UPTREND_LOW_VOL],
+            "ML Score": [90.0, 89.0],
+            "ML Drawdown-Risk Probability": [0.10, 0.10],
+        }
+    )
+    latest_features = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB"],
+            "Adj Close": [100.0, 50.0],
+            "rs_spy_60d": [0.10, -0.10],
+            "rs_smh_60d": [-0.05, 0.20],
+        }
+    )
+
+    table = build_decision_table(current_scores, latest_features, config, profile, benchmark="SMH")
+    ranks = table.set_index("Ticker")["Relative strength rank"]
+
+    assert ranks.loc["BBB"] == 1
+    assert ranks.loc["AAA"] == 2
+
+
+def test_decision_table_falls_back_to_spy_relative_strength_rank() -> None:
+    config = load_decision_config()
+    profile = profile_settings(config, "Balanced")
+    current_scores = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB"],
+            "Rule-Based Regime": [UPTREND_LOW_VOL, UPTREND_LOW_VOL],
+            "ML Score": [90.0, 89.0],
+            "ML Drawdown-Risk Probability": [0.10, 0.10],
+        }
+    )
+    latest_features = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB"],
+            "Adj Close": [100.0, 50.0],
+            "rs_spy_60d": [0.10, -0.10],
+        }
+    )
+
+    table = build_decision_table(current_scores, latest_features, config, profile, benchmark="SOXX")
+    ranks = table.set_index("Ticker")["Relative strength rank"]
+
+    assert ranks.loc["AAA"] == 1
+    assert ranks.loc["BBB"] == 2
+
+
+def test_decision_table_sorts_actions_in_intended_order() -> None:
+    config = load_decision_config()
+    profile = profile_settings(config, "Balanced")
+    current_scores = pd.DataFrame(
+        {
+            "Ticker": ["WATCH", "EXIT", "TRIM", "HOLD", "ADD"],
+            "Rule-Based Regime": [UPTREND_LOW_VOL] * 5,
+            "ML Score": [20.0, 95.0, 94.0, 93.0, 92.0],
+            "ML Drawdown-Risk Probability": [0.70, 0.70, 0.10, 0.10, 0.10],
+        }
+    )
+    latest_features = pd.DataFrame(
+        {
+            "Ticker": ["WATCH", "EXIT", "TRIM", "HOLD", "ADD"],
+            "Adj Close": [100.0] * 5,
+            "rs_spy_60d": [0.01] * 5,
+        }
+    )
+    current_weights = pd.Series({"EXIT": 0.10, "TRIM": 0.14, "HOLD": 0.12, "ADD": 0.00, "WATCH": 0.00})
+
+    table = build_decision_table(current_scores, latest_features, config, profile, current_weights=current_weights)
+
+    assert table["Suggested action"].tolist() == ["Add", "Hold", "Trim", "Exit", "Watch"]
+
+
+def test_parse_current_weights_input_accepts_newlines_commas_and_equals() -> None:
+    weights = parse_current_weights_input("nvda 0.12\nTSLA=0.08, pltr 0.05")
+
+    assert weights.to_dict() == {"NVDA": 0.12, "TSLA": 0.08, "PLTR": 0.05}
+
+
+def test_parse_current_weights_input_rejects_malformed_entries() -> None:
+    try:
+        parse_current_weights_input("NVDA")
+    except ValueError as error:
+        assert "TICKER weight" in str(error)
+    else:
+        raise AssertionError("Expected malformed current weights to raise ValueError")
 
 
 def test_decision_shortlist_filters_existing_table_columns() -> None:

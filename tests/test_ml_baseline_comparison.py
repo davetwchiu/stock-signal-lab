@@ -32,6 +32,7 @@ def score_panel(
                 "Ticker": f"T{index:02d}",
                 "ML Score": ml_score_value,
                 "forward_return": forward_return,
+                "forward_excess_return": forward_return,
             }
         )
     return pd.DataFrame(rows)
@@ -102,7 +103,7 @@ def test_ml_baseline_comparison_handles_missing_required_columns() -> None:
 
 def test_ml_baseline_comparison_handles_nan_heavy_input() -> None:
     panel = score_panel()
-    panel.loc[:26, "forward_return"] = pd.NA
+    panel.loc[:26, "forward_excess_return"] = pd.NA
 
     comparison = comparison_by_signal(build_ml_baseline_comparison(panel))
 
