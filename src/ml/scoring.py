@@ -12,7 +12,7 @@ from src.ml.models import fit_classifier, predict_positive_probability
 def ml_score(outperform_probability: pd.Series, drawdown_risk_probability: pd.Series) -> pd.Series:
     """Convert opportunity and risk probabilities into a 0-100 advisory score."""
 
-    outperformance_evidence = np.sqrt((1.0 - outperform_probability).clip(lower=0.0, upper=1.0))
+    outperformance_evidence = np.sqrt(outperform_probability.clip(lower=0.0, upper=1.0))
     score = 100.0 * (0.7 * outperformance_evidence + 0.3 * (1.0 - drawdown_risk_probability))
     return score.clip(lower=0, upper=100)
 

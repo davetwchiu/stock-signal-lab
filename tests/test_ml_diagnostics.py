@@ -28,8 +28,8 @@ def validation_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
             "Date": dates,
             "Ticker": ["AAA", "BBB", "CCC", "AAA", "BBB", "CCC"],
             "actual": [0, 0, 0, 1, 1, 1],
-            "probability": [0.90, 0.85, 0.65, 0.60, 0.30, 0.20],
-            "prediction": [0, 0, 1, 1, 1, 1],
+            "probability": [0.10, 0.20, 0.45, 0.50, 0.75, 0.85],
+            "prediction": [0, 0, 0, 1, 1, 1],
             "forward_return": [-0.05, -0.02, 0.01, 0.03, 0.08, 0.10],
             "forward_excess_return": [-0.08, -0.04, -0.01, 0.02, 0.06, 0.09],
             "forward_drawdown": [-0.20, -0.15, -0.08, -0.07, -0.04, -0.03],
@@ -42,7 +42,7 @@ def validation_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
             "Date": dates,
             "Ticker": ["AAA", "BBB", "CCC", "AAA", "BBB", "CCC"],
             "actual": [1, 1, 0, 0, 0, 0],
-            "probability": [0.80, 0.75, 0.45, 0.35, 0.20, 0.10],
+            "probability": [0.80, 0.75, 0.50, 0.45, 0.20, 0.10],
             "prediction": [1, 1, 0, 0, 0, 0],
         }
     )
@@ -175,6 +175,7 @@ def test_probability_direction_check_identifies_raw_direction() -> None:
     indexed = direction.set_index("signal")
     assert indexed.loc["raw probability", "monotonicity"] == "aligned"
     assert indexed.loc["raw probability", "high_minus_low_spread"] == pytest.approx(0.08)
+    assert indexed.loc["current ML Score", "monotonicity"] == "aligned"
     assert indexed.loc["raw probability", "actual_label_rate_high_bucket"] > indexed.loc[
         "raw probability",
         "actual_label_rate_low_bucket",
@@ -209,6 +210,17 @@ def test_probability_direction_check_identifies_current_ml_score_direction() -> 
         interpret_ml_probability_direction_check(direction)
         == "current ML Score direction is supported"
     )
+
+
+def test_probability_direction_check_identifies_corrected_current_ml_score_direction() -> None:
+    panel = probability_direction_panel(raw_direction="supported", include_risk=False)
+    panel["probability_risk"] = 0.30
+
+    direction = build_ml_probability_direction_check(panel)
+
+    indexed = direction.set_index("signal")
+    assert indexed.loc["current ML Score", "monotonicity"] == "aligned"
+    assert indexed.loc["current ML Score", "high_minus_low_spread"] == pytest.approx(0.08)
 
 
 def test_probability_direction_check_returns_mixed_for_flat_data() -> None:
