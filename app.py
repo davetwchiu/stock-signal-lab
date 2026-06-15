@@ -859,6 +859,17 @@ with research_tab:
                             embargo=int(embargo),
                             probability_threshold=float(probability_threshold),
                         )
+                        risk_adjusted_result = walk_forward_validate_classifier(
+                            supervised,
+                            columns,
+                            label_column=f"label_risk_adjusted_outperform_{config.default_label_horizon}d",
+                            model_name=model_name,
+                            train_window=int(train_window),
+                            test_window=int(test_window),
+                            step=int(step),
+                            embargo=int(embargo),
+                            probability_threshold=float(probability_threshold),
+                        )
                         if risk_result.predictions.empty:
                             st.warning("No drawdown-risk predictions were available for ML diagnostics.")
                         else:
@@ -868,6 +879,7 @@ with research_tab:
                                 result.overall_metrics,
                                 risk_result.overall_metrics,
                                 baseline_panel=supervised,
+                                risk_adjusted_predictions=risk_adjusted_result.predictions,
                             )
                             show_research_lab_run_interpretation(
                                 interpret_research_lab_run(
@@ -936,6 +948,19 @@ with research_tab:
                                 st.info("No baseline comparison was available for this walk-forward sample.")
                             else:
                                 st.dataframe(diagnostics.baseline_comparison, width="stretch")
+                            st.write("**ML target comparison: v1 vs risk-adjusted relative v2**")
+                            st.caption(
+                                "Diagnostics-only comparison of the current target and the risk-adjusted "
+                                "relative forward-return target. This does not replace production ML scoring."
+                            )
+                            if diagnostics.target_comparison.empty:
+                                st.info("No target comparison was available for this walk-forward sample.")
+                            else:
+                                st.dataframe(
+                                    diagnostics.target_comparison,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
                             st.write("**ML score direction diagnostics**")
                             st.caption(
                                 "Diagnostics-only checks for score direction, label alignment, bucket "

@@ -8,6 +8,7 @@ import pytest
 from src.ml.diagnostics import (
     build_ml_diagnostics,
     build_ml_score_direction_diagnostics,
+    build_ml_target_comparison,
     build_probability_label_alignment,
     build_regime_score_direction_summary,
     build_score_bucket_monotonicity,
@@ -28,6 +29,7 @@ def validation_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
             "forward_return": [-0.05, -0.02, 0.01, 0.03, 0.08, 0.10],
             "forward_excess_return": [-0.08, -0.04, -0.01, 0.02, 0.06, 0.09],
             "forward_drawdown": [-0.20, -0.15, -0.08, -0.07, -0.04, -0.03],
+            "forward_risk_adjusted_excess_return": [-0.18, -0.115, -0.05, -0.015, 0.04, 0.075],
         }
     )
     drawdown_risk = pd.DataFrame(
@@ -256,6 +258,64 @@ def test_build_ml_diagnostics_includes_score_direction_tables() -> None:
     assert not diagnostics.probability_label_alignment.empty
     assert not diagnostics.score_bucket_monotonicity.empty
     assert not diagnostics.score_inversion.empty
+
+
+def target_comparison_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
+    dates = pd.date_range("2024-01-01", periods=30, freq="B")
+    v1_rows: list[dict[str, object]] = []
+    v2_rows: list[dict[str, object]] = []
+    for index, probability in enumerate([0.10] * 10 + [0.50] * 10 + [0.90] * 10):
+        v1_excess = 0.00 if index < 10 else 0.02 if index < 20 else 0.03
+        v2_target = -0.04 if index < 10 else 0.01 if index < 20 else 0.08
+        base = {
+            "fold": 1,
+            "Date": dates[index],
+            "Ticker": f"T{index:02d}",
+            "actual": 1 if probability >= 0.50 else 0,
+            "probability": probability,
+            "prediction": 1 if probability >= 0.50 else 0,
+        }
+        v1_rows.append(
+            {
+                **base,
+                "forward_excess_return": v1_excess,
+                "forward_risk_adjusted_excess_return": v2_target,
+            }
+        )
+        v2_rows.append(
+            {
+                **base,
+                "forward_excess_return": v1_excess,
+                "forward_risk_adjusted_excess_return": v2_target,
+            }
+        )
+    return pd.DataFrame(v1_rows), pd.DataFrame(v2_rows)
+
+
+def test_ml_target_comparison_identifies_stronger_v2_separation() -> None:
+    v1, v2 = target_comparison_predictions()
+
+    comparison = build_ml_target_comparison(v1, v2).set_index("target_version")
+
+    assert comparison.loc["v1 outperformance", "relative_result"] == "v1 reference"
+    assert comparison.loc["v2 risk-adjusted relative", "high_minus_low_spread"] == pytest.approx(0.12)
+    assert comparison.loc["v2 risk-adjusted relative", "monotonicity"] == "aligned"
+    assert comparison.loc["v2 risk-adjusted relative", "relative_result"] == "v2 looks better"
+
+
+def test_ml_target_comparison_handles_insufficient_data() -> None:
+    tiny = pd.DataFrame(
+        {
+            "probability": [0.2, 0.8],
+            "forward_excess_return": [0.01, 0.02],
+            "forward_risk_adjusted_excess_return": [0.00, 0.01],
+        }
+    )
+
+    comparison = build_ml_target_comparison(tiny, tiny)
+
+    assert comparison["relative_result"].tolist() == ["v1 reference", "insufficient data"]
+    assert comparison.loc[1, "monotonicity"] == "insufficient"
 
 
 def test_score_direction_interpretations_avoid_trading_action_words() -> None:

@@ -11,6 +11,8 @@ import pandas as pd
 
 from src.features.regime import DISTRIBUTION, DOWNTREND_HIGH_RISK
 
+DEFAULT_DRAWDOWN_PENALTY_WEIGHT = 0.5
+
 
 def forward_return(price: pd.Series, horizon: int = 20) -> pd.Series:
     """Return from date `t` to `t + horizon`."""
@@ -36,6 +38,22 @@ def forward_drawdown(price: pd.Series, horizon: int = 20) -> pd.Series:
     output = pd.concat(future_returns, axis=1).min(axis=1)
     output.iloc[-horizon:] = np.nan
     return output
+
+
+def make_risk_adjusted_relative_forward_target(
+    price: pd.Series,
+    benchmark_price: pd.Series,
+    horizon: int = 20,
+    drawdown_penalty_weight: float = DEFAULT_DRAWDOWN_PENALTY_WEIGHT,
+) -> pd.Series:
+    """Forward excess return minus a penalty for worst forward drawdown."""
+
+    excess = forward_excess_return(price.astype(float), benchmark_price.astype(float), horizon)
+    drawdown = forward_drawdown(price.astype(float), horizon)
+    drawdown_penalty = drawdown.clip(upper=0.0).abs()
+    target = excess - drawdown_penalty_weight * drawdown_penalty
+    target.name = f"forward_{horizon}d_risk_adjusted_excess_return"
+    return target
 
 
 def forward_regime_deterioration(
@@ -71,17 +89,28 @@ def make_forward_labels(
     benchmark_forward = forward_return(benchmark, horizon)
     excess = ticker_forward - benchmark_forward
     drawdown = forward_drawdown(price, horizon)
+    risk_adjusted = make_risk_adjusted_relative_forward_target(
+        price,
+        benchmark,
+        horizon=horizon,
+        drawdown_penalty_weight=DEFAULT_DRAWDOWN_PENALTY_WEIGHT,
+    )
 
     labels = pd.DataFrame(index=features.index)
     labels[f"forward_{horizon}d_return"] = ticker_forward
     labels[f"benchmark_forward_{horizon}d_return"] = benchmark_forward
     labels[f"forward_{horizon}d_excess_return"] = excess
     labels[f"forward_{horizon}d_drawdown"] = drawdown
+    labels[f"forward_{horizon}d_risk_adjusted_excess_return"] = risk_adjusted
     labels[f"label_outperform_{horizon}d"] = (excess > outperformance_threshold).astype(float)
+    labels[f"label_risk_adjusted_outperform_{horizon}d"] = (
+        risk_adjusted > outperformance_threshold
+    ).astype(float)
     labels[f"label_drawdown_risk_{horizon}d"] = (drawdown < drawdown_threshold).astype(float)
 
     invalid = ticker_forward.isna() | benchmark_forward.isna()
     labels.loc[invalid, [f"label_outperform_{horizon}d"]] = np.nan
+    labels.loc[risk_adjusted.isna(), [f"label_risk_adjusted_outperform_{horizon}d"]] = np.nan
     labels.loc[drawdown.isna(), [f"label_drawdown_risk_{horizon}d"]] = np.nan
 
     if "regime" in features:
@@ -89,4 +118,3 @@ def make_forward_labels(
             features["regime"], horizon=horizon
         )
     return labels
-

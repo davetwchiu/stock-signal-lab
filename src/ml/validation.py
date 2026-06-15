@@ -107,6 +107,9 @@ def walk_forward_validate_classifier(
                 "forward_return": test.get(f"forward_{horizon}d_return"),
                 "forward_excess_return": test.get(f"forward_{horizon}d_excess_return"),
                 "forward_drawdown": test.get(f"forward_{horizon}d_drawdown"),
+                "forward_risk_adjusted_excess_return": test.get(
+                    f"forward_{horizon}d_risk_adjusted_excess_return"
+                ),
             },
             index=test.index,
         )
