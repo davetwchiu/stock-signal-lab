@@ -7,6 +7,11 @@ from dataclasses import dataclass
 import pandas as pd
 
 from src.ml.datasets import feature_group_columns
+from src.ml.feature_selection import (
+    FEATURE_REDUNDANCY_CORRELATION_THRESHOLD,
+    FEATURE_REDUNDANCY_REPORT_COLUMNS,
+    prune_redundant_features,
+)
 from src.ml.metrics import calibration_table
 from src.ml.scoring import ml_score
 from src.ml.validation import deduplicate_prediction_keys, prediction_merge_keys
@@ -287,6 +292,14 @@ FEATURE_CORRELATION_PAIR_COLUMNS = [
     "interpretation",
 ]
 
+FEATURE_REDUNDANCY_SELECTION_SUMMARY_COLUMNS = [
+    "candidate_feature_count",
+    "kept_feature_count",
+    "dropped_feature_count",
+    "correlation_threshold",
+    "interpretation",
+]
+
 FEATURE_IMPORTANCE_COLUMNS = [
     "feature",
     "importance",
@@ -386,6 +399,8 @@ class MLFeatureAudit:
     warnings: pd.DataFrame
     redundancy_summary: pd.DataFrame
     high_correlation_pairs: pd.DataFrame
+    redundancy_selection_summary: pd.DataFrame
+    redundancy_selection_report: pd.DataFrame
     feature_importance: pd.DataFrame
 
 
@@ -534,6 +549,14 @@ def _empty_feature_redundancy_summary() -> pd.DataFrame:
 
 def _empty_feature_correlation_pairs() -> pd.DataFrame:
     return pd.DataFrame(columns=FEATURE_CORRELATION_PAIR_COLUMNS)
+
+
+def _empty_feature_redundancy_selection_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_REDUNDANCY_SELECTION_SUMMARY_COLUMNS)
+
+
+def _empty_feature_redundancy_selection_report() -> pd.DataFrame:
+    return pd.DataFrame(columns=FEATURE_REDUNDANCY_REPORT_COLUMNS)
 
 
 def _empty_feature_importance_summary() -> pd.DataFrame:
@@ -896,6 +919,71 @@ def build_feature_redundancy_summary(
     return summary, pair_frame
 
 
+def build_feature_redundancy_selection(
+    panel: pd.DataFrame,
+    candidate_columns: list[str],
+    *,
+    correlation_threshold: float = FEATURE_REDUNDANCY_CORRELATION_THRESHOLD,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return deterministic transform-feature pruning diagnostics."""
+
+    candidates = list(dict.fromkeys(candidate_columns))
+    fourier_candidates = [column for column in candidates if column.startswith("fourier_")]
+    wavelet_candidates = [column for column in candidates if column.startswith("wavelet_")]
+    transform_candidates = fourier_candidates + wavelet_candidates
+    if panel.empty or not transform_candidates:
+        summary = pd.DataFrame(
+            [
+                {
+                    "candidate_feature_count": len(transform_candidates),
+                    "kept_feature_count": len(transform_candidates),
+                    "dropped_feature_count": 0,
+                    "correlation_threshold": correlation_threshold,
+                    "interpretation": "No Fourier/Wavelet pruning candidates were available.",
+                }
+            ],
+            columns=FEATURE_REDUNDANCY_SELECTION_SUMMARY_COLUMNS,
+        )
+        return summary, _empty_feature_redundancy_selection_report()
+
+    kept_columns: list[str] = []
+    dropped_columns: list[str] = []
+    reports: list[pd.DataFrame] = []
+    for family_candidates in (fourier_candidates, wavelet_candidates):
+        family_kept, family_dropped, family_report = prune_redundant_features(
+            panel,
+            family_candidates,
+            correlation_threshold=correlation_threshold,
+        )
+        kept_columns.extend(family_kept)
+        dropped_columns.extend(family_dropped)
+        if not family_report.empty:
+            reports.append(family_report)
+    report = (
+        pd.concat(reports, ignore_index=True)
+        if reports
+        else _empty_feature_redundancy_selection_report()
+    )
+    interpretation = (
+        "Highly correlated Fourier/Wavelet candidates were pruned before model training."
+        if dropped_columns
+        else "No highly correlated Fourier/Wavelet candidates were pruned at this threshold."
+    )
+    summary = pd.DataFrame(
+        [
+            {
+                "candidate_feature_count": len(transform_candidates),
+                "kept_feature_count": len(kept_columns),
+                "dropped_feature_count": len(dropped_columns),
+                "correlation_threshold": correlation_threshold,
+                "interpretation": interpretation,
+            }
+        ],
+        columns=FEATURE_REDUNDANCY_SELECTION_SUMMARY_COLUMNS,
+    )
+    return summary, report
+
+
 def _extract_model_step(model: object) -> object | None:
     if model is None:
         return None
@@ -959,14 +1047,27 @@ def build_ml_feature_audit(
     feature_columns: list[str] | None = None,
     *,
     model: object | None = None,
+    redundancy_candidate_columns: list[str] | None = None,
 ) -> MLFeatureAudit:
     """Build read-only diagnostics for current ML feature columns."""
 
     features = _coerce_feature_columns(panel, feature_columns)
+    if redundancy_candidate_columns is None:
+        redundancy_candidates = (
+            feature_group_columns(panel, "all", prune_redundant_complex=False)
+            if feature_columns is None
+            else features
+        )
+    else:
+        redundancy_candidates = list(dict.fromkeys(redundancy_candidate_columns))
     inventory = build_feature_inventory_summary(panel, features)
     family_summary = build_feature_family_summary(features)
     warnings = build_feature_audit_warnings(panel, features, family_summary)
     redundancy_summary, high_correlation_pairs = build_feature_redundancy_summary(panel, features)
+    redundancy_selection_summary, redundancy_selection_report = build_feature_redundancy_selection(
+        panel,
+        redundancy_candidates,
+    )
     present_numeric_features = _numeric_audit_features(panel, features)
     return MLFeatureAudit(
         inventory,
@@ -974,6 +1075,8 @@ def build_ml_feature_audit(
         warnings,
         redundancy_summary,
         high_correlation_pairs,
+        redundancy_selection_summary,
+        redundancy_selection_report,
         build_feature_importance_summary(model, present_numeric_features),
     )
 

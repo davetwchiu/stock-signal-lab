@@ -381,6 +381,16 @@ def show_ml_feature_audit(audit: MLFeatureAudit) -> None:
             audit.high_correlation_pairs,
             "No high-correlation feature pairs were detected at the configured threshold.",
         )
+        _show_label_audit_table(
+            "Feature redundancy selection",
+            audit.redundancy_selection_summary,
+            "No feature redundancy selection summary was available for this sample.",
+        )
+        _show_label_audit_table(
+            "Dropped redundant Fourier/Wavelet features",
+            audit.redundancy_selection_report,
+            "No Fourier/Wavelet features were dropped by redundancy selection.",
+        )
         st.write("**Feature importance**")
         if audit.feature_importance.empty:
             st.info(
@@ -883,6 +893,11 @@ with research_tab:
                         feature_audit = build_ml_feature_audit(
                             supervised,
                             columns,
+                            redundancy_candidate_columns=feature_group_columns(
+                                supervised,
+                                feature_group,
+                                prune_redundant_complex=False,
+                            ),
                         )
                         show_ml_feature_audit(feature_audit)
                         show_ml_feature_signal_diagnostics(

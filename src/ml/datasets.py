@@ -6,6 +6,7 @@ import re
 
 import pandas as pd
 
+from src.ml.feature_selection import prune_redundant_features
 from src.ml.labels import make_forward_labels
 
 
@@ -51,7 +52,17 @@ MODEL_FEATURE_EXCLUDE = {
 }
 
 
-def feature_group_columns(frame: pd.DataFrame, group: str = "all") -> list[str]:
+def _prune_transform_columns(frame: pd.DataFrame, columns: list[str]) -> list[str]:
+    kept_columns, _, _ = prune_redundant_features(frame, columns)
+    return kept_columns
+
+
+def feature_group_columns(
+    frame: pd.DataFrame,
+    group: str = "all",
+    *,
+    prune_redundant_complex: bool = True,
+) -> list[str]:
     """Return numeric feature columns for a named feature group."""
 
     numeric_columns = [column for column in frame.columns if pd.api.types.is_numeric_dtype(frame[column])]
@@ -67,9 +78,13 @@ def feature_group_columns(frame: pd.DataFrame, group: str = "all") -> list[str]:
     technical = [column for column in candidates if column.startswith(TECHNICAL_PREFIXES)]
     fourier = [column for column in candidates if column.startswith("fourier_")]
     wavelet = [column for column in candidates if column.startswith("wavelet_")]
-
     if group == "technical":
         return technical
+
+    if prune_redundant_complex:
+        fourier = _prune_transform_columns(frame, fourier)
+        wavelet = _prune_transform_columns(frame, wavelet)
+
     if group == "technical_fourier":
         return technical + fourier
     if group == "technical_wavelet":

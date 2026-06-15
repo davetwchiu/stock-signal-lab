@@ -207,6 +207,8 @@ def test_feature_audit_interpretations_avoid_trading_action_words() -> None:
         audit.warnings,
         audit.redundancy_summary,
         audit.high_correlation_pairs,
+        audit.redundancy_selection_summary,
+        audit.redundancy_selection_report,
         audit.feature_importance,
     ]
     text = " ".join(
