@@ -39,7 +39,13 @@ def rolling_fourier_features(
     """
 
     source = _prepare_source(series.astype(float), input_mode)
-    columns = [f"{prefix}_energy_concentration", f"{prefix}_spectral_entropy"]
+    columns = [
+        f"{prefix}_energy_concentration",
+        f"{prefix}_spectral_entropy",
+        f"{prefix}_cycle_clarity",
+        f"{prefix}_cycle_strength",
+        f"{prefix}_noise_diffusion",
+    ]
     for rank in range(1, n_components + 1):
         columns.extend(
             [
@@ -70,11 +76,28 @@ def rolling_fourier_features(
         ranked = nonzero[np.argsort(power[nonzero])[::-1]]
         top = ranked[:n_components]
         total_energy = power[nonzero].sum()
+        energy_concentration = power[top].sum() / total_energy
+        spectral_entropy = _spectral_entropy(power[nonzero])
+        dominant_amplitude = amplitudes[top[0]]
+
         output.iat[end, output.columns.get_loc(f"{prefix}_energy_concentration")] = (
-            power[top].sum() / total_energy
+            energy_concentration
         )
-        output.iat[end, output.columns.get_loc(f"{prefix}_spectral_entropy")] = _spectral_entropy(
-            power[nonzero]
+        output.iat[end, output.columns.get_loc(f"{prefix}_spectral_entropy")] = spectral_entropy
+        output.iat[end, output.columns.get_loc(f"{prefix}_cycle_clarity")] = (
+            energy_concentration / (1.0 + spectral_entropy)
+            if np.isfinite(spectral_entropy)
+            else np.nan
+        )
+        output.iat[end, output.columns.get_loc(f"{prefix}_cycle_strength")] = (
+            dominant_amplitude * energy_concentration
+            if np.isfinite(dominant_amplitude)
+            else np.nan
+        )
+        output.iat[end, output.columns.get_loc(f"{prefix}_noise_diffusion")] = (
+            spectral_entropy / (1.0 + energy_concentration)
+            if np.isfinite(spectral_entropy)
+            else np.nan
         )
 
         for rank, idx in enumerate(top, start=1):
@@ -86,4 +109,3 @@ def rolling_fourier_features(
             output.iat[end, output.columns.get_loc(f"{prefix}_amp_{rank}")] = amplitudes[idx]
 
     return output
-

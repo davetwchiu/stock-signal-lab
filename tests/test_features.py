@@ -47,9 +47,17 @@ def test_fourier_feature_columns_and_window() -> None:
     data = synthetic_ohlcv(120)
     features = rolling_fourier_features(data["Adj Close"], window=40, n_components=2)
 
-    assert features.shape == (120, 8)
-    assert features.iloc[:39].drop(columns=[]).isna().all().all()
+    assert features.shape == (120, 11)
+    assert features.iloc[:40].drop(columns=[]).isna().all().all()
     assert features["fourier_energy_concentration"].notna().sum() > 0
+    assert "fourier_cycle_clarity" in features
+    assert "fourier_cycle_strength" in features
+    assert "fourier_noise_diffusion" in features
+    derived = features[
+        ["fourier_cycle_clarity", "fourier_cycle_strength", "fourier_noise_diffusion"]
+    ].dropna()
+    assert not derived.empty
+    assert np.isfinite(derived.to_numpy()).all()
 
 
 def test_wavelet_feature_columns() -> None:
@@ -58,5 +66,19 @@ def test_wavelet_feature_columns() -> None:
 
     assert "wavelet_available" in features
     assert "wavelet_trend_return" in features
+    assert "wavelet_clean_trend" in features
+    assert "wavelet_trend_quality" in features
+    assert "wavelet_noise_pressure" in features
+    assert "wavelet_medium_long_energy_share" in features
     assert features.shape[0] == 140
-
+    assert features.iloc[:63].drop(columns=["wavelet_available"]).isna().all().all()
+    derived = features[
+        [
+            "wavelet_clean_trend",
+            "wavelet_trend_quality",
+            "wavelet_noise_pressure",
+            "wavelet_medium_long_energy_share",
+        ]
+    ].dropna()
+    assert not derived.empty
+    assert np.isfinite(derived.to_numpy()).all()

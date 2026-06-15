@@ -17,7 +17,15 @@ def _empty_wavelet_frame(
     prefix: str,
     available: float,
 ) -> pd.DataFrame:
-    columns = [f"{prefix}_available", f"{prefix}_trend_return", f"{prefix}_short_noise_intensity"]
+    columns = [
+        f"{prefix}_available",
+        f"{prefix}_trend_return",
+        f"{prefix}_short_noise_intensity",
+        f"{prefix}_clean_trend",
+        f"{prefix}_trend_quality",
+        f"{prefix}_noise_pressure",
+        f"{prefix}_medium_long_energy_share",
+    ]
     columns.extend(f"{prefix}_energy_scale_{scale}" for scale in range(1, level + 1))
     output = pd.DataFrame(index=index, columns=columns, dtype=float)
     output[f"{prefix}_available"] = available
@@ -57,7 +65,8 @@ def rolling_wavelet_features(
 
         trend_coeffs = [coeffs[0]] + [np.zeros_like(coeff) for coeff in coeffs[1:]]
         trend = pywt.waverec(trend_coeffs, wavelet=wavelet, mode="periodization")[:window]
-        output.at[series.index[end], f"{prefix}_trend_return"] = float(np.exp(trend[-1] - trend[0]) - 1.0)
+        trend_return = float(np.exp(trend[-1] - trend[0]) - 1.0)
+        output.at[series.index[end], f"{prefix}_trend_return"] = trend_return
 
         detail_by_short_scale = list(reversed(energies))
         for scale, energy in enumerate(detail_by_short_scale[:level], start=1):
@@ -66,9 +75,28 @@ def rolling_wavelet_features(
             )
 
         short_energy = detail_by_short_scale[0] if detail_by_short_scale else np.nan
-        output.at[series.index[end], f"{prefix}_short_noise_intensity"] = (
-            short_energy / total_energy if total_energy > 0 else np.nan
+        short_noise_intensity = short_energy / total_energy if total_energy > 0 else np.nan
+        output.at[series.index[end], f"{prefix}_short_noise_intensity"] = short_noise_intensity
+        output.at[series.index[end], f"{prefix}_clean_trend"] = (
+            trend_return / (1.0 + short_noise_intensity)
+            if np.isfinite(short_noise_intensity)
+            else np.nan
+        )
+        output.at[series.index[end], f"{prefix}_trend_quality"] = (
+            abs(trend_return) / (1.0 + short_noise_intensity)
+            if np.isfinite(short_noise_intensity)
+            else np.nan
+        )
+        output.at[series.index[end], f"{prefix}_noise_pressure"] = (
+            short_energy / (total_energy + short_energy)
+            if total_energy > 0 and np.isfinite(short_energy)
+            else np.nan
+        )
+        medium_long_energy = sum(detail_by_short_scale[1:level])
+        output.at[series.index[end], f"{prefix}_medium_long_energy_share"] = (
+            medium_long_energy / total_energy
+            if total_energy > 0 and len(detail_by_short_scale) >= 2
+            else np.nan
         )
 
     return output
-

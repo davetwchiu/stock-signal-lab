@@ -59,6 +59,9 @@ def feature_selection_panel() -> pd.DataFrame:
         "rs_qqq_120d",
         "fourier_energy_concentration",
         "fourier_spectral_entropy",
+        "fourier_cycle_clarity",
+        "fourier_cycle_strength",
+        "fourier_noise_diffusion",
         "fourier_freq_1",
         "fourier_period_1",
         "fourier_amp_1",
@@ -71,6 +74,10 @@ def feature_selection_panel() -> pd.DataFrame:
         "wavelet_available",
         "wavelet_trend_return",
         "wavelet_short_noise_intensity",
+        "wavelet_clean_trend",
+        "wavelet_trend_quality",
+        "wavelet_noise_pressure",
+        "wavelet_medium_long_energy_share",
         "wavelet_energy_scale_1",
         "wavelet_energy_scale_2",
         "wavelet_energy_scale_3",
@@ -101,9 +108,16 @@ def test_all_feature_group_uses_curated_model_features() -> None:
         "rs_qqq_60d",
         "fourier_energy_concentration",
         "fourier_spectral_entropy",
+        "fourier_cycle_clarity",
+        "fourier_cycle_strength",
+        "fourier_noise_diffusion",
         "fourier_amp_1",
         "wavelet_trend_return",
         "wavelet_short_noise_intensity",
+        "wavelet_clean_trend",
+        "wavelet_trend_quality",
+        "wavelet_noise_pressure",
+        "wavelet_medium_long_energy_share",
         "wavelet_energy_scale_1",
     ]
 
@@ -131,10 +145,37 @@ def test_curated_feature_group_preserves_broad_families() -> None:
     assert any(column.startswith("wavelet_") for column in columns)
 
 
+def test_signal_feature_groups_include_derived_transform_features() -> None:
+    panel = feature_selection_panel()
+
+    technical = feature_group_columns(panel, "technical")
+    technical_fourier = feature_group_columns(panel, "technical_fourier")
+    technical_wavelet = feature_group_columns(panel, "technical_wavelet")
+    all_columns = feature_group_columns(panel, "all")
+
+    fourier_derived = {
+        "fourier_cycle_clarity",
+        "fourier_cycle_strength",
+        "fourier_noise_diffusion",
+    }
+    wavelet_derived = {
+        "wavelet_clean_trend",
+        "wavelet_trend_quality",
+        "wavelet_noise_pressure",
+        "wavelet_medium_long_energy_share",
+    }
+
+    assert fourier_derived.isdisjoint(technical)
+    assert wavelet_derived.isdisjoint(technical)
+    assert fourier_derived <= set(technical_fourier)
+    assert wavelet_derived <= set(technical_wavelet)
+    assert fourier_derived | wavelet_derived <= set(all_columns)
+
+
 def test_feature_audit_defaults_to_selected_model_features() -> None:
     audit = build_ml_feature_audit(feature_selection_panel())
 
-    assert audit.inventory_summary.loc[0, "feature_count"] == 19
+    assert audit.inventory_summary.loc[0, "feature_count"] == 26
 
 
 def test_feature_signal_diagnostics_default_to_selected_model_features() -> None:
@@ -150,6 +191,6 @@ def test_feature_signal_tables_default_to_selected_model_features() -> None:
     signal_table = build_feature_signal_table(panel, max_features=None)
     quantile_summary = build_feature_quantile_signal_summary(panel, max_features=50)
 
-    assert len(signal_table) == 19
+    assert len(signal_table) == 26
     assert PRUNED_FEATURES.isdisjoint(set(signal_table["feature"]))
     assert PRUNED_FEATURES.isdisjoint(set(quantile_summary["feature"]))
