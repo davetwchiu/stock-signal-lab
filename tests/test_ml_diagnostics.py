@@ -6,9 +6,11 @@ import pandas as pd
 import pytest
 
 from src.ml.diagnostics import (
+    build_opportunity_risk_joint_validation,
     build_ml_diagnostics,
     build_ml_score_direction_diagnostics,
     build_ml_target_comparison,
+    interpret_opportunity_risk_joint_validation,
     build_probability_label_alignment,
     build_regime_score_direction_summary,
     build_score_bucket_monotonicity,
@@ -258,6 +260,129 @@ def test_build_ml_diagnostics_includes_score_direction_tables() -> None:
     assert not diagnostics.probability_label_alignment.empty
     assert not diagnostics.score_bucket_monotonicity.empty
     assert not diagnostics.score_inversion.empty
+
+
+def opportunity_risk_panel(rows_per_cell: int = 5) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    dates = pd.date_range("2024-02-01", periods=rows_per_cell * 4, freq="B")
+    scenarios = [
+        ("High opportunity", "Low risk", 0.90, 0.10, 0.08, -0.04, 0),
+        ("High opportunity", "High risk", 0.80, 0.90, 0.05, -0.18, 1),
+        ("Low opportunity", "Low risk", 0.20, 0.20, 0.01, -0.05, 0),
+        ("Low opportunity", "High risk", 0.10, 0.80, -0.03, -0.22, 1),
+    ]
+    row_index = 0
+    for opportunity_bucket, risk_bucket, opportunity, risk, forward_return, drawdown, risk_label in scenarios:
+        for cell_index in range(rows_per_cell):
+            rows.append(
+                {
+                    "Date": dates[row_index],
+                    "Ticker": f"J{row_index:02d}",
+                    "probability_out": opportunity - cell_index * 0.001,
+                    "probability_risk": risk + cell_index * 0.001,
+                    "forward_excess_return": forward_return,
+                    "forward_drawdown": drawdown,
+                    "actual_risk": risk_label,
+                    "expected_opportunity_bucket": opportunity_bucket,
+                    "expected_risk_bucket": risk_bucket,
+                }
+            )
+            row_index += 1
+    return pd.DataFrame(rows)
+
+
+def test_opportunity_risk_joint_validation_includes_expected_four_cells() -> None:
+    matrix = build_opportunity_risk_joint_validation(opportunity_risk_panel())
+
+    cells = set(zip(matrix["opportunity_bucket"], matrix["risk_bucket"], strict=True))
+
+    assert cells == {
+        ("High opportunity", "Low risk"),
+        ("High opportunity", "High risk"),
+        ("Low opportunity", "Low risk"),
+        ("Low opportunity", "High risk"),
+    }
+    assert matrix["sample_size"].tolist() == [5, 5, 5, 5]
+
+
+def test_opportunity_risk_joint_validation_identifies_best_supported_cell() -> None:
+    matrix = build_opportunity_risk_joint_validation(opportunity_risk_panel())
+    indexed = matrix.set_index(["opportunity_bucket", "risk_bucket"])
+
+    assert indexed.loc[("High opportunity", "Low risk"), "avg_forward_excess_return"] == pytest.approx(0.08)
+    assert indexed.loc[("High opportunity", "Low risk"), "interpretation"].startswith("Best setup")
+    assert (
+        interpret_opportunity_risk_joint_validation(matrix)
+        == "joint validation supports separate opportunity and risk signals"
+    )
+
+
+def test_opportunity_risk_joint_validation_flags_high_opportunity_high_risk_as_riskier() -> None:
+    matrix = build_opportunity_risk_joint_validation(opportunity_risk_panel())
+    indexed = matrix.set_index(["opportunity_bucket", "risk_bucket"])
+
+    assert indexed.loc[("High opportunity", "High risk"), "avg_forward_drawdown"] < indexed.loc[
+        ("High opportunity", "Low risk"),
+        "avg_forward_drawdown",
+    ]
+    assert indexed.loc[("High opportunity", "High risk"), "drawdown_event_rate"] > indexed.loc[
+        ("High opportunity", "Low risk"),
+        "drawdown_event_rate",
+    ]
+
+
+def test_opportunity_risk_joint_validation_identifies_low_opportunity_high_risk_as_worst() -> None:
+    matrix = build_opportunity_risk_joint_validation(opportunity_risk_panel())
+    indexed = matrix.set_index(["opportunity_bucket", "risk_bucket"])
+
+    assert indexed.loc[("Low opportunity", "High risk"), "avg_forward_excess_return"] == pytest.approx(-0.03)
+    assert indexed.loc[("Low opportunity", "High risk"), "interpretation"].startswith("Worst setup")
+
+
+def test_opportunity_risk_joint_validation_handles_insufficient_data() -> None:
+    matrix = build_opportunity_risk_joint_validation(opportunity_risk_panel(rows_per_cell=1))
+
+    assert matrix.empty
+    assert interpret_opportunity_risk_joint_validation(matrix) == "insufficient data to compare"
+
+
+def test_opportunity_risk_joint_validation_handles_missing_columns() -> None:
+    panel = opportunity_risk_panel().drop(columns=["probability_risk"])
+
+    matrix = build_opportunity_risk_joint_validation(panel)
+
+    assert matrix.empty
+
+
+def test_opportunity_risk_joint_validation_does_not_mutate_input() -> None:
+    panel = opportunity_risk_panel()
+    original = panel.copy(deep=True)
+
+    build_opportunity_risk_joint_validation(panel)
+
+    pd.testing.assert_frame_equal(panel, original)
+
+
+def test_build_ml_diagnostics_includes_opportunity_risk_joint_validation() -> None:
+    panel = opportunity_risk_panel()
+    outperformance = panel.rename(
+        columns={
+            "probability_out": "probability",
+            "expected_opportunity_bucket": "unused_opportunity_bucket",
+        }
+    )
+    outperformance["actual"] = [1] * len(outperformance)
+    drawdown_risk = panel[["Date", "Ticker", "probability_risk", "actual_risk"]].rename(
+        columns={"probability_risk": "probability", "actual_risk": "actual"}
+    )
+
+    diagnostics = build_ml_diagnostics(outperformance, drawdown_risk)
+
+    assert not diagnostics.opportunity_risk_joint_validation.empty
+    assert (
+        interpret_opportunity_risk_joint_validation(diagnostics.opportunity_risk_joint_validation)
+        == "joint validation supports separate opportunity and risk signals"
+    )
 
 
 def target_comparison_predictions() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:

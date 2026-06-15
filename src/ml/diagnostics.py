@@ -120,6 +120,17 @@ TARGET_COMPARISON_COLUMNS = [
     "interpretation",
 ]
 
+OPPORTUNITY_RISK_JOINT_COLUMNS = [
+    "opportunity_bucket",
+    "risk_bucket",
+    "sample_size",
+    "avg_forward_excess_return",
+    "avg_forward_drawdown",
+    "drawdown_event_rate",
+    "interpretation",
+    "joint_validation_result",
+]
+
 LABEL_PREVALENCE_COLUMNS = [
     "label",
     "sample_size",
@@ -182,6 +193,8 @@ MIN_REGIME_SAMPLE_COUNT = 20
 SPREAD_SIMILARITY_TOLERANCE = 0.0025
 MIN_SCORE_DIRECTION_BUCKET_COUNT = 5
 MIN_SCORE_DIRECTION_SAMPLE_COUNT = 20
+MIN_JOINT_VALIDATION_CELL_COUNT = 5
+MIN_JOINT_VALIDATION_SAMPLE_COUNT = 20
 DEFAULT_OUTPERFORMANCE_THRESHOLDS = (0.00, 0.01, 0.02, 0.03, 0.05)
 DEFAULT_DRAWDOWN_THRESHOLDS = (-0.05, -0.10, -0.15, -0.20)
 MIN_LABEL_AUDIT_SAMPLE_SIZE = 20
@@ -318,6 +331,7 @@ class MLDiagnostics:
     regime_score_direction: pd.DataFrame
     drawdown_risk_calibration_quality: pd.DataFrame
     target_comparison: pd.DataFrame
+    opportunity_risk_joint_validation: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -441,6 +455,10 @@ def _empty_drawdown_risk_calibration_quality() -> pd.DataFrame:
 
 def _empty_target_comparison() -> pd.DataFrame:
     return pd.DataFrame(columns=TARGET_COMPARISON_COLUMNS)
+
+
+def _empty_opportunity_risk_joint_validation() -> pd.DataFrame:
+    return pd.DataFrame(columns=OPPORTUNITY_RISK_JOINT_COLUMNS)
 
 
 def _empty_label_prevalence_summary() -> pd.DataFrame:
@@ -2581,6 +2599,149 @@ def build_score_bucket_monotonicity(
     return pd.DataFrame(rows, columns=SCORE_BUCKET_MONOTONICITY_COLUMNS)
 
 
+def _rank_quantile_bucket(values: pd.Series, labels: list[str]) -> pd.Series:
+    ranked = values.rank(method="first")
+    return pd.qcut(ranked, q=len(labels), labels=labels)
+
+
+def _joint_cell_interpretation(opportunity_bucket: str, risk_bucket: str) -> str:
+    if opportunity_bucket == "High opportunity" and risk_bucket == "Low risk":
+        return "Best setup candidate if returns lead and drawdown stays controlled."
+    if opportunity_bucket == "High opportunity" and risk_bucket == "High risk":
+        return "High-opportunity setup with elevated pullback risk; compare drawdown against high opportunity / low risk."
+    if opportunity_bucket == "Low opportunity" and risk_bucket == "Low risk":
+        return "Defensive or low-conviction setup with lower opportunity and lower pullback risk."
+    return "Worst setup candidate if returns lag and drawdown risk is elevated."
+
+
+def _joint_validation_result(
+    cells: pd.DataFrame,
+    *,
+    min_cell_size: int,
+) -> str:
+    lookup = cells.set_index(["opportunity_bucket", "risk_bucket"])
+    required_cells = [
+        ("High opportunity", "Low risk"),
+        ("High opportunity", "High risk"),
+        ("Low opportunity", "Low risk"),
+        ("Low opportunity", "High risk"),
+    ]
+    if any(lookup.loc[cell, "sample_size"] < min_cell_size for cell in required_cells):
+        return "insufficient data to compare"
+
+    high_low = lookup.loc[("High opportunity", "Low risk")]
+    high_high = lookup.loc[("High opportunity", "High risk")]
+    low_high = lookup.loc[("Low opportunity", "High risk")]
+    high_low_return = high_low["avg_forward_excess_return"]
+    low_high_return = low_high["avg_forward_excess_return"]
+    if pd.isna(high_low_return) or pd.isna(low_high_return):
+        return "insufficient data to compare"
+
+    return_support = high_low_return - low_high_return > SPREAD_SIMILARITY_TOLERANCE
+    high_low_drawdown = high_low["avg_forward_drawdown"]
+    high_high_drawdown = high_high["avg_forward_drawdown"]
+    high_low_event_rate = high_low["drawdown_event_rate"]
+    high_high_event_rate = high_high["drawdown_event_rate"]
+    drawdown_support = False
+    if pd.notna(high_low_drawdown) and pd.notna(high_high_drawdown):
+        drawdown_support = high_high_drawdown < high_low_drawdown - SPREAD_SIMILARITY_TOLERANCE
+    if pd.notna(high_low_event_rate) and pd.notna(high_high_event_rate):
+        drawdown_support = (
+            drawdown_support
+            or high_high_event_rate - high_low_event_rate > SPREAD_SIMILARITY_TOLERANCE
+        )
+
+    if return_support and drawdown_support:
+        return "joint validation supports separate opportunity and risk signals"
+    if not return_support and not drawdown_support:
+        return "joint validation does not support the combined signal"
+    return "joint validation is mixed"
+
+
+def build_opportunity_risk_joint_validation(
+    score_panel: pd.DataFrame,
+    *,
+    opportunity_col: str = "probability_out",
+    risk_col: str = "probability_risk",
+    return_col: str = "forward_excess_return",
+    drawdown_col: str = "forward_drawdown",
+    drawdown_label_col: str = "actual_risk",
+    min_cell_size: int = MIN_JOINT_VALIDATION_CELL_COUNT,
+    min_samples: int = MIN_JOINT_VALIDATION_SAMPLE_COUNT,
+) -> pd.DataFrame:
+    """Compare existing opportunity and pullback-risk validation signals in a 2x2 matrix."""
+
+    if score_panel.empty:
+        return _empty_opportunity_risk_joint_validation()
+    required = [opportunity_col, risk_col, return_col]
+    if any(column not in score_panel for column in required):
+        return _empty_opportunity_risk_joint_validation()
+
+    data = score_panel.copy()
+    for column in required:
+        data[column] = _numeric_column(data, column)
+    optional_columns = [column for column in (drawdown_col, drawdown_label_col) if column in data]
+    for column in optional_columns:
+        data[column] = _numeric_column(data, column)
+    data = data.dropna(subset=required)
+    if (
+        len(data) < min_samples
+        or data[opportunity_col].nunique(dropna=True) < 2
+        or data[risk_col].nunique(dropna=True) < 2
+    ):
+        return _empty_opportunity_risk_joint_validation()
+
+    data["opportunity_bucket"] = _rank_quantile_bucket(
+        data[opportunity_col],
+        ["Low opportunity", "High opportunity"],
+    )
+    data["risk_bucket"] = _rank_quantile_bucket(data[risk_col], ["Low risk", "High risk"])
+
+    rows: list[dict[str, object]] = []
+    for opportunity_bucket in ("High opportunity", "Low opportunity"):
+        for risk_bucket in ("Low risk", "High risk"):
+            cell = data[
+                (data["opportunity_bucket"] == opportunity_bucket)
+                & (data["risk_bucket"] == risk_bucket)
+            ]
+            rows.append(
+                {
+                    "opportunity_bucket": opportunity_bucket,
+                    "risk_bucket": risk_bucket,
+                    "sample_size": int(len(cell)),
+                    "avg_forward_excess_return": float(cell[return_col].mean()) if not cell.empty else pd.NA,
+                    "avg_forward_drawdown": (
+                        float(cell[drawdown_col].mean())
+                        if drawdown_col in cell and not cell[drawdown_col].dropna().empty
+                        else pd.NA
+                    ),
+                    "drawdown_event_rate": (
+                        float(cell[drawdown_label_col].mean())
+                        if drawdown_label_col in cell and not cell[drawdown_label_col].dropna().empty
+                        else pd.NA
+                    ),
+                    "interpretation": _joint_cell_interpretation(opportunity_bucket, risk_bucket),
+                    "joint_validation_result": "",
+                }
+            )
+
+    result = pd.DataFrame(rows, columns=OPPORTUNITY_RISK_JOINT_COLUMNS)
+    joint_result = _joint_validation_result(result, min_cell_size=min_cell_size)
+    result["joint_validation_result"] = joint_result
+    return result
+
+
+def interpret_opportunity_risk_joint_validation(joint_validation: pd.DataFrame) -> str:
+    """Return the compact Research Lab readout for the joint validation table."""
+
+    if joint_validation.empty or "joint_validation_result" not in joint_validation:
+        return "insufficient data to compare"
+    result = joint_validation["joint_validation_result"].dropna()
+    if result.empty:
+        return "insufficient data to compare"
+    return str(result.iloc[0])
+
+
 def _target_comparison_row(
     predictions: pd.DataFrame,
     *,
@@ -2949,6 +3110,7 @@ def build_ml_diagnostics(
             _empty_regime_score_direction_summary(),
             _empty_drawdown_risk_calibration_quality(),
             _empty_target_comparison(),
+            _empty_opportunity_risk_joint_validation(),
         )
 
     out_columns = [
@@ -2979,6 +3141,7 @@ def build_ml_diagnostics(
     score_bucket_monotonicity = build_score_bucket_monotonicity(score_panel)
     score_inversion = build_score_inversion_diagnostics(score_panel)
     regime_score_direction = build_regime_score_direction_summary(score_panel, baseline_panel=baseline_panel)
+    opportunity_risk_joint_validation = build_opportunity_risk_joint_validation(score_panel)
     target_comparison = (
         build_ml_target_comparison(
             outperformance_predictions,
@@ -3018,4 +3181,5 @@ def build_ml_diagnostics(
         regime_score_direction,
         risk_calibration_quality,
         target_comparison,
+        opportunity_risk_joint_validation,
     )

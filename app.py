@@ -40,6 +40,7 @@ from src.ml.diagnostics import (
     build_ml_feature_audit,
     build_ml_feature_signal_diagnostics,
     build_ml_label_audit,
+    interpret_opportunity_risk_joint_validation,
 )
 from src.ml.interpretations import (
     DiagnosticInterpretation,
@@ -970,6 +971,20 @@ with research_tab:
                             else:
                                 st.dataframe(
                                     diagnostics.target_comparison,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                            st.write("**Opportunity-risk joint validation**")
+                            st.caption(
+                                interpret_opportunity_risk_joint_validation(
+                                    diagnostics.opportunity_risk_joint_validation
+                                )
+                            )
+                            if diagnostics.opportunity_risk_joint_validation.empty:
+                                st.info("No opportunity-risk joint validation was available for this sample.")
+                            else:
+                                st.dataframe(
+                                    diagnostics.opportunity_risk_joint_validation,
                                     width="stretch",
                                     hide_index=True,
                                 )
