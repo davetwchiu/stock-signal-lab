@@ -2598,7 +2598,7 @@ def _target_comparison_row(
             "high_bucket_target": pd.NA,
             "high_minus_low_spread": pd.NA,
             "monotonicity": "insufficient",
-            "baseline_spread": 0.0,
+            "baseline_spread": pd.NA,
             "relative_result": "insufficient data",
             "interpretation": "There is too little usable data for this target comparison.",
         }
@@ -2614,7 +2614,7 @@ def _target_comparison_row(
             "high_bucket_target": pd.NA,
             "high_minus_low_spread": pd.NA,
             "monotonicity": "insufficient",
-            "baseline_spread": 0.0,
+            "baseline_spread": pd.NA,
             "relative_result": "insufficient data",
             "interpretation": "There is too little usable data for this target comparison.",
         }
@@ -2637,7 +2637,7 @@ def _target_comparison_row(
             "high_bucket_target": pd.NA,
             "high_minus_low_spread": pd.NA,
             "monotonicity": "insufficient",
-            "baseline_spread": 0.0,
+            "baseline_spread": pd.NA,
             "relative_result": "insufficient data",
             "interpretation": "Probability buckets were too narrow for this target comparison.",
         }
@@ -2668,7 +2668,7 @@ def _target_comparison_row(
         "high_bucket_target": float(means.loc[high_code]) if high_count >= min_bucket_size else pd.NA,
         "high_minus_low_spread": spread,
         "monotonicity": monotonicity,
-        "baseline_spread": 0.0,
+        "baseline_spread": pd.NA,
         "relative_result": "",
         "interpretation": interpretation,
     }
@@ -2688,35 +2688,41 @@ def _target_comparison_score(row: pd.Series) -> tuple[float, int] | None:
     return float(spread), monotonicity_rank
 
 
-def _target_comparison_result(v1: pd.Series, v2: pd.Series) -> str:
-    v1_score = _target_comparison_score(v1)
-    v2_score = _target_comparison_score(v2)
-    if v1_score is None or v2_score is None:
+def _target_comparison_result(reference: pd.Series, candidate: pd.Series, version: str) -> str:
+    v1_score = _target_comparison_score(reference)
+    candidate_score = _target_comparison_score(candidate)
+    if v1_score is None or candidate_score is None:
         return "insufficient data"
 
     v1_spread, v1_monotonicity = v1_score
-    v2_spread, v2_monotonicity = v2_score
+    candidate_spread, candidate_monotonicity = candidate_score
     if (
-        v2_spread > v1_spread + SPREAD_SIMILARITY_TOLERANCE
-        and v2_monotonicity >= v1_monotonicity
-        and v2_spread >= -SPREAD_SIMILARITY_TOLERANCE
+        (
+            candidate_spread > v1_spread + SPREAD_SIMILARITY_TOLERANCE
+            and candidate_monotonicity >= v1_monotonicity
+        )
+        or (
+            candidate_spread + SPREAD_SIMILARITY_TOLERANCE >= v1_spread
+            and candidate_monotonicity > v1_monotonicity
+        )
     ):
-        return "v2 looks better"
+        return f"{version} looks better"
     if (
-        v2_spread + SPREAD_SIMILARITY_TOLERANCE < v1_spread
-        or v2_monotonicity < v1_monotonicity
+        candidate_spread + SPREAD_SIMILARITY_TOLERANCE < v1_spread
+        or candidate_monotonicity < v1_monotonicity
     ):
-        return "v2 looks worse"
-    return "v2 looks similar"
+        return f"{version} looks worse"
+    return f"{version} looks similar"
 
 
 def build_ml_target_comparison(
     outperformance_predictions: pd.DataFrame,
     risk_adjusted_predictions: pd.DataFrame,
+    tail_risk_predictions: pd.DataFrame | None = None,
     *,
     min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
 ) -> pd.DataFrame:
-    """Compare v1 outperformance and v2 risk-adjusted relative targets."""
+    """Compare v1 outperformance, v2 risk-adjusted, and v3 tail-risk targets."""
 
     rows = [
         _target_comparison_row(
@@ -2732,29 +2738,50 @@ def build_ml_target_comparison(
             min_bucket_size=min_bucket_size,
         ),
     ]
+    if tail_risk_predictions is not None:
+        rows.append(
+            _target_comparison_row(
+                tail_risk_predictions,
+                target_version="v3 tail-risk relative",
+                target_col="forward_tail_risk_adjusted_excess_return",
+                min_bucket_size=min_bucket_size,
+            )
+        )
     comparison = pd.DataFrame(rows, columns=TARGET_COMPARISON_COLUMNS)
     if comparison.empty:
         return comparison
 
-    result = _target_comparison_result(comparison.iloc[0], comparison.iloc[1])
+    reference = comparison.iloc[0]
+    reference_score = _target_comparison_score(reference)
+    reference_spread = reference_score[0] if reference_score is not None else pd.NA
     comparison.loc[comparison["target_version"] == "v1 outperformance", "relative_result"] = "v1 reference"
     comparison.loc[
         comparison["target_version"] == "v1 outperformance",
         "interpretation",
     ] = "Existing outperformance target used as the diagnostics reference."
-    comparison.loc[comparison["target_version"] == "v2 risk-adjusted relative", "relative_result"] = result
-    if result == "v2 looks better":
-        interpretation = "v2 has cleaner bucket separation without weaker monotonicity in this sample."
-    elif result == "v2 looks worse":
-        interpretation = "v2 has weaker bucket separation or monotonicity in this sample."
-    elif result == "v2 looks similar":
-        interpretation = "v2 and v1 show similar diagnostics in this sample."
-    else:
-        interpretation = "The sample is too small or incomplete for a v1-vs-v2 read."
-    comparison.loc[
-        comparison["target_version"] == "v2 risk-adjusted relative",
-        "interpretation",
-    ] = interpretation
+    for target_version, version_label in (
+        ("v2 risk-adjusted relative", "v2"),
+        ("v3 tail-risk relative", "v3"),
+    ):
+        mask = comparison["target_version"] == target_version
+        if not mask.any():
+            continue
+        row = comparison[mask].iloc[0]
+        result = _target_comparison_result(reference, row, version_label)
+        comparison.loc[mask, "relative_result"] = result
+        comparison.loc[mask, "baseline_spread"] = reference_spread
+        if result.endswith("looks better"):
+            interpretation = (
+                f"{version_label} has cleaner bucket separation or monotonicity without clearly "
+                "worse spread than v1 in this sample."
+            )
+        elif result.endswith("looks worse"):
+            interpretation = f"{version_label} has weaker bucket separation or monotonicity than v1 in this sample."
+        elif result.endswith("looks similar"):
+            interpretation = f"{version_label} and v1 show similar diagnostics in this sample."
+        else:
+            interpretation = f"The sample is too small or incomplete for a v1-vs-{version_label} read."
+        comparison.loc[mask, "interpretation"] = interpretation
     return comparison
 
 
@@ -2893,6 +2920,7 @@ def build_ml_diagnostics(
     risk_bins: int = 5,
     baseline_panel: pd.DataFrame | None = None,
     risk_adjusted_predictions: pd.DataFrame | None = None,
+    tail_risk_predictions: pd.DataFrame | None = None,
 ) -> MLDiagnostics:
     """Summarize out-of-sample usefulness of the existing ML signal.
 
@@ -2952,7 +2980,11 @@ def build_ml_diagnostics(
     score_inversion = build_score_inversion_diagnostics(score_panel)
     regime_score_direction = build_regime_score_direction_summary(score_panel, baseline_panel=baseline_panel)
     target_comparison = (
-        build_ml_target_comparison(outperformance_predictions, risk_adjusted_predictions)
+        build_ml_target_comparison(
+            outperformance_predictions,
+            risk_adjusted_predictions,
+            tail_risk_predictions,
+        )
         if risk_adjusted_predictions is not None
         else _empty_target_comparison()
     )

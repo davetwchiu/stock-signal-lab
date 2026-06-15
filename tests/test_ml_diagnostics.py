@@ -260,13 +260,15 @@ def test_build_ml_diagnostics_includes_score_direction_tables() -> None:
     assert not diagnostics.score_inversion.empty
 
 
-def target_comparison_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
+def target_comparison_predictions() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     dates = pd.date_range("2024-01-01", periods=30, freq="B")
     v1_rows: list[dict[str, object]] = []
     v2_rows: list[dict[str, object]] = []
+    v3_rows: list[dict[str, object]] = []
     for index, probability in enumerate([0.10] * 10 + [0.50] * 10 + [0.90] * 10):
         v1_excess = 0.00 if index < 10 else 0.02 if index < 20 else 0.03
         v2_target = -0.04 if index < 10 else 0.01 if index < 20 else 0.08
+        v3_target = 0.00 if index < 10 else 0.02 if index < 20 else 0.032
         base = {
             "fold": 1,
             "Date": dates[index],
@@ -289,18 +291,33 @@ def target_comparison_predictions() -> tuple[pd.DataFrame, pd.DataFrame]:
                 "forward_risk_adjusted_excess_return": v2_target,
             }
         )
-    return pd.DataFrame(v1_rows), pd.DataFrame(v2_rows)
+        v3_rows.append(
+            {
+                **base,
+                "forward_excess_return": v1_excess,
+                "forward_tail_risk_adjusted_excess_return": v3_target,
+            }
+        )
+    return pd.DataFrame(v1_rows), pd.DataFrame(v2_rows), pd.DataFrame(v3_rows)
 
 
-def test_ml_target_comparison_identifies_stronger_v2_separation() -> None:
-    v1, v2 = target_comparison_predictions()
+def test_ml_target_comparison_includes_v1_v2_and_v3() -> None:
+    v1, v2, v3 = target_comparison_predictions()
 
-    comparison = build_ml_target_comparison(v1, v2).set_index("target_version")
+    comparison = build_ml_target_comparison(v1, v2, v3).set_index("target_version")
 
+    assert comparison.index.tolist() == [
+        "v1 outperformance",
+        "v2 risk-adjusted relative",
+        "v3 tail-risk relative",
+    ]
     assert comparison.loc["v1 outperformance", "relative_result"] == "v1 reference"
+    assert comparison.loc["v1 outperformance", "high_minus_low_spread"] == pytest.approx(0.03)
     assert comparison.loc["v2 risk-adjusted relative", "high_minus_low_spread"] == pytest.approx(0.12)
     assert comparison.loc["v2 risk-adjusted relative", "monotonicity"] == "aligned"
     assert comparison.loc["v2 risk-adjusted relative", "relative_result"] == "v2 looks better"
+    assert comparison.loc["v2 risk-adjusted relative", "baseline_spread"] == pytest.approx(0.03)
+    assert comparison.loc["v3 tail-risk relative", "relative_result"] == "v3 looks similar"
 
 
 def test_ml_target_comparison_handles_insufficient_data() -> None:
@@ -309,12 +326,13 @@ def test_ml_target_comparison_handles_insufficient_data() -> None:
             "probability": [0.2, 0.8],
             "forward_excess_return": [0.01, 0.02],
             "forward_risk_adjusted_excess_return": [0.00, 0.01],
+            "forward_tail_risk_adjusted_excess_return": [0.01, 0.02],
         }
     )
 
-    comparison = build_ml_target_comparison(tiny, tiny)
+    comparison = build_ml_target_comparison(tiny, tiny, tiny)
 
-    assert comparison["relative_result"].tolist() == ["v1 reference", "insufficient data"]
+    assert comparison["relative_result"].tolist() == ["v1 reference", "insufficient data", "insufficient data"]
     assert comparison.loc[1, "monotonicity"] == "insufficient"
 
 

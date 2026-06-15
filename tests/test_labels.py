@@ -10,6 +10,7 @@ from src.ml.labels import (
     forward_regime_deterioration,
     make_forward_labels,
     make_risk_adjusted_relative_forward_target,
+    make_tail_risk_adjusted_relative_forward_target,
 )
 
 
@@ -100,6 +101,63 @@ def test_risk_adjusted_relative_target_does_not_mutate_inputs() -> None:
     pd.testing.assert_series_equal(benchmark, original_benchmark)
 
 
+def test_tail_risk_target_equals_v1_when_drawdown_within_threshold() -> None:
+    index = pd.date_range("2024-01-01", periods=8, freq="B")
+    price = pd.Series([100, 95, 108, 109, 110, 111, 112, 113], index=index, dtype=float)
+    benchmark = pd.Series(100.0, index=index)
+
+    target = make_tail_risk_adjusted_relative_forward_target(price, benchmark, horizon=2)
+
+    assert target.iloc[0] == pytest.approx(0.08)
+
+
+def test_tail_risk_target_penalizes_only_excess_drawdown() -> None:
+    index = pd.date_range("2024-01-01", periods=8, freq="B")
+    price = pd.Series([100, 85, 108, 109, 110, 111, 112, 113], index=index, dtype=float)
+    benchmark = pd.Series(100.0, index=index)
+
+    target = make_tail_risk_adjusted_relative_forward_target(price, benchmark, horizon=2)
+
+    assert target.iloc[0] == pytest.approx(0.08 - 0.5 * 0.05)
+
+
+def test_tail_risk_target_penalty_increases_with_worse_tail_drawdown() -> None:
+    index = pd.date_range("2024-01-01", periods=8, freq="B")
+    moderate_price = pd.Series([100, 85, 108, 109, 110, 111, 112, 113], index=index, dtype=float)
+    severe_price = pd.Series([100, 75, 108, 109, 110, 111, 112, 113], index=index, dtype=float)
+    benchmark = pd.Series(100.0, index=index)
+
+    moderate_target = make_tail_risk_adjusted_relative_forward_target(moderate_price, benchmark, horizon=2)
+    severe_target = make_tail_risk_adjusted_relative_forward_target(severe_price, benchmark, horizon=2)
+
+    assert severe_target.iloc[0] < moderate_target.iloc[0]
+    assert severe_target.iloc[0] == pytest.approx(0.08 - 0.5 * 0.15)
+
+
+def test_tail_risk_target_handles_missing_and_short_data() -> None:
+    index = pd.date_range("2024-01-01", periods=4, freq="B")
+    price = pd.Series([100, np.nan, 102, 103], index=index, dtype=float)
+    benchmark = pd.Series([100, 101, np.nan, 103], index=index, dtype=float)
+
+    target = make_tail_risk_adjusted_relative_forward_target(price, benchmark, horizon=3)
+
+    assert np.isfinite(target.dropna()).all()
+    assert target.tail(3).isna().all()
+
+
+def test_tail_risk_target_does_not_mutate_inputs() -> None:
+    index = pd.date_range("2024-01-01", periods=6, freq="B")
+    price = pd.Series([100, 85, 105, 106, 107, 108], index=index, dtype=float)
+    benchmark = pd.Series(100.0, index=index)
+    original_price = price.copy(deep=True)
+    original_benchmark = benchmark.copy(deep=True)
+
+    make_tail_risk_adjusted_relative_forward_target(price, benchmark, horizon=2)
+
+    pd.testing.assert_series_equal(price, original_price)
+    pd.testing.assert_series_equal(benchmark, original_benchmark)
+
+
 def test_make_forward_labels_includes_risk_adjusted_v2_columns() -> None:
     index = pd.date_range("2024-01-01", periods=8, freq="B")
     price = pd.Series([100, 90, 108, 109, 110, 111, 112, 113], index=index, dtype=float)
@@ -111,3 +169,16 @@ def test_make_forward_labels_includes_risk_adjusted_v2_columns() -> None:
     assert labels.loc[index[0], "forward_2d_risk_adjusted_excess_return"] == pytest.approx(0.03)
     assert labels.loc[index[0], "label_risk_adjusted_outperform_2d"] == 1.0
     assert labels["label_risk_adjusted_outperform_2d"].tail(2).isna().all()
+
+
+def test_make_forward_labels_includes_tail_risk_v3_columns() -> None:
+    index = pd.date_range("2024-01-01", periods=8, freq="B")
+    price = pd.Series([100, 90, 108, 109, 110, 111, 112, 113], index=index, dtype=float)
+    benchmark = pd.Series(100.0, index=index)
+    features = pd.DataFrame({"Adj Close": price}, index=index)
+
+    labels = make_forward_labels(features, benchmark, horizon=2, outperformance_threshold=0.02)
+
+    assert labels.loc[index[0], "forward_2d_tail_risk_adjusted_excess_return"] == pytest.approx(0.08)
+    assert labels.loc[index[0], "label_tail_risk_adjusted_outperform_2d"] == 1.0
+    assert labels["label_tail_risk_adjusted_outperform_2d"].tail(2).isna().all()
