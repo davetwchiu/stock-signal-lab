@@ -201,18 +201,15 @@ def test_probability_direction_check_identifies_inverted_direction() -> None:
     )
 
 
-def test_probability_direction_check_identifies_current_ml_score_direction() -> None:
+def test_probability_direction_check_does_not_make_current_score_direction_from_risk_only() -> None:
     panel = probability_direction_panel(raw_direction="supported", constant_probability=True)
 
     direction = build_ml_probability_direction_check(panel)
 
     indexed = direction.set_index("signal")
     assert indexed.loc["raw probability", "monotonicity"] == "insufficient"
-    assert indexed.loc["current ML Score", "monotonicity"] == "aligned"
-    assert (
-        interpret_ml_probability_direction_check(direction)
-        == "current ML Score direction is supported"
-    )
+    assert indexed.loc["current ML Score", "monotonicity"] == "insufficient"
+    assert interpret_ml_probability_direction_check(direction) == "insufficient data"
 
 
 def test_probability_direction_check_identifies_corrected_current_ml_score_direction() -> None:
@@ -318,17 +315,21 @@ def test_formula_candidate_comparison_identifies_opportunity_only_as_strong() ->
 
     assert indexed.loc["raw_probability", "interpretation"] == "candidate looks strong"
     assert indexed.loc["sqrt_opportunity_only", "interpretation"] == "candidate looks strong"
-    assert interpret_ml_score_formula_candidate_comparison(comparison) == (
-        "opportunity-only scoring looks strongest"
-    )
+    assert interpret_ml_score_formula_candidate_comparison(comparison) == "formula evidence is mixed"
 
 
-def test_formula_candidate_comparison_can_identify_current_score_as_inverted() -> None:
+def test_formula_candidate_comparison_current_score_matches_raw_probability() -> None:
     comparison = build_ml_score_formula_candidate_comparison(formula_candidate_panel(include_drawdown_label=False))
-    current = comparison.set_index("candidate_name").loc["current_production_score"]
+    indexed = comparison.set_index("candidate_name")
+    raw = indexed.loc["raw_probability"]
+    current = indexed.loc["current_production_score"]
 
-    assert current["monotonicity"] == "inverted"
-    assert current["interpretation"] == "candidate is inverted"
+    assert current["low_bucket_forward_excess_return"] == pytest.approx(raw["low_bucket_forward_excess_return"])
+    assert current["mid_bucket_forward_excess_return"] == pytest.approx(raw["mid_bucket_forward_excess_return"])
+    assert current["high_bucket_forward_excess_return"] == pytest.approx(raw["high_bucket_forward_excess_return"])
+    assert current["high_minus_low_spread"] == pytest.approx(raw["high_minus_low_spread"])
+    assert current["monotonicity"] == "aligned"
+    assert current["interpretation"] == "candidate looks strong"
 
 
 def test_formula_candidate_comparison_computes_risk_haircut_score() -> None:
