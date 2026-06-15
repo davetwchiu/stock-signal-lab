@@ -4,6 +4,14 @@ import pandas as pd
 
 from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config, profile_settings
 from src.decision.report import generate_markdown_report, portfolio_summary_text
+from src.decision.shortlist import (
+    SHORTLIST_VIEW_ALL,
+    SHORTLIST_VIEW_PULLBACK,
+    SHORTLIST_VIEW_STRONG,
+    SHORTLIST_VIEW_WATCHLIST,
+    SHORTLIST_VIEW_WEAK,
+    filter_decision_shortlist,
+)
 from src.decision.table import build_decision_table, confidence_from_score, one_line_reason, target_exposure_bucket
 from src.features.regime import DOWNTREND_HIGH_RISK, UPTREND_LOW_VOL
 from src.portfolio.allocation import suggested_action
@@ -113,6 +121,41 @@ def test_decision_mode_table_output_shape() -> None:
         "One-line reason",
     ]
     assert len(table) == 2
+
+
+def test_decision_shortlist_filters_existing_table_columns() -> None:
+    table = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB", "CCC", "DDD"],
+            "ML score": [82, 78, 65, 32],
+            "Drawdown-risk probability": [0.20, 0.55, 0.72, 0.30],
+            "Relative strength rank": [1, 2, 4, 5],
+            "Suggested action": ["Add", "Watch", "Hold", "Trim"],
+        }
+    )
+
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_ALL)["Ticker"].tolist() == ["AAA", "BBB", "CCC", "DDD"]
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_STRONG)["Ticker"].tolist() == ["AAA"]
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_WATCHLIST)["Ticker"].tolist() == ["BBB"]
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_PULLBACK)["Ticker"].tolist() == ["CCC"]
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_WEAK)["Ticker"].tolist() == ["DDD"]
+
+
+def test_decision_shortlist_filters_display_labels_and_percent_strings() -> None:
+    table = pd.DataFrame(
+        {
+            "Ticker": ["AAA", "BBB", "CCC"],
+            "Opportunity score": ["75", "39", "88"],
+            "Pullback risk": ["25%", "68%", "High"],
+            "Relative strength rank": ["2", "5", "1"],
+            "Suggested action": ["Add", "Avoid", "Add"],
+        }
+    )
+
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_STRONG)["Ticker"].tolist() == ["AAA"]
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_WATCHLIST)["Ticker"].tolist() == ["CCC"]
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_PULLBACK)["Ticker"].tolist() == ["BBB", "CCC"]
+    assert filter_decision_shortlist(table, SHORTLIST_VIEW_WEAK)["Ticker"].tolist() == ["BBB"]
 
 
 def test_markdown_report_generation() -> None:

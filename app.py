@@ -14,6 +14,7 @@ from src.data.fetch import load_daily_data
 from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config, profile_settings
 from src.decision.explain import ticker_explanation
 from src.decision.report import generate_markdown_report, main_warning, portfolio_summary_text
+from src.decision.shortlist import SHORTLIST_VIEW_OPTIONS, filter_decision_shortlist
 from src.decision.table import action_counts, build_decision_table
 from src.decision.user_benchmark import resolve_active_benchmark, save_user_benchmark
 from src.decision.user_portfolio import (
@@ -631,8 +632,21 @@ with today_tab:
         + " Pullback risk: "
         + DECISION_HELP["drawdown"]
     )
-    displayed_decision_table = display_decision_table(decision_table)
-    st.dataframe(styled_decision_table(displayed_decision_table), width="stretch")
+    cockpit_view = st.selectbox(
+        "Cockpit view",
+        SHORTLIST_VIEW_OPTIONS,
+        help="Filter the displayed rows without changing the calculated Decision Cockpit table.",
+    )
+    filtered_decision_table = filter_decision_shortlist(decision_table, cockpit_view)
+    st.caption(
+        f"Showing {len(filtered_decision_table)} of {len(decision_table)} rows. "
+        "This display filter does not change scores, ranking, actions, or position sizing."
+    )
+    displayed_decision_table = display_decision_table(filtered_decision_table)
+    if displayed_decision_table.empty:
+        st.info("No rows match this cockpit view.")
+    else:
+        st.dataframe(styled_decision_table(displayed_decision_table), width="stretch")
     c1, c2 = st.columns(2)
     c1.download_button(
         "Export today's decision table to CSV",
