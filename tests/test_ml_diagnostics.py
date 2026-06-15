@@ -8,8 +8,10 @@ import pytest
 from src.ml.diagnostics import (
     build_opportunity_risk_joint_validation,
     build_ml_diagnostics,
+    build_ml_probability_direction_check,
     build_ml_score_direction_diagnostics,
     build_ml_target_comparison,
+    interpret_ml_probability_direction_check,
     interpret_opportunity_risk_joint_validation,
     build_probability_label_alignment,
     build_regime_score_direction_summary,
@@ -122,6 +124,124 @@ def score_direction_panel(
             )
             row_index += 1
     return pd.DataFrame(rows)
+
+
+def probability_direction_panel(
+    *,
+    raw_direction: str = "supported",
+    rows_per_bucket: int = 10,
+    include_risk: bool = True,
+    constant_probability: bool = False,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    dates = pd.date_range("2024-03-01", periods=rows_per_bucket * 3, freq="B")
+    if raw_direction == "supported":
+        returns = (0.00, 0.03, 0.08)
+        labels = (0, 1, 1)
+    elif raw_direction == "inverted":
+        returns = (0.08, 0.03, 0.00)
+        labels = (1, 1, 0)
+    else:
+        returns = (0.02, 0.02, 0.02)
+        labels = (1, 1, 1)
+
+    row_index = 0
+    for probability, risk, forward_excess_return, actual in zip(
+        (0.20, 0.50, 0.80),
+        (0.80, 0.50, 0.10),
+        returns,
+        labels,
+        strict=True,
+    ):
+        for bucket_index in range(rows_per_bucket):
+            row = {
+                "Date": dates[row_index],
+                "Ticker": f"P{row_index:02d}",
+                "probability_out": 0.50 if constant_probability else probability + bucket_index * 0.0001,
+                "actual_out": actual,
+                "forward_excess_return": forward_excess_return,
+                "forward_return": forward_excess_return + 0.01,
+            }
+            if include_risk:
+                row["probability_risk"] = risk + bucket_index * 0.0001
+            rows.append(row)
+            row_index += 1
+    return pd.DataFrame(rows)
+
+
+def test_probability_direction_check_identifies_raw_direction() -> None:
+    direction = build_ml_probability_direction_check(probability_direction_panel())
+
+    indexed = direction.set_index("signal")
+    assert indexed.loc["raw probability", "monotonicity"] == "aligned"
+    assert indexed.loc["raw probability", "high_minus_low_spread"] == pytest.approx(0.08)
+    assert indexed.loc["raw probability", "actual_label_rate_high_bucket"] > indexed.loc[
+        "raw probability",
+        "actual_label_rate_low_bucket",
+    ]
+    assert (
+        interpret_ml_probability_direction_check(direction)
+        == "raw outperformance probability direction is supported"
+    )
+
+
+def test_probability_direction_check_identifies_inverted_direction() -> None:
+    direction = build_ml_probability_direction_check(probability_direction_panel(raw_direction="inverted"))
+
+    indexed = direction.set_index("signal")
+    assert indexed.loc["inverted probability", "monotonicity"] == "aligned"
+    assert indexed.loc["inverted probability", "high_minus_low_spread"] == pytest.approx(0.08)
+    assert (
+        interpret_ml_probability_direction_check(direction)
+        == "inverted outperformance probability direction is supported"
+    )
+
+
+def test_probability_direction_check_identifies_current_ml_score_direction() -> None:
+    panel = probability_direction_panel(raw_direction="supported", constant_probability=True)
+
+    direction = build_ml_probability_direction_check(panel)
+
+    indexed = direction.set_index("signal")
+    assert indexed.loc["raw probability", "monotonicity"] == "insufficient"
+    assert indexed.loc["current ML Score", "monotonicity"] == "aligned"
+    assert (
+        interpret_ml_probability_direction_check(direction)
+        == "current ML Score direction is supported"
+    )
+
+
+def test_probability_direction_check_returns_mixed_for_flat_data() -> None:
+    direction = build_ml_probability_direction_check(probability_direction_panel(raw_direction="flat"))
+
+    assert set(direction["monotonicity"]) == {"flat"}
+    assert interpret_ml_probability_direction_check(direction) == "direction evidence is mixed"
+
+
+def test_probability_direction_check_handles_insufficient_data() -> None:
+    direction = build_ml_probability_direction_check(probability_direction_panel(rows_per_bucket=1))
+
+    assert set(direction["monotonicity"]) == {"insufficient"}
+    assert interpret_ml_probability_direction_check(direction) == "insufficient data"
+
+
+def test_probability_direction_check_allows_missing_risk_probability() -> None:
+    direction = build_ml_probability_direction_check(probability_direction_panel(include_risk=False))
+
+    assert direction["signal"].tolist() == ["raw probability", "inverted probability"]
+    assert (
+        interpret_ml_probability_direction_check(direction)
+        == "raw outperformance probability direction is supported"
+    )
+
+
+def test_probability_direction_check_does_not_mutate_input() -> None:
+    panel = probability_direction_panel()
+    original = panel.copy(deep=True)
+
+    build_ml_probability_direction_check(panel)
+
+    pd.testing.assert_frame_equal(panel, original)
 
 
 def test_score_direction_diagnostics_identify_aligned_direction() -> None:
@@ -260,6 +380,7 @@ def test_build_ml_diagnostics_includes_score_direction_tables() -> None:
     assert not diagnostics.probability_label_alignment.empty
     assert not diagnostics.score_bucket_monotonicity.empty
     assert not diagnostics.score_inversion.empty
+    assert not diagnostics.probability_direction_check.empty
 
 
 def opportunity_risk_panel(rows_per_cell: int = 5) -> pd.DataFrame:

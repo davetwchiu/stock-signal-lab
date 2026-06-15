@@ -40,6 +40,7 @@ from src.ml.diagnostics import (
     build_ml_feature_audit,
     build_ml_feature_signal_diagnostics,
     build_ml_label_audit,
+    interpret_ml_probability_direction_check,
     interpret_opportunity_risk_joint_validation,
 )
 from src.ml.interpretations import (
@@ -985,6 +986,25 @@ with research_tab:
                             else:
                                 st.dataframe(
                                     diagnostics.opportunity_risk_joint_validation,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                            st.write("**ML probability direction check**")
+                            st.caption(
+                                interpret_ml_probability_direction_check(
+                                    diagnostics.probability_direction_check
+                                )
+                            )
+                            st.caption(
+                                "Raw and inverted outperformance probabilities are compared against realised "
+                                "forward excess return and labels. Model probabilities use the fitted estimator's "
+                                "class-1 probability when class labels are exposed."
+                            )
+                            if diagnostics.probability_direction_check.empty:
+                                st.info("No probability direction check was available for this walk-forward sample.")
+                            else:
+                                st.dataframe(
+                                    diagnostics.probability_direction_check,
                                     width="stretch",
                                     hide_index=True,
                                 )

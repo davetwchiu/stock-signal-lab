@@ -83,6 +83,19 @@ SCORE_INVERSION_COLUMNS = [
     "interpretation",
 ]
 
+ML_PROBABILITY_DIRECTION_COLUMNS = [
+    "signal",
+    "sample_size",
+    "low_bucket_forward_excess_return",
+    "mid_bucket_forward_excess_return",
+    "high_bucket_forward_excess_return",
+    "high_minus_low_spread",
+    "monotonicity",
+    "actual_label_rate_low_bucket",
+    "actual_label_rate_high_bucket",
+    "interpretation",
+]
+
 REGIME_SCORE_DIRECTION_COLUMNS = [
     "regime_dimension",
     "regime",
@@ -332,6 +345,7 @@ class MLDiagnostics:
     drawdown_risk_calibration_quality: pd.DataFrame
     target_comparison: pd.DataFrame
     opportunity_risk_joint_validation: pd.DataFrame
+    probability_direction_check: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -443,6 +457,10 @@ def _empty_score_bucket_monotonicity() -> pd.DataFrame:
 
 def _empty_score_inversion_diagnostics() -> pd.DataFrame:
     return pd.DataFrame(columns=SCORE_INVERSION_COLUMNS)
+
+
+def _empty_ml_probability_direction_check() -> pd.DataFrame:
+    return pd.DataFrame(columns=ML_PROBABILITY_DIRECTION_COLUMNS)
 
 
 def _empty_regime_score_direction_summary() -> pd.DataFrame:
@@ -3009,6 +3027,206 @@ def build_score_inversion_diagnostics(
     return pd.DataFrame(rows, columns=SCORE_INVERSION_COLUMNS)
 
 
+def _probability_direction_candidate_row(
+    data: pd.DataFrame,
+    *,
+    signal: str,
+    signal_col: str,
+    return_col: str,
+    label_col: str,
+    min_bucket_size: int,
+    min_samples: int,
+) -> dict[str, object]:
+    empty_row = {
+        "signal": signal,
+        "sample_size": 0,
+        "low_bucket_forward_excess_return": pd.NA,
+        "mid_bucket_forward_excess_return": pd.NA,
+        "high_bucket_forward_excess_return": pd.NA,
+        "high_minus_low_spread": pd.NA,
+        "monotonicity": "insufficient",
+        "actual_label_rate_low_bucket": pd.NA,
+        "actual_label_rate_high_bucket": pd.NA,
+        "interpretation": "There is too little usable data for this probability direction check.",
+    }
+    if signal_col not in data or return_col not in data:
+        return empty_row
+
+    columns = [signal_col, return_col]
+    has_label = label_col in data
+    if has_label:
+        columns.append(label_col)
+
+    usable = data[columns].apply(pd.to_numeric, errors="coerce").dropna(subset=[signal_col, return_col])
+    if (
+        len(usable) < min_samples
+        or usable[signal_col].nunique(dropna=True) < 3
+    ):
+        row = empty_row.copy()
+        row["sample_size"] = int(len(usable))
+        return row
+
+    bucketed = usable.copy()
+    try:
+        bucketed["_direction_bucket"] = pd.qcut(
+            bucketed[signal_col].rank(method="first"),
+            q=3,
+            labels=["Low", "Mid", "High"],
+        )
+    except ValueError:
+        row = empty_row.copy()
+        row["sample_size"] = int(len(usable))
+        row["interpretation"] = "Probability buckets were too narrow for this direction check."
+        return row
+
+    grouped = bucketed.groupby("_direction_bucket", observed=True)
+    bucket_returns: dict[str, object] = {}
+    label_rates: dict[str, object] = {}
+    for bucket in ("Low", "Mid", "High"):
+        if bucket not in grouped.groups:
+            bucket_returns[bucket] = pd.NA
+            label_rates[bucket] = pd.NA
+            continue
+        group = grouped.get_group(bucket)
+        if len(group) < min_bucket_size:
+            bucket_returns[bucket] = pd.NA
+            label_rates[bucket] = pd.NA
+            continue
+        bucket_returns[bucket] = float(group[return_col].mean())
+        label_rates[bucket] = float(group[label_col].mean()) if has_label else pd.NA
+
+    low_return = bucket_returns["Low"]
+    mid_return = bucket_returns["Mid"]
+    high_return = bucket_returns["High"]
+    if pd.isna(low_return) or pd.isna(high_return):
+        spread = pd.NA
+        monotonicity = "insufficient"
+        interpretation = "Probability buckets were too small for this direction check."
+    else:
+        spread = float(high_return - low_return)
+        complete_returns = [
+            float(value)
+            for value in (low_return, mid_return, high_return)
+            if pd.notna(value)
+        ]
+        monotonicity = _monotonicity_result(complete_returns)
+        if monotonicity == "aligned":
+            interpretation = f"Higher {signal} buckets have higher realised forward excess return in this sample."
+        elif monotonicity == "inverted":
+            interpretation = f"Higher {signal} buckets have lower realised forward excess return in this sample."
+        elif monotonicity == "flat":
+            interpretation = f"{signal} buckets have similar realised forward excess return in this sample."
+        else:
+            interpretation = f"{signal} buckets have mixed realised forward excess return in this sample."
+
+    return {
+        "signal": signal,
+        "sample_size": int(len(usable)),
+        "low_bucket_forward_excess_return": low_return,
+        "mid_bucket_forward_excess_return": mid_return,
+        "high_bucket_forward_excess_return": high_return,
+        "high_minus_low_spread": spread,
+        "monotonicity": monotonicity,
+        "actual_label_rate_low_bucket": label_rates["Low"],
+        "actual_label_rate_high_bucket": label_rates["High"],
+        "interpretation": interpretation,
+    }
+
+
+def build_ml_probability_direction_check(
+    score_panel: pd.DataFrame,
+    *,
+    probability_col: str = "probability_out",
+    risk_probability_col: str = "probability_risk",
+    score_col: str = "ML Score",
+    return_col: str = "forward_excess_return",
+    label_col: str = "actual_out",
+    min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
+    min_samples: int = MIN_SCORE_DIRECTION_SAMPLE_COUNT,
+) -> pd.DataFrame:
+    """Compare raw, inverted, and current-score directions against realised excess returns."""
+
+    if score_panel.empty or probability_col not in score_panel or return_col not in score_panel:
+        return _empty_ml_probability_direction_check()
+
+    data = score_panel.copy()
+    data["raw_outperform_probability"] = _numeric_column(data, probability_col)
+    data["inverted_outperform_probability"] = 1.0 - data["raw_outperform_probability"]
+    candidate_specs = [
+        ("raw probability", "raw_outperform_probability"),
+        ("inverted probability", "inverted_outperform_probability"),
+    ]
+    if score_col in data:
+        data["current_ml_score"] = _numeric_column(data, score_col)
+        candidate_specs.append(("current ML Score", "current_ml_score"))
+    elif risk_probability_col in data:
+        data["current_ml_score"] = ml_score(
+            data["raw_outperform_probability"],
+            _numeric_column(data, risk_probability_col),
+        )
+        candidate_specs.append(("current ML Score", "current_ml_score"))
+
+    rows = [
+        _probability_direction_candidate_row(
+            data,
+            signal=signal,
+            signal_col=column,
+            return_col=return_col,
+            label_col=label_col,
+            min_bucket_size=min_bucket_size,
+            min_samples=min_samples,
+        )
+        for signal, column in candidate_specs
+    ]
+    return pd.DataFrame(rows, columns=ML_PROBABILITY_DIRECTION_COLUMNS)
+
+
+def _probability_direction_row_supported(row: pd.Series, *, require_label: bool) -> bool:
+    if row.get("monotonicity") != "aligned":
+        return False
+    spread = pd.to_numeric(pd.Series([row.get("high_minus_low_spread")]), errors="coerce").iloc[0]
+    if pd.isna(spread) or spread <= SPREAD_SIMILARITY_TOLERANCE:
+        return False
+    if not require_label:
+        return True
+    label_low = pd.to_numeric(pd.Series([row.get("actual_label_rate_low_bucket")]), errors="coerce").iloc[0]
+    label_high = pd.to_numeric(pd.Series([row.get("actual_label_rate_high_bucket")]), errors="coerce").iloc[0]
+    return pd.notna(label_low) and pd.notna(label_high) and label_high > label_low + SPREAD_SIMILARITY_TOLERANCE
+
+
+def interpret_ml_probability_direction_check(direction_check: pd.DataFrame) -> str:
+    """Return one compact conclusion for the probability direction check."""
+
+    if direction_check.empty or "signal" not in direction_check:
+        return "insufficient data"
+
+    rows = direction_check.set_index("signal")
+    raw_supported = (
+        "raw probability" in rows.index
+        and _probability_direction_row_supported(rows.loc["raw probability"], require_label=True)
+    )
+    inverted_supported = (
+        "inverted probability" in rows.index
+        and _probability_direction_row_supported(rows.loc["inverted probability"], require_label=True)
+    )
+    score_supported = (
+        "current ML Score" in rows.index
+        and _probability_direction_row_supported(rows.loc["current ML Score"], require_label=False)
+    )
+
+    if raw_supported and not inverted_supported:
+        return "raw outperformance probability direction is supported"
+    if inverted_supported and not raw_supported:
+        return "inverted outperformance probability direction is supported"
+    if score_supported and not raw_supported and not inverted_supported:
+        return "current ML Score direction is supported"
+
+    monotonicity = set(direction_check["monotonicity"].dropna().astype(str))
+    if not monotonicity or monotonicity == {"insufficient"}:
+        return "insufficient data"
+    return "direction evidence is mixed"
+
+
 def build_regime_score_direction_summary(
     score_panel: pd.DataFrame,
     *,
@@ -3090,6 +3308,39 @@ def build_ml_diagnostics(
     change score, probability, or decision logic.
     """
 
+    out_columns = [
+        "Date",
+        "Ticker",
+        "actual",
+        "probability",
+        "forward_return",
+        "forward_excess_return",
+        "forward_drawdown",
+    ]
+    risk_columns = ["Date", "Ticker", "actual", "probability"]
+    out = outperformance_predictions[
+        [column for column in out_columns if column in outperformance_predictions]
+    ].rename(columns={"actual": "actual_out", "probability": "probability_out"})
+    risk = drawdown_risk_predictions[
+        [column for column in risk_columns if column in drawdown_risk_predictions]
+    ].rename(
+        columns={"actual": "actual_risk", "probability": "probability_risk"}
+    )
+    probability_direction_panel = out.copy()
+    if (
+        not probability_direction_panel.empty
+        and not risk.empty
+        and {"Date", "Ticker"}.issubset(probability_direction_panel.columns)
+        and {"Date", "Ticker"}.issubset(risk.columns)
+    ):
+        probability_direction_panel = probability_direction_panel.merge(risk, on=["Date", "Ticker"], how="left")
+    if not probability_direction_panel.empty and "probability_risk" in probability_direction_panel:
+        probability_direction_panel["ML Score"] = ml_score(
+            probability_direction_panel["probability_out"],
+            probability_direction_panel["probability_risk"],
+        )
+    probability_direction_check = build_ml_probability_direction_check(probability_direction_panel)
+
     if outperformance_predictions.empty or drawdown_risk_predictions.empty:
         summary = pd.DataFrame(
             [
@@ -3111,26 +3362,9 @@ def build_ml_diagnostics(
             _empty_drawdown_risk_calibration_quality(),
             _empty_target_comparison(),
             _empty_opportunity_risk_joint_validation(),
+            probability_direction_check,
         )
 
-    out_columns = [
-        "Date",
-        "Ticker",
-        "actual",
-        "probability",
-        "forward_return",
-        "forward_excess_return",
-        "forward_drawdown",
-    ]
-    risk_columns = ["Date", "Ticker", "actual", "probability"]
-    out = outperformance_predictions[
-        [column for column in out_columns if column in outperformance_predictions]
-    ].rename(columns={"actual": "actual_out", "probability": "probability_out"})
-    risk = drawdown_risk_predictions[
-        [column for column in risk_columns if column in drawdown_risk_predictions]
-    ].rename(
-        columns={"actual": "actual_risk", "probability": "probability_risk"}
-    )
     score_panel = out.merge(risk, on=["Date", "Ticker"], how="inner")
     if not score_panel.empty:
         score_panel["ML Score"] = ml_score(score_panel["probability_out"], score_panel["probability_risk"])
@@ -3182,4 +3416,5 @@ def build_ml_diagnostics(
         risk_calibration_quality,
         target_comparison,
         opportunity_risk_joint_validation,
+        probability_direction_check,
     )
