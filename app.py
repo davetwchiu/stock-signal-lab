@@ -56,6 +56,13 @@ from src.ml.interpretations import (
 from src.ml.metrics import calibration_summary, calibration_table, confusion_matrix_frame, score_quintile_analysis
 from src.ml.models import MODEL_OPTIONS
 from src.ml.scoring import current_ml_score_table
+from src.ml.target_diagnostics import (
+    add_target_candidate_labels,
+    build_target_balance_diagnostics,
+    build_target_walk_forward_comparison,
+    target_candidate_registry,
+    target_definition_table,
+)
 from src.ml.validation import (
     compare_feature_groups,
     deduplicate_prediction_keys,
@@ -925,6 +932,25 @@ with research_tab:
                                 high_correlation_pairs=feature_audit.high_correlation_pairs,
                             )
                         )
+                        target_candidates = target_candidate_registry(config.default_label_horizon)
+                        target_panel = add_target_candidate_labels(
+                            supervised,
+                            benchmark_price=benchmark_frame["Adj Close"],
+                            base_horizon=config.default_label_horizon,
+                        )
+                        target_balance = build_target_balance_diagnostics(target_panel, target_candidates)
+                        target_walk_forward = build_target_walk_forward_comparison(
+                            target_panel,
+                            columns,
+                            target_candidates,
+                            model_name=model_name,
+                            train_window=int(train_window),
+                            test_window=int(test_window),
+                            step=int(step),
+                            embargo=int(embargo),
+                            probability_threshold=float(probability_threshold),
+                            model_selection_mode=model_selection_mode,
+                        )
                         risk_result = walk_forward_validate_classifier(
                             supervised,
                             columns,
@@ -1063,6 +1089,44 @@ with research_tab:
                                     width="stretch",
                                     hide_index=True,
                                 )
+                            st.write("**Alternative ML target diagnostics**")
+                            st.caption(
+                                "These diagnostics compare possible future ML targets. They do not change "
+                                "Decision Cockpit scoring or today's ML Score."
+                            )
+                            st.write("Candidate target definitions")
+                            st.dataframe(
+                                target_definition_table(target_candidates)[
+                                    ["target_id", "display_name", "horizon", "positive_label_meaning"]
+                                ],
+                                width="stretch",
+                                hide_index=True,
+                            )
+                            st.write("Target balance and label quality")
+                            st.dataframe(
+                                target_balance[
+                                    ["target_id", "sample_count", "positive_rate", "class_balance_status"]
+                                ],
+                                width="stretch",
+                                hide_index=True,
+                            )
+                            st.write("Walk-forward target comparison")
+                            st.dataframe(
+                                target_walk_forward[
+                                    [
+                                        "target_id",
+                                        "roc_auc",
+                                        "pr_auc",
+                                        "brier_score",
+                                        "calibration_gap",
+                                        "bucket_spread",
+                                        "quality_summary",
+                                        "interpretation",
+                                    ]
+                                ],
+                                width="stretch",
+                                hide_index=True,
+                            )
                             st.write("**Opportunity-risk joint validation**")
                             st.caption(
                                 interpret_opportunity_risk_joint_validation(
