@@ -5,6 +5,7 @@ import re
 import pandas as pd
 import pytest
 
+from src.ml.metrics import calibration_summary, calibration_table
 from src.ml.diagnostics import (
     _risk_haircut_score,
     build_opportunity_risk_joint_validation,
@@ -85,6 +86,19 @@ def test_ml_diagnostics_include_drawdown_risk_calibration_and_summary() -> None:
     assert diagnostics.summary.loc[1, "accuracy"] == 0.8
     assert "observed_drawdown_risk_rate" in diagnostics.drawdown_risk_calibration.columns
     assert diagnostics.drawdown_risk_calibration["count"].sum() == 6
+
+
+def test_calibration_diagnostics_include_brier_and_gap() -> None:
+    outperformance, _ = validation_predictions()
+
+    summary = calibration_summary(outperformance)
+    bucketed = calibration_table(outperformance, bins=2)
+
+    assert summary.loc[0, "brier_score"] == pytest.approx(0.0979166667)
+    assert summary.loc[0, "calibration_gap"] == pytest.approx(
+        summary.loc[0, "observed_positive_rate"] - summary.loc[0, "average_predicted_probability"]
+    )
+    assert "calibration_gap" in bucketed.columns
 
 
 def test_ml_diagnostics_merge_overlapping_folds_without_row_explosion() -> None:

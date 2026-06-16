@@ -53,13 +53,14 @@ from src.ml.interpretations import (
     interpret_ml_score_buckets,
     ml_signal_health_interpretation,
 )
-from src.ml.metrics import calibration_table, confusion_matrix_frame, score_quintile_analysis
+from src.ml.metrics import calibration_summary, calibration_table, confusion_matrix_frame, score_quintile_analysis
 from src.ml.models import MODEL_OPTIONS
 from src.ml.scoring import current_ml_score_table
 from src.ml.validation import (
     compare_feature_groups,
     deduplicate_prediction_keys,
     prediction_merge_keys,
+    summarize_model_selection,
     walk_forward_validate_classifier,
 )
 from src.portfolio.allocation import AllocationConfig
@@ -812,6 +813,15 @@ with research_tab:
             format_func=lambda value: value.replace("_", " ").title(),
             help="Stage 2 model family. Decision Mode uses the locked default model.",
         )
+        model_selection_mode = st.selectbox(
+            "ML model mode",
+            options=["current_default", "auto_select"],
+            format_func=lambda value: (
+                "Current default" if value == "current_default" else "Auto select per walk-forward fold"
+            ),
+            index=1,
+            help="Research Lab validation mode. Auto select uses only each fold's training period.",
+        )
         feature_group = st.selectbox(
             "Feature group",
             options=["technical", "technical_fourier", "technical_wavelet", "all"],
@@ -848,15 +858,21 @@ with research_tab:
                 step=int(step),
                 embargo=int(embargo),
                 probability_threshold=float(probability_threshold),
+                model_selection_mode=model_selection_mode,
             )
             if result.predictions.empty:
                 st.warning("No walk-forward predictions. Try a longer date range or smaller windows.")
             else:
                 st.dataframe(result.overall_metrics, width="stretch")
                 st.dataframe(result.fold_metrics, width="stretch")
+                selection_summary = summarize_model_selection(result.fold_metrics, "outperformance")
+                if not selection_summary.empty:
+                    st.write("**ML model selection summary**")
+                    st.dataframe(selection_summary, width="stretch", hide_index=True)
                 quintiles = score_quintile_analysis(result.predictions)
                 st.dataframe(quintiles, width="stretch")
                 st.dataframe(confusion_matrix_frame(result.predictions["actual"], result.predictions["probability"]), width="stretch")
+                st.dataframe(calibration_summary(result.predictions), width="stretch", hide_index=True)
                 st.dataframe(calibration_table(result.predictions), width="stretch")
 
                 group_options = {
@@ -873,6 +889,7 @@ with research_tab:
                     step=int(step),
                     embargo=int(embargo),
                     probability_threshold=float(probability_threshold),
+                    model_selection_mode=model_selection_mode,
                 )
                 st.dataframe(comparison, width="stretch")
 
@@ -918,6 +935,7 @@ with research_tab:
                             step=int(step),
                             embargo=int(embargo),
                             probability_threshold=float(probability_threshold),
+                            model_selection_mode=model_selection_mode,
                         )
                         risk_adjusted_result = walk_forward_validate_classifier(
                             supervised,
@@ -929,6 +947,7 @@ with research_tab:
                             step=int(step),
                             embargo=int(embargo),
                             probability_threshold=float(probability_threshold),
+                            model_selection_mode=model_selection_mode,
                         )
                         tail_risk_result = walk_forward_validate_classifier(
                             supervised,
@@ -940,10 +959,21 @@ with research_tab:
                             step=int(step),
                             embargo=int(embargo),
                             probability_threshold=float(probability_threshold),
+                            model_selection_mode=model_selection_mode,
                         )
                         if risk_result.predictions.empty:
                             st.warning("No drawdown-risk predictions were available for ML diagnostics.")
                         else:
+                            combined_selection_summary = pd.concat(
+                                [
+                                    summarize_model_selection(result.fold_metrics, "outperformance"),
+                                    summarize_model_selection(risk_result.fold_metrics, "drawdown_risk"),
+                                ],
+                                ignore_index=True,
+                            )
+                            if not combined_selection_summary.empty:
+                                st.write("**ML model selection summary by target**")
+                                st.dataframe(combined_selection_summary, width="stretch", hide_index=True)
                             diagnostics = build_ml_diagnostics(
                                 result.predictions,
                                 risk_result.predictions,

@@ -13,6 +13,18 @@ from sklearn.preprocessing import StandardScaler
 
 
 MODEL_OPTIONS = ("logistic_regression", "random_forest", "hist_gradient_boosting")
+MODEL_CANDIDATES = (
+    "current_default",
+    "regularized_logistic",
+    "random_forest_shallow",
+    "random_forest_balanced",
+)
+
+
+def available_model_candidates() -> tuple[str, ...]:
+    """Return deterministic candidate names for walk-forward model selection."""
+
+    return MODEL_CANDIDATES
 
 
 def build_model_pipeline(model_name: str, random_state: int = 42) -> Pipeline:
@@ -40,6 +52,42 @@ def build_model_pipeline(model_name: str, random_state: int = 42) -> Pipeline:
         model = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.05, random_state=random_state)
         return Pipeline([("imputer", SimpleImputer(strategy="median", keep_empty_features=True)), ("model", model)])
     raise ValueError(f"Unknown model_name: {model_name}")
+
+
+def build_classifier(candidate_name: str, random_state: int = 42) -> Pipeline:
+    """Build a lightweight classifier candidate for training-only model selection."""
+
+    if candidate_name == "current_default":
+        return build_model_pipeline("logistic_regression", random_state=random_state)
+    if candidate_name == "regularized_logistic":
+        model = LogisticRegression(max_iter=1000, class_weight="balanced", C=0.25)
+        return Pipeline(
+            [
+                ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
+                ("scaler", StandardScaler()),
+                ("model", model),
+            ]
+        )
+    if candidate_name == "random_forest_shallow":
+        model = RandomForestClassifier(
+            n_estimators=80,
+            max_depth=3,
+            min_samples_leaf=8,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+        return Pipeline([("imputer", SimpleImputer(strategy="median", keep_empty_features=True)), ("model", model)])
+    if candidate_name == "random_forest_balanced":
+        model = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=5,
+            min_samples_leaf=5,
+            class_weight="balanced_subsample",
+            random_state=random_state,
+            n_jobs=-1,
+        )
+        return Pipeline([("imputer", SimpleImputer(strategy="median", keep_empty_features=True)), ("model", model)])
+    raise ValueError(f"Unknown candidate_name: {candidate_name}")
 
 
 def fit_classifier(
