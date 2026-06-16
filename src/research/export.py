@@ -221,6 +221,7 @@ def build_codex_handoff(
         tables.get("regime_segmented_ml_diagnostics"),
     )
     diagnostics_summary = _frame(tables.get("ml_diagnostics_summary"))
+    ml_reliability = _frame(tables.get("ml_reliability_by_regime"))
     drawdown_quality = _frame(tables.get("drawdown_risk_calibration_quality"))
     feature_audit = _frame(tables.get("feature_audit_summary"))
     redundancy = _frame(tables.get("feature_redundancy_selection"))
@@ -253,6 +254,9 @@ def build_codex_handoff(
         "",
         "## Regime warnings",
         _regime_warnings(regime, target_quality),
+        "",
+        "## ML reliability by regime",
+        _ml_reliability_evidence(ml_reliability),
         "",
         "## Feature group findings",
         _feature_group_findings(feature_group, target_quality),
@@ -422,6 +426,21 @@ def _regime_warnings(regime: pd.DataFrame, target_quality: pd.DataFrame) -> str:
     if warnings:
         return "Evidence is mixed across regimes for: " + ", ".join(dict.fromkeys(warnings)) + "."
     return "No explicit regime-sensitive or inverted behaviour was identified from the exported tables."
+
+
+def _ml_reliability_evidence(reliability: pd.DataFrame) -> str:
+    if reliability.empty:
+        return "No ML reliability-by-regime table was exported."
+    if "classification" not in reliability:
+        return "This table shows where ML score historically worked, failed, or lacked enough evidence."
+
+    counts = reliability["classification"].astype(str).value_counts().sort_index()
+    count_text = ", ".join(f"{classification}={count}" for classification, count in counts.items())
+    return (
+        "This table shows where ML score historically worked, failed, or lacked enough evidence. "
+        f"Exported {len(reliability)} regime rows"
+        + (f": {count_text}." if count_text else ".")
+    )
 
 
 def _feature_group_findings(feature_group: pd.DataFrame, target_quality: pd.DataFrame) -> str:

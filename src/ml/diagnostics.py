@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pandas as pd
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.ml.datasets import feature_group_columns
 from src.ml.feature_selection import (
@@ -40,6 +41,24 @@ REGIME_SEGMENTED_COLUMNS = [
     "direction",
     "evidence_quality",
     "interpretation",
+]
+
+ML_RELIABILITY_BY_REGIME_COLUMNS = [
+    "regime",
+    "sample_count",
+    "positive_rate",
+    "roc_auc",
+    "pr_auc",
+    "brier",
+    "bucket_spread",
+    "score_bucket_monotonicity",
+    "drawdown_brier",
+    "drawdown_calibration_gap",
+    "drawdown_bucket_spread",
+    "inversion_flag",
+    "insufficient_sample_flag",
+    "classification",
+    "reason",
 ]
 
 SCORE_DIRECTION_SUMMARY_COLUMNS = [
@@ -224,7 +243,12 @@ SIMPLE_BASELINE_CANDIDATES = (
 MIN_BASELINE_BUCKET_COUNT = 5
 MIN_REGIME_BUCKET_COUNT = 5
 MIN_REGIME_SAMPLE_COUNT = 20
+MIN_RELIABILITY_CLASS_COUNT = 5
 SPREAD_SIMILARITY_TOLERANCE = 0.0025
+RELIABILITY_WEAK_AUC = 0.52
+RELIABILITY_WEAK_PR_MARGIN = 0.02
+RELIABILITY_DRAWDOWN_BRIER_LIMIT = 0.25
+RELIABILITY_DRAWDOWN_GAP_LIMIT = 0.15
 MIN_SCORE_DIRECTION_BUCKET_COUNT = 5
 MIN_SCORE_DIRECTION_SAMPLE_COUNT = 20
 MIN_JOINT_VALIDATION_CELL_COUNT = 5
@@ -371,6 +395,7 @@ class MLDiagnostics:
     score_bucket_monotonicity: pd.DataFrame
     score_inversion: pd.DataFrame
     regime_score_direction: pd.DataFrame
+    ml_reliability_by_regime: pd.DataFrame
     drawdown_risk_calibration_quality: pd.DataFrame
     target_comparison: pd.DataFrame
     opportunity_risk_joint_validation: pd.DataFrame
@@ -473,6 +498,10 @@ def _empty_baseline_comparison() -> pd.DataFrame:
 
 def _empty_regime_segmented_diagnostics() -> pd.DataFrame:
     return pd.DataFrame(columns=REGIME_SEGMENTED_COLUMNS)
+
+
+def _empty_ml_reliability_by_regime() -> pd.DataFrame:
+    return pd.DataFrame(columns=ML_RELIABILITY_BY_REGIME_COLUMNS)
 
 
 def _empty_score_direction_summary() -> pd.DataFrame:
@@ -2406,6 +2435,247 @@ def build_regime_segmented_ml_diagnostics(
     return pd.DataFrame(rows, columns=REGIME_SEGMENTED_COLUMNS)
 
 
+def _binary_metrics(data: pd.DataFrame, label_col: str, probability_col: str) -> tuple[object, object, object]:
+    if label_col not in data or probability_col not in data:
+        return pd.NA, pd.NA, pd.NA
+    usable = data[[label_col, probability_col]].apply(pd.to_numeric, errors="coerce").dropna()
+    if usable.empty:
+        return pd.NA, pd.NA, pd.NA
+    labels = usable[label_col].astype(int)
+    probability = usable[probability_col].astype(float)
+    brier = float(((probability - labels) ** 2).mean())
+    if labels.nunique() < 2:
+        return pd.NA, pd.NA, brier
+    return float(roc_auc_score(labels, probability)), float(average_precision_score(labels, probability)), brier
+
+
+def _bucket_metric_spread(
+    data: pd.DataFrame,
+    *,
+    score_col: str,
+    value_col: str,
+    min_bucket_size: int,
+) -> tuple[object, object]:
+    if score_col not in data or value_col not in data:
+        return pd.NA, "insufficient"
+    usable = data[[score_col, value_col]].apply(pd.to_numeric, errors="coerce").dropna()
+    if usable.empty:
+        return pd.NA, "insufficient"
+
+    bucketed = _bucket_score_data(usable, score_col)
+    bucket_means: list[float] = []
+    for bucket in ("Low", "Medium", "High"):
+        group = bucketed[bucketed["score_bucket"] == bucket]
+        if len(group) < min_bucket_size:
+            return pd.NA, "insufficient"
+        bucket_means.append(float(group[value_col].mean()))
+    return bucket_means[-1] - bucket_means[0], _monotonicity_result(bucket_means)
+
+
+def _reliability_classification(
+    *,
+    sample_count: int,
+    positive_count: int,
+    negative_count: int,
+    roc_auc: object,
+    pr_auc: object,
+    positive_rate: object,
+    bucket_spread: object,
+    monotonicity: object,
+    drawdown_brier: object,
+    drawdown_calibration_gap: object,
+    drawdown_bucket_spread: object,
+    min_samples: int,
+    min_class_count: int,
+) -> tuple[bool, bool, str, str]:
+    """Classify regime reliability with plain conservative thresholds.
+
+    The table is research-only: it identifies regimes where historical evidence
+    supports, contradicts, or fails to support trusting the current ML score.
+    Thresholds are deliberately simple to avoid tuning a future gate here.
+    """
+
+    insufficient = (
+        sample_count < min_samples
+        or positive_count < min_class_count
+        or negative_count < min_class_count
+        or pd.isna(bucket_spread)
+    )
+    if insufficient:
+        return False, True, "insufficient_sample", "Not enough valid samples, classes, or score buckets."
+
+    inversion = (
+        (pd.notna(bucket_spread) and bucket_spread < -SPREAD_SIMILARITY_TOLERANCE)
+        or monotonicity == "inverted"
+    )
+    if inversion:
+        return True, False, "inverted", "Higher ML score had worse realised outperformance evidence."
+
+    weak_return_evidence = (
+        pd.isna(roc_auc)
+        or pd.isna(pr_auc)
+        or pd.isna(positive_rate)
+        or roc_auc < RELIABILITY_WEAK_AUC
+        or pr_auc < positive_rate + RELIABILITY_WEAK_PR_MARGIN
+        or monotonicity not in {"aligned", "flat"}
+        or bucket_spread <= SPREAD_SIMILARITY_TOLERANCE
+    )
+    weak_drawdown_evidence = (
+        pd.isna(drawdown_brier)
+        or drawdown_brier > RELIABILITY_DRAWDOWN_BRIER_LIMIT
+        or (
+            pd.notna(drawdown_calibration_gap)
+            and abs(drawdown_calibration_gap) > RELIABILITY_DRAWDOWN_GAP_LIMIT
+        )
+    )
+    conflicting_drawdown_bucket = (
+        pd.notna(drawdown_bucket_spread)
+        and drawdown_bucket_spread > SPREAD_SIMILARITY_TOLERANCE
+        and bucket_spread <= SPREAD_SIMILARITY_TOLERANCE
+    )
+
+    if weak_return_evidence and conflicting_drawdown_bucket:
+        return False, False, "unstable", "Return evidence is weak while higher score carries more drawdown risk."
+    if not weak_return_evidence and not weak_drawdown_evidence:
+        return False, False, "reliable", "Return discrimination and drawdown calibration both clear conservative thresholds."
+    return False, False, "mixed", "Some useful evidence exists, but separation or calibration is weak."
+
+
+def build_ml_reliability_by_regime(
+    score_panel: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    regime_cols: list[str] | None = None,
+    score_col: str = "ML Score",
+    target_col: str = "forward_excess_return",
+    return_label_col: str = "actual_out",
+    return_probability_col: str = "probability_out",
+    drawdown_label_col: str = "actual_risk",
+    drawdown_probability_col: str = "probability_risk",
+    min_samples: int = MIN_REGIME_SAMPLE_COUNT,
+    min_class_count: int = MIN_RELIABILITY_CLASS_COUNT,
+    min_bucket_size: int = MIN_REGIME_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Return regime-aware research diagnostics for when ML score looks trustworthy."""
+
+    if score_panel.empty:
+        return _empty_ml_reliability_by_regime()
+
+    candidate_regime_cols = list(regime_cols or DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(score_panel, baseline_panel, candidate_regime_cols)
+    required = [
+        score_col,
+        target_col,
+        return_label_col,
+        return_probability_col,
+        drawdown_label_col,
+        drawdown_probability_col,
+    ]
+    if any(column not in data for column in required):
+        return _empty_ml_reliability_by_regime()
+
+    available_regime_cols = [column for column in candidate_regime_cols if column in data]
+    if not available_regime_cols:
+        return _empty_ml_reliability_by_regime()
+
+    rows: list[dict[str, object]] = []
+    for regime_col in available_regime_cols:
+        regime_data = data.dropna(subset=[regime_col]).copy()
+        if regime_data.empty:
+            continue
+        regime_data[regime_col] = regime_data[regime_col].astype(str).str.strip()
+        regime_data = regime_data[regime_data[regime_col] != ""]
+        if regime_data.empty:
+            continue
+
+        for regime, group in regime_data.groupby(regime_col, sort=True):
+            metrics_data = group[
+                [
+                    score_col,
+                    target_col,
+                    return_label_col,
+                    return_probability_col,
+                    drawdown_label_col,
+                    drawdown_probability_col,
+                ]
+            ].apply(pd.to_numeric, errors="coerce")
+            usable = metrics_data.dropna(subset=[return_label_col, return_probability_col])
+            sample_count = int(len(usable))
+            if sample_count:
+                positive_rate = float(usable[return_label_col].mean())
+                positive_count = int((usable[return_label_col] == 1).sum())
+                negative_count = int((usable[return_label_col] == 0).sum())
+            else:
+                positive_rate = pd.NA
+                positive_count = 0
+                negative_count = 0
+
+            roc_auc, pr_auc, brier = _binary_metrics(usable, return_label_col, return_probability_col)
+            bucket_spread, monotonicity = _bucket_metric_spread(
+                metrics_data,
+                score_col=score_col,
+                value_col=target_col,
+                min_bucket_size=min_bucket_size,
+            )
+            drawdown_roc_auc, drawdown_pr_auc, drawdown_brier = _binary_metrics(
+                metrics_data,
+                drawdown_label_col,
+                drawdown_probability_col,
+            )
+            del drawdown_roc_auc, drawdown_pr_auc
+            drawdown_usable = metrics_data[[drawdown_label_col, drawdown_probability_col]].dropna()
+            drawdown_calibration_gap = (
+                float(drawdown_usable[drawdown_label_col].mean() - drawdown_usable[drawdown_probability_col].mean())
+                if not drawdown_usable.empty
+                else pd.NA
+            )
+            drawdown_bucket_spread, _drawdown_monotonicity = _bucket_metric_spread(
+                metrics_data,
+                score_col=score_col,
+                value_col=drawdown_label_col,
+                min_bucket_size=min_bucket_size,
+            )
+            del _drawdown_monotonicity
+            inversion_flag, insufficient_sample_flag, classification, reason = _reliability_classification(
+                sample_count=sample_count,
+                positive_count=positive_count,
+                negative_count=negative_count,
+                roc_auc=roc_auc,
+                pr_auc=pr_auc,
+                positive_rate=positive_rate,
+                bucket_spread=bucket_spread,
+                monotonicity=monotonicity,
+                drawdown_brier=drawdown_brier,
+                drawdown_calibration_gap=drawdown_calibration_gap,
+                drawdown_bucket_spread=drawdown_bucket_spread,
+                min_samples=min_samples,
+                min_class_count=min_class_count,
+            )
+            rows.append(
+                {
+                    "regime": regime,
+                    "sample_count": sample_count,
+                    "positive_rate": positive_rate,
+                    "roc_auc": roc_auc,
+                    "pr_auc": pr_auc,
+                    "brier": brier,
+                    "bucket_spread": bucket_spread,
+                    "score_bucket_monotonicity": monotonicity,
+                    "drawdown_brier": drawdown_brier,
+                    "drawdown_calibration_gap": drawdown_calibration_gap,
+                    "drawdown_bucket_spread": drawdown_bucket_spread,
+                    "inversion_flag": inversion_flag,
+                    "insufficient_sample_flag": insufficient_sample_flag,
+                    "classification": classification,
+                    "reason": reason,
+                }
+            )
+
+    if not rows:
+        return _empty_ml_reliability_by_regime()
+    return pd.DataFrame(rows, columns=ML_RELIABILITY_BY_REGIME_COLUMNS)
+
+
 def _numeric_column(data: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(data[column], errors="coerce")
 
@@ -3751,6 +4021,7 @@ def build_ml_diagnostics(
             _empty_score_bucket_monotonicity(),
             _empty_score_inversion_diagnostics(),
             _empty_regime_score_direction_summary(),
+            _empty_ml_reliability_by_regime(),
             _empty_drawdown_risk_calibration_quality(),
             _empty_target_comparison(),
             _empty_opportunity_risk_joint_validation(),
@@ -3773,6 +4044,7 @@ def build_ml_diagnostics(
     score_bucket_monotonicity = build_score_bucket_monotonicity(score_panel)
     score_inversion = build_score_inversion_diagnostics(score_panel)
     regime_score_direction = build_regime_score_direction_summary(score_panel, baseline_panel=baseline_panel)
+    ml_reliability_by_regime = build_ml_reliability_by_regime(score_panel, baseline_panel=baseline_panel)
     opportunity_risk_joint_validation = build_opportunity_risk_joint_validation(score_panel)
     target_comparison = (
         build_ml_target_comparison(
@@ -3811,6 +4083,7 @@ def build_ml_diagnostics(
         score_bucket_monotonicity,
         score_inversion,
         regime_score_direction,
+        ml_reliability_by_regime,
         risk_calibration_quality,
         target_comparison,
         opportunity_risk_joint_validation,
