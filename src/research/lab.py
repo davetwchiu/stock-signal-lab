@@ -246,6 +246,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "ml_baseline_comparison": diagnostics.baseline_comparison,
         "ml_probability_direction_check": diagnostics.probability_direction_check,
         "ml_score_direction_diagnostics": diagnostics.score_direction_summary,
+        "ml_reliability_by_regime": diagnostics.ml_reliability_by_regime,
         "drawdown_risk_calibration": diagnostics.drawdown_risk_calibration,
         "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
         "model_selection_summary": pd.concat(

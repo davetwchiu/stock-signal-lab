@@ -126,7 +126,13 @@ def test_codex_handoff_contains_required_sections(tmp_path: Path) -> None:
                     "calibration_quality": ["Weak", "Good"],
                     "candidate_rank": [2, 1],
                 }
-            )
+            ),
+            "ml_reliability_by_regime": pd.DataFrame(
+                {
+                    "regime": ["Uptrend", "Downtrend"],
+                    "classification": ["mixed", "inverted"],
+                }
+            ),
         },
         output_root=tmp_path,
         run_id="run",
@@ -136,6 +142,11 @@ def test_codex_handoff_contains_required_sections(tmp_path: Path) -> None:
     assert "## Run metadata" in handoff
     assert "## Main evidence" in handoff
     assert "## Production target status" in handoff
+    assert "## ML reliability by regime" in handoff
+    assert (
+        "This table shows where ML score historically worked, failed, or lacked enough evidence."
+        in handoff
+    )
     assert "## Suggested next engineering direction" in handoff
     assert "## How Codex should use this bundle" in handoff
     assert "no production target switch is supported" in handoff
