@@ -265,12 +265,57 @@ EARNINGS_PEAD_SUMMARY_COLUMNS = [
     "reason",
 ]
 
+MOMENTUM_QUALITY_DIAGNOSTIC_COLUMNS = [
+    "ticker",
+    "sample_count",
+    "momentum_quality_bucket",
+    "positive_rate",
+    "avg_forward_excess_return",
+    "drawdown_rate",
+    "avg_ml_score",
+    "high_ml_sample_count",
+    "high_ml_positive_rate",
+    "high_ml_avg_forward_excess_return",
+    "high_ml_drawdown_rate",
+    "bucket_spread",
+    "classification",
+    "reason",
+]
+
+MOMENTUM_QUALITY_BY_REGIME_COLUMNS = [
+    "regime",
+    "momentum_quality_bucket",
+    "sample_count",
+    "positive_rate",
+    "avg_forward_excess_return",
+    "drawdown_rate",
+    "avg_ml_score",
+    "classification",
+    "reason",
+]
+
+MOMENTUM_QUALITY_FEATURE_SUMMARY_COLUMNS = [
+    "feature",
+    "valid_sample_count",
+    "missing_rate",
+    "low_quality_mean",
+    "high_quality_mean",
+    "interpretation",
+]
+
 PEAD_MIN_USABLE_EVENTS = 3
 PEAD_MIN_WINDOW_SAMPLES = 12
 PEAD_RETURN_TOLERANCE = 0.002
 PEAD_DRAWDOWN_TOLERANCE = 0.05
 PEAD_HIGH_ML_SCORE = 70.0
 PEAD_LOW_ML_SCORE = 40.0
+MOMENTUM_QUALITY_MIN_SAMPLES = 20
+MOMENTUM_QUALITY_MIN_BUCKET_SAMPLES = 5
+MOMENTUM_QUALITY_HIGH_ML_SCORE = 70.0
+MOMENTUM_QUALITY_RETURN_TOLERANCE = 0.0025
+MOMENTUM_QUALITY_POSITIVE_RATE_TOLERANCE = 0.03
+MOMENTUM_QUALITY_DRAWDOWN_TOLERANCE = 0.05
+MOMENTUM_QUALITY_CONCENTRATION_LIMIT = 0.70
 
 LABEL_PREVALENCE_COLUMNS = [
     "label",
@@ -497,6 +542,9 @@ class MLDiagnostics:
     earnings_event_diagnostics: pd.DataFrame
     ml_score_by_earnings_window: pd.DataFrame
     earnings_pead_summary: pd.DataFrame
+    momentum_quality_diagnostics: pd.DataFrame
+    momentum_quality_by_regime: pd.DataFrame
+    momentum_quality_feature_summary: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -606,6 +654,18 @@ def _empty_ml_reliability_gate_diagnostics() -> pd.DataFrame:
 
 def _empty_ml_reliability_gate_by_regime() -> pd.DataFrame:
     return pd.DataFrame(columns=ML_RELIABILITY_GATE_BY_REGIME_COLUMNS)
+
+
+def _empty_momentum_quality_diagnostics() -> pd.DataFrame:
+    return pd.DataFrame(columns=MOMENTUM_QUALITY_DIAGNOSTIC_COLUMNS)
+
+
+def _empty_momentum_quality_by_regime() -> pd.DataFrame:
+    return pd.DataFrame(columns=MOMENTUM_QUALITY_BY_REGIME_COLUMNS)
+
+
+def _empty_momentum_quality_feature_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=MOMENTUM_QUALITY_FEATURE_SUMMARY_COLUMNS)
 
 
 def _empty_score_direction_summary() -> pd.DataFrame:
@@ -3285,6 +3345,481 @@ def build_ml_reliability_gate_by_regime(
     return pd.DataFrame(rows, columns=ML_RELIABILITY_GATE_BY_REGIME_COLUMNS)
 
 
+def _merge_baseline_columns(
+    score_panel: pd.DataFrame,
+    baseline_panel: pd.DataFrame | None,
+    columns: list[str],
+) -> pd.DataFrame:
+    data = score_panel.copy()
+    missing_columns = [column for column in columns if column not in data]
+    if not missing_columns:
+        return data
+    if baseline_panel is None or baseline_panel.empty:
+        return data
+    if "Date" not in data or "Ticker" not in data:
+        return data
+    if "Date" not in baseline_panel or "Ticker" not in baseline_panel:
+        return data
+
+    available_columns = [column for column in missing_columns if column in baseline_panel]
+    if not available_columns:
+        return data
+
+    right = baseline_panel[["Date", "Ticker", *available_columns]].copy()
+    data["Date"] = pd.to_datetime(data["Date"])
+    right["Date"] = pd.to_datetime(right["Date"])
+    right = right.drop_duplicates(subset=["Date", "Ticker"], keep="last")
+    return data.merge(right, on=["Date", "Ticker"], how="left")
+
+
+def _run_length_true(values: pd.Series) -> pd.Series:
+    output: list[int] = []
+    count = 0
+    for value in values.fillna(False).astype(bool):
+        count = count + 1 if value else 0
+        output.append(count)
+    return pd.Series(output, index=values.index, dtype="float64")
+
+
+def _trailing_compound_return(values: pd.Series, window: int) -> pd.Series:
+    return (1.0 + values).rolling(window=window, min_periods=window).apply(lambda data: float(data.prod() - 1.0), raw=True)
+
+
+def _momentum_quality_features(data: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    required = {"Date", "Ticker", "Adj Close"}
+    if data.empty or required.difference(data.columns):
+        return pd.DataFrame(), ["Date", "Ticker", "Adj Close"]
+
+    output = data.copy()
+    output["Date"] = pd.to_datetime(output["Date"])
+    output = output.sort_values(["Ticker", "Date"]).copy()
+    created: set[str] = set()
+
+    for _, group in output.groupby("Ticker", sort=False):
+        index = group.index
+        price = pd.to_numeric(group["Adj Close"], errors="coerce")
+        daily_return = (
+            pd.to_numeric(group["daily_return"], errors="coerce")
+            if "daily_return" in group
+            else price.pct_change()
+        )
+
+        output.loc[index, "momentum_20d"] = (
+            pd.to_numeric(group["return_20d"], errors="coerce")
+            if "return_20d" in group
+            else price / price.shift(20) - 1.0
+        )
+        output.loc[index, "momentum_60d"] = (
+            pd.to_numeric(group["return_60d"], errors="coerce")
+            if "return_60d" in group
+            else price / price.shift(60) - 1.0
+        )
+        created.update({"momentum_20d", "momentum_60d"})
+
+        positive_return = daily_return.clip(lower=0.0).rolling(60, min_periods=60).sum()
+        absolute_return = daily_return.abs().rolling(60, min_periods=60).sum()
+        output.loc[index, "momentum_consistency_60d"] = positive_return / absolute_return.replace(0.0, pd.NA)
+        output.loc[index, "up_day_participation_60d"] = daily_return.gt(0.0).rolling(60, min_periods=60).mean()
+        output.loc[index, "max_single_day_contribution_60d"] = (
+            daily_return.abs().rolling(60, min_periods=60).max() / absolute_return.replace(0.0, pd.NA)
+        )
+        daily_volatility = daily_return.rolling(60, min_periods=60).std()
+        output.loc[index, "momentum_volatility_penalty_60d"] = (
+            output.loc[index, "momentum_60d"] - daily_volatility * (60 ** 0.5)
+        )
+        output.loc[index, "distance_from_52w_high"] = price / price.rolling(252, min_periods=60).max() - 1.0
+        created.update(
+            {
+                "momentum_consistency_60d",
+                "up_day_participation_60d",
+                "max_single_day_contribution_60d",
+                "momentum_volatility_penalty_60d",
+                "distance_from_52w_high",
+            }
+        )
+
+        ma50 = pd.to_numeric(group["ma_50d"], errors="coerce") if "ma_50d" in group else price.rolling(50, min_periods=50).mean()
+        output.loc[index, "trend_age_above_ma50"] = _run_length_true(price > ma50)
+        created.add("trend_age_above_ma50")
+
+        if {"Open", "Close"}.issubset(group.columns):
+            open_price = pd.to_numeric(group["Open"], errors="coerce")
+            close_price = pd.to_numeric(group["Close"], errors="coerce")
+            intraday_return = close_price / open_price - 1.0
+            output.loc[index, "gap_adjusted_momentum_60d"] = _trailing_compound_return(intraday_return, 60)
+            created.add("gap_adjusted_momentum_60d")
+
+        if "High" in group:
+            high = pd.to_numeric(group["High"], errors="coerce")
+            prior_20d_high = price.shift(1).rolling(20, min_periods=20).max()
+            failed_breakout = high.gt(prior_20d_high) & price.lt(prior_20d_high)
+            output.loc[index, "failed_breakout_count_60d"] = failed_breakout.rolling(60, min_periods=20).sum()
+            created.add("failed_breakout_count_60d")
+
+    feature_columns = [
+        column
+        for column in (
+            "momentum_20d",
+            "momentum_60d",
+            "momentum_consistency_60d",
+            "up_day_participation_60d",
+            "gap_adjusted_momentum_60d",
+            "max_single_day_contribution_60d",
+            "momentum_volatility_penalty_60d",
+            "distance_from_52w_high",
+            "trend_age_above_ma50",
+            "failed_breakout_count_60d",
+        )
+        if column in created
+    ]
+    return output, feature_columns
+
+
+def _assign_momentum_quality_bucket(data: pd.DataFrame, feature_columns: list[str]) -> pd.Series:
+    if "momentum_60d" not in feature_columns:
+        return pd.Series(pd.NA, index=data.index)
+
+    score = pd.Series(0.0, index=data.index)
+    momentum = pd.to_numeric(data["momentum_60d"], errors="coerce")
+    score += momentum.gt(0.0).astype(float)
+
+    thresholds = {
+        "momentum_consistency_60d": data.get("momentum_consistency_60d", pd.Series(index=data.index, dtype=float)).ge(0.55),
+        "up_day_participation_60d": data.get("up_day_participation_60d", pd.Series(index=data.index, dtype=float)).ge(0.50),
+        "gap_adjusted_momentum_60d": data.get("gap_adjusted_momentum_60d", pd.Series(index=data.index, dtype=float)).ge(0.0),
+        "max_single_day_contribution_60d": data.get("max_single_day_contribution_60d", pd.Series(index=data.index, dtype=float)).le(0.35),
+        "momentum_volatility_penalty_60d": data.get("momentum_volatility_penalty_60d", pd.Series(index=data.index, dtype=float)).gt(0.0),
+        "distance_from_52w_high": data.get("distance_from_52w_high", pd.Series(index=data.index, dtype=float)).ge(-0.15),
+        "trend_age_above_ma50": data.get("trend_age_above_ma50", pd.Series(index=data.index, dtype=float)).ge(20.0),
+        "failed_breakout_count_60d": data.get("failed_breakout_count_60d", pd.Series(index=data.index, dtype=float)).le(2.0),
+    }
+    for column, passed in thresholds.items():
+        if column in feature_columns:
+            score += passed.fillna(False).astype(float)
+
+    available_checks = 1 + sum(column in feature_columns for column in thresholds)
+    high_cutoff = max(4.0, available_checks * 0.65)
+    low_cutoff = max(2.0, available_checks * 0.35)
+    bucket = pd.Series("Medium", index=data.index, dtype="object")
+    bucket[(momentum <= 0.0) | (score <= low_cutoff)] = "Low"
+    bucket[(momentum > 0.0) & (score >= high_cutoff)] = "High"
+    bucket[momentum.isna()] = pd.NA
+    return bucket
+
+
+def _momentum_bucket_summary(
+    data: pd.DataFrame,
+    *,
+    ticker: str,
+    bucket: str,
+    bucket_spread: object,
+    classification: str,
+    reason: str,
+) -> dict[str, object]:
+    high_ml = (
+        data[pd.to_numeric(data["ML Score"], errors="coerce") >= MOMENTUM_QUALITY_HIGH_ML_SCORE]
+        if "ML Score" in data
+        else pd.DataFrame()
+    )
+    return {
+        "ticker": ticker,
+        "sample_count": int(len(data)),
+        "momentum_quality_bucket": bucket,
+        "positive_rate": _mean_metric(data, "actual_out"),
+        "avg_forward_excess_return": _mean_metric(data, "forward_excess_return"),
+        "drawdown_rate": _mean_metric(data, "actual_risk"),
+        "avg_ml_score": _mean_metric(data, "ML Score"),
+        "high_ml_sample_count": int(len(high_ml)),
+        "high_ml_positive_rate": _mean_metric(high_ml, "actual_out"),
+        "high_ml_avg_forward_excess_return": _mean_metric(high_ml, "forward_excess_return"),
+        "high_ml_drawdown_rate": _mean_metric(high_ml, "actual_risk"),
+        "bucket_spread": bucket_spread,
+        "classification": classification,
+        "reason": reason,
+    }
+
+
+def _momentum_entity_support_counts(
+    data: pd.DataFrame,
+    entity_column: str,
+    *,
+    min_bucket_size: int,
+) -> tuple[int, int, int]:
+    if entity_column not in data:
+        return 0, 0, 0
+
+    comparable = 0
+    supportive = 0
+    harmful = 0
+    for _, group in data.groupby(entity_column, sort=True):
+        high = group[group["momentum_quality_bucket"] == "High"]
+        low = group[group["momentum_quality_bucket"] == "Low"]
+        if len(high) < min_bucket_size or len(low) < min_bucket_size:
+            continue
+        comparable += 1
+        high_return = _mean_metric(high, "forward_excess_return")
+        low_return = _mean_metric(low, "forward_excess_return")
+        high_positive = _mean_metric(high, "actual_out")
+        low_positive = _mean_metric(low, "actual_out")
+        high_drawdown = _mean_metric(high, "actual_risk")
+        low_drawdown = _mean_metric(low, "actual_risk")
+        spread = high_return - low_return if pd.notna(high_return) and pd.notna(low_return) else pd.NA
+        return_support = pd.notna(spread) and float(spread) > MOMENTUM_QUALITY_RETURN_TOLERANCE
+        positive_support = (
+            pd.notna(high_positive)
+            and pd.notna(low_positive)
+            and float(high_positive) > float(low_positive) + MOMENTUM_QUALITY_POSITIVE_RATE_TOLERANCE
+            and pd.notna(high_return)
+            and float(high_return) >= -MOMENTUM_QUALITY_RETURN_TOLERANCE
+        )
+        drawdown_worse = (
+            pd.notna(high_drawdown)
+            and pd.notna(low_drawdown)
+            and float(high_drawdown) > float(low_drawdown) + MOMENTUM_QUALITY_DRAWDOWN_TOLERANCE
+        )
+        if return_support or positive_support:
+            supportive += 1
+        if (pd.notna(spread) and float(spread) < -MOMENTUM_QUALITY_RETURN_TOLERANCE) or (
+            drawdown_worse and not (return_support or positive_support)
+        ):
+            harmful += 1
+    return comparable, supportive, harmful
+
+
+def _momentum_quality_classification(
+    data: pd.DataFrame,
+    *,
+    min_samples: int = MOMENTUM_QUALITY_MIN_SAMPLES,
+    min_bucket_size: int = MOMENTUM_QUALITY_MIN_BUCKET_SAMPLES,
+) -> tuple[object, str, str]:
+    high = data[data["momentum_quality_bucket"] == "High"]
+    low = data[data["momentum_quality_bucket"] == "Low"]
+    if len(data) < min_samples or len(high) < min_bucket_size or len(low) < min_bucket_size:
+        return pd.NA, "insufficient_sample", "High and low momentum-quality buckets need more samples."
+
+    high_return = _mean_metric(high, "forward_excess_return")
+    low_return = _mean_metric(low, "forward_excess_return")
+    high_positive = _mean_metric(high, "actual_out")
+    low_positive = _mean_metric(low, "actual_out")
+    high_drawdown = _mean_metric(high, "actual_risk")
+    low_drawdown = _mean_metric(low, "actual_risk")
+    spread = high_return - low_return if pd.notna(high_return) and pd.notna(low_return) else pd.NA
+
+    concentration = 0.0
+    regime_concentration = 0.0
+    if "Ticker" in high and not high.empty:
+        concentration = float(high["Ticker"].astype(str).value_counts(normalize=True).iloc[0])
+    regime_column = _first_available_regime_column(high, DEFAULT_REGIME_COLUMNS)
+    if regime_column is not None and not high.empty:
+        regime_concentration = float(high[regime_column].astype(str).value_counts(normalize=True).iloc[0])
+    ticker_comparable, ticker_supportive, ticker_harmful = _momentum_entity_support_counts(
+        data,
+        "Ticker",
+        min_bucket_size=min_bucket_size,
+    )
+    regime_comparable, regime_supportive, regime_harmful = (
+        _momentum_entity_support_counts(data, regime_column, min_bucket_size=min_bucket_size)
+        if regime_column is not None
+        else (0, 0, 0)
+    )
+
+    return_support = pd.notna(spread) and float(spread) > MOMENTUM_QUALITY_RETURN_TOLERANCE
+    positive_support = (
+        pd.notna(high_positive)
+        and pd.notna(low_positive)
+        and float(high_positive) > float(low_positive) + MOMENTUM_QUALITY_POSITIVE_RATE_TOLERANCE
+    )
+    high_return_not_negative = pd.notna(high_return) and float(high_return) >= -MOMENTUM_QUALITY_RETURN_TOLERANCE
+    drawdown_worse = (
+        pd.notna(high_drawdown)
+        and pd.notna(low_drawdown)
+        and float(high_drawdown) > float(low_drawdown) + MOMENTUM_QUALITY_DRAWDOWN_TOLERANCE
+    )
+    concentrated = concentration > MOMENTUM_QUALITY_CONCENTRATION_LIMIT or regime_concentration > MOMENTUM_QUALITY_CONCENTRATION_LIMIT
+    ticker_conflict = ticker_comparable >= 2 and (ticker_supportive == 0 or ticker_harmful >= ticker_supportive)
+    regime_conflict = regime_comparable >= 2 and (regime_supportive == 0 or regime_harmful >= regime_supportive)
+
+    if drawdown_worse and not (return_support or positive_support):
+        return spread, "harmful", "High-quality momentum did not improve returns and had materially worse drawdown."
+    if pd.notna(spread) and float(spread) < -MOMENTUM_QUALITY_RETURN_TOLERANCE:
+        return spread, "harmful", "High-quality momentum had weaker forward excess returns than low quality."
+    if (return_support or positive_support) and (ticker_conflict or regime_conflict):
+        return spread, "mixed", "Aggregate momentum-quality evidence improved, but ticker or regime evidence was inconsistent."
+    if (return_support or (positive_support and high_return_not_negative)) and not drawdown_worse and not concentrated:
+        return spread, "useful", "High-quality momentum improved return or hit-rate evidence without materially worse drawdown."
+    if (return_support or positive_support) and concentrated:
+        return spread, "mixed", "Momentum-quality evidence improved, but high-quality samples were concentrated."
+    return spread, "mixed", "Momentum-quality evidence was not clearly better than raw low-quality momentum."
+
+
+def build_momentum_quality_diagnostics(
+    score_panel: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    min_samples: int = MOMENTUM_QUALITY_MIN_SAMPLES,
+    min_bucket_size: int = MOMENTUM_QUALITY_MIN_BUCKET_SAMPLES,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build research-only diagnostics for whether momentum quality explains outcomes."""
+
+    if score_panel.empty:
+        unavailable = _momentum_bucket_summary(
+            pd.DataFrame(),
+            ticker="ALL",
+            bucket="Unavailable",
+            bucket_spread=pd.NA,
+            classification="unavailable",
+            reason="No ML score panel was available for momentum-quality diagnostics.",
+        )
+        return pd.DataFrame([unavailable], columns=MOMENTUM_QUALITY_DIAGNOSTIC_COLUMNS), _empty_momentum_quality_by_regime(), _empty_momentum_quality_feature_summary()
+
+    required_score_columns = ["Date", "Ticker", "ML Score", "actual_out", "forward_excess_return", "actual_risk"]
+    missing_score_columns = [column for column in required_score_columns if column not in score_panel]
+    if missing_score_columns:
+        unavailable = _momentum_bucket_summary(
+            pd.DataFrame(),
+            ticker="ALL",
+            bucket="Unavailable",
+            bucket_spread=pd.NA,
+            classification="unavailable",
+            reason="Required momentum-quality outcome columns are missing: " + ", ".join(missing_score_columns) + ".",
+        )
+        return pd.DataFrame([unavailable], columns=MOMENTUM_QUALITY_DIAGNOSTIC_COLUMNS), _empty_momentum_quality_by_regime(), _empty_momentum_quality_feature_summary()
+
+    baseline_columns = [
+        "Adj Close",
+        "Open",
+        "High",
+        "Close",
+        "daily_return",
+        "return_20d",
+        "return_60d",
+        "ma_50d",
+        *DEFAULT_REGIME_COLUMNS,
+    ]
+    data = _merge_baseline_columns(score_panel, baseline_panel, baseline_columns)
+    enriched, feature_columns = _momentum_quality_features(data)
+    if enriched.empty or "momentum_60d" not in feature_columns:
+        unavailable = _momentum_bucket_summary(
+            pd.DataFrame(),
+            ticker="ALL",
+            bucket="Unavailable",
+            bucket_spread=pd.NA,
+            classification="unavailable",
+            reason="Required OHLCV columns for momentum-quality diagnostics were unavailable.",
+        )
+        return pd.DataFrame([unavailable], columns=MOMENTUM_QUALITY_DIAGNOSTIC_COLUMNS), _empty_momentum_quality_by_regime(), _empty_momentum_quality_feature_summary()
+
+    enriched["momentum_quality_bucket"] = _assign_momentum_quality_bucket(enriched, feature_columns)
+    usable = enriched.dropna(subset=["momentum_quality_bucket", "ML Score", "actual_out", "forward_excess_return", "actual_risk"]).copy()
+    if usable.empty:
+        unavailable = _momentum_bucket_summary(
+            pd.DataFrame(),
+            ticker="ALL",
+            bucket="Unavailable",
+            bucket_spread=pd.NA,
+            classification="unavailable",
+            reason="No complete momentum-quality diagnostic samples were available.",
+        )
+        return pd.DataFrame([unavailable], columns=MOMENTUM_QUALITY_DIAGNOSTIC_COLUMNS), _empty_momentum_quality_by_regime(), _empty_momentum_quality_feature_summary()
+
+    overall_spread, overall_classification, overall_reason = _momentum_quality_classification(
+        usable,
+        min_samples=min_samples,
+        min_bucket_size=min_bucket_size,
+    )
+    rows: list[dict[str, object]] = []
+    for bucket in ("Low", "Medium", "High"):
+        group = usable[usable["momentum_quality_bucket"] == bucket]
+        if group.empty:
+            continue
+        rows.append(
+            _momentum_bucket_summary(
+                group,
+                ticker="ALL",
+                bucket=bucket,
+                bucket_spread=overall_spread,
+                classification=overall_classification,
+                reason=overall_reason,
+            )
+        )
+
+    for ticker, ticker_data in usable.groupby("Ticker", sort=True):
+        ticker_spread, ticker_classification, ticker_reason = _momentum_quality_classification(
+            ticker_data,
+            min_samples=min_samples,
+            min_bucket_size=min_bucket_size,
+        )
+        for bucket in ("Low", "Medium", "High"):
+            group = ticker_data[ticker_data["momentum_quality_bucket"] == bucket]
+            if group.empty:
+                continue
+            rows.append(
+                _momentum_bucket_summary(
+                    group,
+                    ticker=str(ticker),
+                    bucket=bucket,
+                    bucket_spread=ticker_spread,
+                    classification=ticker_classification,
+                    reason=ticker_reason,
+                )
+            )
+
+    regime_rows: list[dict[str, object]] = []
+    regime_column = _first_available_regime_column(usable, DEFAULT_REGIME_COLUMNS)
+    if regime_column is not None:
+        for (regime, bucket), group in usable.groupby([regime_column, "momentum_quality_bucket"], sort=True):
+            if len(group) < min_bucket_size:
+                classification = "insufficient_sample"
+                reason = "Regime momentum-quality bucket is too small for stable interpretation."
+            elif pd.notna(_mean_metric(group, "forward_excess_return")) and float(
+                _mean_metric(group, "forward_excess_return")
+            ) < -MOMENTUM_QUALITY_RETURN_TOLERANCE:
+                classification = "harmful"
+                reason = "Regime bucket had negative realised forward excess return."
+            else:
+                classification = overall_classification if len(group) >= min_bucket_size else "insufficient_sample"
+                reason = overall_reason
+            regime_rows.append(
+                {
+                    "regime": str(regime),
+                    "momentum_quality_bucket": str(bucket),
+                    "sample_count": int(len(group)),
+                    "positive_rate": _mean_metric(group, "actual_out"),
+                    "avg_forward_excess_return": _mean_metric(group, "forward_excess_return"),
+                    "drawdown_rate": _mean_metric(group, "actual_risk"),
+                    "avg_ml_score": _mean_metric(group, "ML Score"),
+                    "classification": classification,
+                    "reason": reason,
+                }
+            )
+
+    feature_rows: list[dict[str, object]] = []
+    low = usable[usable["momentum_quality_bucket"] == "Low"]
+    high = usable[usable["momentum_quality_bucket"] == "High"]
+    for feature in feature_columns:
+        values = pd.to_numeric(usable[feature], errors="coerce")
+        feature_rows.append(
+            {
+                "feature": feature,
+                "valid_sample_count": int(values.notna().sum()),
+                "missing_rate": float(values.isna().mean()) if len(values) else pd.NA,
+                "low_quality_mean": _mean_metric(low, feature),
+                "high_quality_mean": _mean_metric(high, feature),
+                "interpretation": "Used in the research-only momentum quality bucket." if values.notna().any() else "Unavailable for this sample.",
+            }
+        )
+
+    return (
+        pd.DataFrame(rows, columns=MOMENTUM_QUALITY_DIAGNOSTIC_COLUMNS),
+        pd.DataFrame(regime_rows, columns=MOMENTUM_QUALITY_BY_REGIME_COLUMNS)
+        if regime_rows
+        else _empty_momentum_quality_by_regime(),
+        pd.DataFrame(feature_rows, columns=MOMENTUM_QUALITY_FEATURE_SUMMARY_COLUMNS)
+        if feature_rows
+        else _empty_momentum_quality_feature_summary(),
+    )
+
+
 def _numeric_column(data: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(data[column], errors="coerce")
 
@@ -5082,6 +5617,9 @@ def build_ml_diagnostics(
             unavailable_earnings[0],
             unavailable_earnings[1],
             unavailable_earnings[2],
+            _empty_momentum_quality_diagnostics(),
+            _empty_momentum_quality_by_regime(),
+            _empty_momentum_quality_feature_summary(),
         )
 
     keys = prediction_merge_keys(out, risk)
@@ -5115,6 +5653,9 @@ def build_ml_diagnostics(
         baseline_panel=baseline_panel,
         gate_diagnostics=ml_reliability_gate_diagnostics,
         ml_reliability_by_regime=ml_reliability_by_regime,
+    )
+    momentum_quality_diagnostics, momentum_quality_by_regime, momentum_quality_feature_summary = (
+        build_momentum_quality_diagnostics(score_panel, baseline_panel=baseline_panel)
     )
     opportunity_risk_joint_validation = build_opportunity_risk_joint_validation(score_panel)
     target_comparison = (
@@ -5165,4 +5706,7 @@ def build_ml_diagnostics(
         earnings_event_diagnostics,
         ml_score_by_earnings_window,
         earnings_pead_summary,
+        momentum_quality_diagnostics,
+        momentum_quality_by_regime,
+        momentum_quality_feature_summary,
     )
