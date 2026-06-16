@@ -168,3 +168,6 @@ def test_codex_iteration_protocol_text_includes_required_stop_rules() -> None:
     assert "No `ml_score()` change unless explicitly instructed" in text
     assert "No generated research run outputs committed" in text
     assert "Compare baseline vs candidate export" in text
+    assert "Fast smoke universe: `NVDA,MSFT,AAPL,QQQ,TSM,PLTR`" in text
+    assert "Balanced research universe: `NVDA,MSFT,AAPL,TSM,AVGO,PLTR,TSLA,QQQ,SMH,XLK`" in text
+    assert "Full default universe: run only once near final consolidation" in text
