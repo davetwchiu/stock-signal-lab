@@ -133,6 +133,12 @@ def test_codex_handoff_contains_required_sections(tmp_path: Path) -> None:
                     "classification": ["mixed", "inverted"],
                 }
             ),
+            "ml_reliability_gate_diagnostics": pd.DataFrame(
+                {
+                    "gate_name": ["no_gate_baseline", "exclude_inverted_regimes"],
+                    "classification": ["mixed", "harmful"],
+                }
+            ),
         },
         output_root=tmp_path,
         run_id="run",
@@ -147,6 +153,8 @@ def test_codex_handoff_contains_required_sections(tmp_path: Path) -> None:
         "This table shows where ML score historically worked, failed, or lacked enough evidence."
         in handoff
     )
+    assert "## ML reliability gate diagnostics" in handoff
+    assert "Research-only reliability gates were tested without changing production scoring." in handoff
     assert "## Suggested next engineering direction" in handoff
     assert "## How Codex should use this bundle" in handoff
     assert "no production target switch is supported" in handoff

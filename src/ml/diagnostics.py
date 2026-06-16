@@ -61,6 +61,43 @@ ML_RELIABILITY_BY_REGIME_COLUMNS = [
     "reason",
 ]
 
+ML_RELIABILITY_GATE_COLUMNS = [
+    "gate_name",
+    "gate_description",
+    "sample_count",
+    "pass_count",
+    "fail_count",
+    "retention_rate",
+    "pass_positive_rate",
+    "fail_positive_rate",
+    "pass_avg_forward_excess_return",
+    "fail_avg_forward_excess_return",
+    "pass_drawdown_rate",
+    "fail_drawdown_rate",
+    "pass_bucket_spread",
+    "fail_bucket_spread",
+    "pass_brier",
+    "fail_brier",
+    "improvement_flag",
+    "overfit_warning_flag",
+    "insufficient_sample_flag",
+    "classification",
+    "reason",
+]
+
+ML_RELIABILITY_GATE_BY_REGIME_COLUMNS = [
+    "gate_name",
+    "regime",
+    "sample_count",
+    "pass_count",
+    "retention_rate",
+    "pass_positive_rate",
+    "pass_avg_forward_excess_return",
+    "pass_drawdown_rate",
+    "classification",
+    "reason",
+]
+
 SCORE_DIRECTION_SUMMARY_COLUMNS = [
     "sample_size",
     "score_column",
@@ -249,6 +286,9 @@ RELIABILITY_WEAK_AUC = 0.52
 RELIABILITY_WEAK_PR_MARGIN = 0.02
 RELIABILITY_DRAWDOWN_BRIER_LIMIT = 0.25
 RELIABILITY_DRAWDOWN_GAP_LIMIT = 0.15
+RELIABILITY_GATE_RISK_LIMIT = 0.70
+RELIABILITY_GATE_MIN_RETENTION = 0.15
+RELIABILITY_GATE_DRAWDOWN_TOLERANCE = 0.05
 MIN_SCORE_DIRECTION_BUCKET_COUNT = 5
 MIN_SCORE_DIRECTION_SAMPLE_COUNT = 20
 MIN_JOINT_VALIDATION_CELL_COUNT = 5
@@ -396,6 +436,8 @@ class MLDiagnostics:
     score_inversion: pd.DataFrame
     regime_score_direction: pd.DataFrame
     ml_reliability_by_regime: pd.DataFrame
+    ml_reliability_gate_diagnostics: pd.DataFrame
+    ml_reliability_gate_by_regime: pd.DataFrame
     drawdown_risk_calibration_quality: pd.DataFrame
     target_comparison: pd.DataFrame
     opportunity_risk_joint_validation: pd.DataFrame
@@ -502,6 +544,14 @@ def _empty_regime_segmented_diagnostics() -> pd.DataFrame:
 
 def _empty_ml_reliability_by_regime() -> pd.DataFrame:
     return pd.DataFrame(columns=ML_RELIABILITY_BY_REGIME_COLUMNS)
+
+
+def _empty_ml_reliability_gate_diagnostics() -> pd.DataFrame:
+    return pd.DataFrame(columns=ML_RELIABILITY_GATE_COLUMNS)
+
+
+def _empty_ml_reliability_gate_by_regime() -> pd.DataFrame:
+    return pd.DataFrame(columns=ML_RELIABILITY_GATE_BY_REGIME_COLUMNS)
 
 
 def _empty_score_direction_summary() -> pd.DataFrame:
@@ -2676,6 +2726,499 @@ def build_ml_reliability_by_regime(
     return pd.DataFrame(rows, columns=ML_RELIABILITY_BY_REGIME_COLUMNS)
 
 
+GATE_DEFINITIONS = (
+    (
+        "no_gate_baseline",
+        "All valid ML samples; research baseline with no discounting rule applied.",
+        "baseline",
+    ),
+    (
+        "exclude_inverted_regimes",
+        "Exclude regimes where ML reliability diagnostics classified score separation as inverted.",
+        "regime_classification",
+    ),
+    (
+        "exclude_inverted_and_insufficient_regimes",
+        "Exclude regimes classified as inverted or insufficient-sample by regime reliability diagnostics.",
+        "regime_classification",
+    ),
+    (
+        "require_positive_realised_bucket_spread",
+        "Pass only regimes where high ML score historically had positive realised forward-return spread.",
+        "regime_bucket_spread",
+    ),
+    (
+        "drawdown_risk_not_extreme",
+        "Pass only samples with drawdown-risk probability below a conservative 70% research cutoff.",
+        "drawdown_probability",
+    ),
+    (
+        "combined_conservative_gate",
+        "Require non-inverted regime evidence, positive realised bucket spread, and non-extreme drawdown risk.",
+        "combined",
+    ),
+)
+
+
+def _gate_unavailable_rows(reason: str) -> pd.DataFrame:
+    rows = [
+        {
+            "gate_name": gate_name,
+            "gate_description": description,
+            "sample_count": 0,
+            "pass_count": 0,
+            "fail_count": 0,
+            "retention_rate": pd.NA,
+            "pass_positive_rate": pd.NA,
+            "fail_positive_rate": pd.NA,
+            "pass_avg_forward_excess_return": pd.NA,
+            "fail_avg_forward_excess_return": pd.NA,
+            "pass_drawdown_rate": pd.NA,
+            "fail_drawdown_rate": pd.NA,
+            "pass_bucket_spread": pd.NA,
+            "fail_bucket_spread": pd.NA,
+            "pass_brier": pd.NA,
+            "fail_brier": pd.NA,
+            "improvement_flag": False,
+            "overfit_warning_flag": False,
+            "insufficient_sample_flag": False,
+            "classification": "unavailable",
+            "reason": reason,
+        }
+        for gate_name, description, _dependency in GATE_DEFINITIONS
+    ]
+    return pd.DataFrame(rows, columns=ML_RELIABILITY_GATE_COLUMNS)
+
+
+def _mean_metric(data: pd.DataFrame, column: str) -> object:
+    if data.empty or column not in data:
+        return pd.NA
+    values = pd.to_numeric(data[column], errors="coerce").dropna()
+    return pd.NA if values.empty else float(values.mean())
+
+
+def _gate_brier(data: pd.DataFrame) -> object:
+    if data.empty or {"actual_out", "probability_out"}.difference(data.columns):
+        return pd.NA
+    usable = data[["actual_out", "probability_out"]].apply(pd.to_numeric, errors="coerce").dropna()
+    if usable.empty:
+        return pd.NA
+    return float(((usable["probability_out"] - usable["actual_out"]) ** 2).mean())
+
+
+def _gate_bucket_spread(data: pd.DataFrame, min_bucket_size: int) -> object:
+    if data.empty or {"ML Score", "forward_excess_return"}.difference(data.columns):
+        return pd.NA
+    usable = data[["ML Score", "forward_excess_return"]].apply(pd.to_numeric, errors="coerce").dropna()
+    if usable.empty:
+        return pd.NA
+    bucketed = _bucket_score_data(usable, "ML Score")
+    low = bucketed[bucketed["score_bucket"] == "Low"]
+    high = bucketed[bucketed["score_bucket"] == "High"]
+    if len(low) < min_bucket_size or len(high) < min_bucket_size:
+        return pd.NA
+    return float(high["forward_excess_return"].mean() - low["forward_excess_return"].mean())
+
+
+def _is_materially_better(value: object, baseline: object, tolerance: float) -> bool:
+    return pd.notna(value) and pd.notna(baseline) and float(value) > float(baseline) + tolerance
+
+
+def _is_materially_worse(value: object, baseline: object, tolerance: float) -> bool:
+    return pd.notna(value) and pd.notna(baseline) and float(value) < float(baseline) - tolerance
+
+
+def _build_gate_metric_row(
+    data: pd.DataFrame,
+    gate_name: str,
+    gate_description: str,
+    mask: pd.Series,
+    *,
+    min_samples: int,
+    min_bucket_size: int,
+    baseline_row: dict[str, object] | None = None,
+) -> dict[str, object]:
+    sample_count = int(len(data))
+    mask = mask.reindex(data.index, fill_value=False).astype(bool)
+    passed = data[mask]
+    failed = data[~mask]
+    pass_count = int(len(passed))
+    fail_count = int(len(failed))
+    retention_rate = pass_count / sample_count if sample_count else pd.NA
+    row: dict[str, object] = {
+        "gate_name": gate_name,
+        "gate_description": gate_description,
+        "sample_count": sample_count,
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "retention_rate": retention_rate,
+        "pass_positive_rate": _mean_metric(passed, "actual_out"),
+        "fail_positive_rate": _mean_metric(failed, "actual_out"),
+        "pass_avg_forward_excess_return": _mean_metric(passed, "forward_excess_return"),
+        "fail_avg_forward_excess_return": _mean_metric(failed, "forward_excess_return"),
+        "pass_drawdown_rate": _mean_metric(passed, "actual_risk"),
+        "fail_drawdown_rate": _mean_metric(failed, "actual_risk"),
+        "pass_bucket_spread": _gate_bucket_spread(passed, min_bucket_size),
+        "fail_bucket_spread": _gate_bucket_spread(failed, min_bucket_size),
+        "pass_brier": _gate_brier(passed),
+        "fail_brier": _gate_brier(failed),
+    }
+    classification, reason, improvement, overfit_warning, insufficient = _classify_gate_row(
+        row,
+        baseline_row=baseline_row,
+        min_samples=min_samples,
+    )
+    row.update(
+        {
+            "improvement_flag": improvement,
+            "overfit_warning_flag": overfit_warning,
+            "insufficient_sample_flag": insufficient,
+            "classification": classification,
+            "reason": reason,
+        }
+    )
+    return row
+
+
+def _classify_gate_row(
+    row: dict[str, object],
+    *,
+    baseline_row: dict[str, object] | None,
+    min_samples: int,
+) -> tuple[str, str, bool, bool, bool]:
+    if row["gate_name"] == "no_gate_baseline":
+        insufficient = int(row["pass_count"]) < min_samples
+        if insufficient:
+            return "insufficient_sample", "Baseline has too few valid ML samples for gate research.", False, False, True
+        return "mixed", "Baseline row; no research-only reliability gate is applied.", False, False, False
+
+    pass_count = int(row["pass_count"])
+    fail_count = int(row["fail_count"])
+    sample_count = int(row["sample_count"])
+    insufficient = pass_count < min_samples or fail_count < min_samples
+    if insufficient:
+        return (
+            "insufficient_sample",
+            "Gate pass/fail groups are too small for a stable read.",
+            False,
+            False,
+            True,
+        )
+
+    if baseline_row is None:
+        return "unavailable", "Baseline metrics were unavailable for gate comparison.", False, False, False
+
+    retention = row["retention_rate"]
+    overfit_warning = (
+        pd.notna(retention)
+        and (float(retention) < RELIABILITY_GATE_MIN_RETENTION or pass_count < min_samples * 2)
+    )
+    pass_return = row["pass_avg_forward_excess_return"]
+    baseline_return = baseline_row["pass_avg_forward_excess_return"]
+    pass_positive = row["pass_positive_rate"]
+    baseline_positive = baseline_row["pass_positive_rate"]
+    pass_drawdown = row["pass_drawdown_rate"]
+    baseline_drawdown = baseline_row["pass_drawdown_rate"]
+    pass_spread = row["pass_bucket_spread"]
+
+    return_improves = _is_materially_better(pass_return, baseline_return, SPREAD_SIMILARITY_TOLERANCE)
+    positive_improves = _is_materially_better(pass_positive, baseline_positive, SPREAD_SIMILARITY_TOLERANCE)
+    improvement = return_improves or positive_improves
+    drawdown_worsens = (
+        pd.notna(pass_drawdown)
+        and pd.notna(baseline_drawdown)
+        and float(pass_drawdown) > float(baseline_drawdown) + RELIABILITY_GATE_DRAWDOWN_TOLERANCE
+    )
+    spread_inverted = pd.notna(pass_spread) and float(pass_spread) < -SPREAD_SIMILARITY_TOLERANCE
+    return_worse = _is_materially_worse(pass_return, baseline_return, SPREAD_SIMILARITY_TOLERANCE)
+
+    if return_worse or drawdown_worsens or spread_inverted:
+        return (
+            "harmful",
+            "Gate pass group worsened return evidence, drawdown evidence, or score-bucket spread.",
+            improvement,
+            bool(overfit_warning),
+            False,
+        )
+    if improvement and overfit_warning:
+        return (
+            "unstable",
+            "Gate improved one metric, but retention or pass count is too thin for confidence.",
+            True,
+            True,
+            False,
+        )
+    if improvement:
+        return (
+            "useful",
+            "Gate pass group improved return or positive-rate evidence without materially worse drawdown.",
+            True,
+            False,
+            False,
+        )
+    return (
+        "mixed",
+        "Gate did not clearly improve return evidence versus the no-gate baseline.",
+        False,
+        bool(overfit_warning),
+        False,
+    )
+
+
+def _reliability_lookup(ml_reliability_by_regime: pd.DataFrame) -> pd.DataFrame:
+    if ml_reliability_by_regime.empty or "regime" not in ml_reliability_by_regime:
+        return pd.DataFrame()
+    required = ["regime", "classification", "bucket_spread"]
+    available = [column for column in required if column in ml_reliability_by_regime]
+    if "classification" not in available:
+        return pd.DataFrame()
+    lookup = ml_reliability_by_regime[available].copy()
+    lookup["regime"] = lookup["regime"].astype(str).str.strip()
+    lookup = lookup[lookup["regime"] != ""].drop_duplicates(subset=["regime"], keep="first")
+    return lookup.set_index("regime")
+
+
+def build_ml_reliability_gate_diagnostics(
+    score_panel: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    ml_reliability_by_regime: pd.DataFrame | None = None,
+    regime_cols: list[str] | None = None,
+    min_samples: int = MIN_REGIME_SAMPLE_COUNT,
+    min_bucket_size: int = MIN_REGIME_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Test simple research-only reliability gates against existing ML outcomes."""
+
+    if score_panel.empty:
+        return _empty_ml_reliability_gate_diagnostics()
+
+    required = [
+        "ML Score",
+        "actual_out",
+        "probability_out",
+        "forward_excess_return",
+        "actual_risk",
+        "probability_risk",
+    ]
+    missing = [column for column in required if column not in score_panel]
+    if missing:
+        return _gate_unavailable_rows("Required gate diagnostic columns are missing: " + ", ".join(missing) + ".")
+
+    candidate_regime_cols = list(regime_cols or DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(score_panel, baseline_panel, candidate_regime_cols)
+    data = data.dropna(subset=required).copy()
+    if data.empty:
+        return _gate_unavailable_rows("No complete ML reliability gate samples were available.")
+
+    regime_column = _first_available_regime_column(data, candidate_regime_cols)
+    reliability = (
+        ml_reliability_by_regime
+        if ml_reliability_by_regime is not None
+        else build_ml_reliability_by_regime(
+            score_panel,
+            baseline_panel=baseline_panel,
+            regime_cols=candidate_regime_cols,
+            min_samples=min_samples,
+            min_bucket_size=min_bucket_size,
+        )
+    )
+    reliability_index = _reliability_lookup(reliability)
+    has_regime_reliability = regime_column is not None and not reliability_index.empty
+
+    if has_regime_reliability:
+        regimes = data[regime_column].astype(str).str.strip()
+        regime_classification = regimes.map(reliability_index["classification"])
+        regime_bucket_spread = (
+            pd.to_numeric(regimes.map(reliability_index["bucket_spread"]), errors="coerce")
+            if "bucket_spread" in reliability_index
+            else pd.Series(pd.NA, index=data.index)
+        )
+    else:
+        regime_classification = pd.Series(pd.NA, index=data.index)
+        regime_bucket_spread = pd.Series(pd.NA, index=data.index)
+
+    masks = {
+        "no_gate_baseline": pd.Series(True, index=data.index),
+        "exclude_inverted_regimes": regime_classification.notna() & regime_classification.ne("inverted"),
+        "exclude_inverted_and_insufficient_regimes": (
+            regime_classification.notna()
+            & ~regime_classification.isin(["inverted", "insufficient_sample"])
+        ),
+        "require_positive_realised_bucket_spread": regime_bucket_spread > SPREAD_SIMILARITY_TOLERANCE,
+        "drawdown_risk_not_extreme": pd.to_numeric(data["probability_risk"], errors="coerce")
+        < RELIABILITY_GATE_RISK_LIMIT,
+        "combined_conservative_gate": (
+            regime_classification.notna()
+            & ~regime_classification.isin(["inverted", "insufficient_sample"])
+            & (regime_bucket_spread > SPREAD_SIMILARITY_TOLERANCE)
+            & (
+                pd.to_numeric(data["probability_risk"], errors="coerce")
+                < RELIABILITY_GATE_RISK_LIMIT
+            )
+        ),
+    }
+
+    baseline_definition = GATE_DEFINITIONS[0]
+    baseline_row = _build_gate_metric_row(
+        data,
+        baseline_definition[0],
+        baseline_definition[1],
+        masks[baseline_definition[0]],
+        min_samples=min_samples,
+        min_bucket_size=min_bucket_size,
+    )
+
+    rows = [baseline_row]
+    for gate_name, description, dependency in GATE_DEFINITIONS[1:]:
+        if dependency in {"regime_classification", "regime_bucket_spread", "combined"} and not has_regime_reliability:
+            rows.append(
+                {
+                    **_gate_unavailable_rows("Regime reliability diagnostics were unavailable.").iloc[0].to_dict(),
+                    "gate_name": gate_name,
+                    "gate_description": description,
+                }
+            )
+            continue
+        rows.append(
+            _build_gate_metric_row(
+                data,
+                gate_name,
+                description,
+                masks[gate_name],
+                min_samples=min_samples,
+                min_bucket_size=min_bucket_size,
+                baseline_row=baseline_row,
+            )
+        )
+    return pd.DataFrame(rows, columns=ML_RELIABILITY_GATE_COLUMNS)
+
+
+def build_ml_reliability_gate_by_regime(
+    score_panel: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    gate_diagnostics: pd.DataFrame | None = None,
+    ml_reliability_by_regime: pd.DataFrame | None = None,
+    regime_cols: list[str] | None = None,
+    min_samples: int = MIN_REGIME_SAMPLE_COUNT,
+) -> pd.DataFrame:
+    """Summarize research-only reliability gate pass groups by available regime."""
+
+    required = ["ML Score", "actual_out", "forward_excess_return", "actual_risk", "probability_risk"]
+    if score_panel.empty or any(column not in score_panel for column in required):
+        return _empty_ml_reliability_gate_by_regime()
+
+    candidate_regime_cols = list(regime_cols or DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(score_panel, baseline_panel, candidate_regime_cols)
+    data = data.dropna(subset=required).copy()
+    regime_column = _first_available_regime_column(data, candidate_regime_cols)
+    if data.empty or regime_column is None:
+        return _empty_ml_reliability_gate_by_regime()
+
+    diagnostics = (
+        gate_diagnostics
+        if gate_diagnostics is not None
+        else build_ml_reliability_gate_diagnostics(
+            score_panel,
+            baseline_panel=baseline_panel,
+            ml_reliability_by_regime=ml_reliability_by_regime,
+            regime_cols=candidate_regime_cols,
+            min_samples=min_samples,
+        )
+    )
+    if diagnostics.empty:
+        return _empty_ml_reliability_gate_by_regime()
+
+    reliability_index = _reliability_lookup(
+        ml_reliability_by_regime
+        if ml_reliability_by_regime is not None
+        else build_ml_reliability_by_regime(score_panel, baseline_panel=baseline_panel, regime_cols=candidate_regime_cols)
+    )
+    regimes = data[regime_column].astype(str).str.strip()
+    regime_classification = (
+        regimes.map(reliability_index["classification"])
+        if not reliability_index.empty and "classification" in reliability_index
+        else pd.Series(pd.NA, index=data.index)
+    )
+    regime_bucket_spread = (
+        pd.to_numeric(regimes.map(reliability_index["bucket_spread"]), errors="coerce")
+        if not reliability_index.empty and "bucket_spread" in reliability_index
+        else pd.Series(pd.NA, index=data.index)
+    )
+    masks = {
+        "no_gate_baseline": pd.Series(True, index=data.index),
+        "exclude_inverted_regimes": regime_classification.notna() & regime_classification.ne("inverted"),
+        "exclude_inverted_and_insufficient_regimes": (
+            regime_classification.notna()
+            & ~regime_classification.isin(["inverted", "insufficient_sample"])
+        ),
+        "require_positive_realised_bucket_spread": regime_bucket_spread > SPREAD_SIMILARITY_TOLERANCE,
+        "drawdown_risk_not_extreme": pd.to_numeric(data["probability_risk"], errors="coerce")
+        < RELIABILITY_GATE_RISK_LIMIT,
+        "combined_conservative_gate": (
+            regime_classification.notna()
+            & ~regime_classification.isin(["inverted", "insufficient_sample"])
+            & (regime_bucket_spread > SPREAD_SIMILARITY_TOLERANCE)
+            & (
+                pd.to_numeric(data["probability_risk"], errors="coerce")
+                < RELIABILITY_GATE_RISK_LIMIT
+            )
+        ),
+    }
+
+    baseline_drawdown = _mean_metric(data, "actual_risk")
+    rows: list[dict[str, object]] = []
+    for gate_name in diagnostics["gate_name"].dropna().astype(str):
+        if gate_name not in masks:
+            continue
+        mask = masks[gate_name].reindex(data.index, fill_value=False).astype(bool)
+        for regime, group in data.groupby(regimes, sort=True):
+            if not regime:
+                continue
+            group_mask = mask.loc[group.index]
+            passed = group[group_mask]
+            sample_count = int(len(group))
+            pass_count = int(len(passed))
+            retention = pass_count / sample_count if sample_count else pd.NA
+            pass_return = _mean_metric(passed, "forward_excess_return")
+            pass_drawdown = _mean_metric(passed, "actual_risk")
+            classification = "mixed"
+            reason = "Pass group evidence is inconclusive in this regime."
+            if sample_count < min_samples or pass_count < min_samples:
+                classification = "insufficient_sample"
+                reason = "Regime pass group is too small for stable interpretation."
+            elif pd.notna(pass_return) and float(pass_return) < -SPREAD_SIMILARITY_TOLERANCE:
+                classification = "harmful"
+                reason = "Regime pass group had negative realised forward excess return."
+            elif (
+                pd.notna(pass_drawdown)
+                and pd.notna(baseline_drawdown)
+                and float(pass_drawdown) > float(baseline_drawdown) + RELIABILITY_GATE_DRAWDOWN_TOLERANCE
+            ):
+                classification = "harmful"
+                reason = "Regime pass group had materially worse drawdown incidence."
+            elif pd.notna(pass_return) and float(pass_return) > SPREAD_SIMILARITY_TOLERANCE:
+                classification = "useful"
+                reason = "Regime pass group had positive realised forward excess return."
+            rows.append(
+                {
+                    "gate_name": gate_name,
+                    "regime": regime,
+                    "sample_count": sample_count,
+                    "pass_count": pass_count,
+                    "retention_rate": retention,
+                    "pass_positive_rate": _mean_metric(passed, "actual_out"),
+                    "pass_avg_forward_excess_return": pass_return,
+                    "pass_drawdown_rate": pass_drawdown,
+                    "classification": classification,
+                    "reason": reason,
+                }
+            )
+    if not rows:
+        return _empty_ml_reliability_gate_by_regime()
+    return pd.DataFrame(rows, columns=ML_RELIABILITY_GATE_BY_REGIME_COLUMNS)
+
+
 def _numeric_column(data: pd.DataFrame, column: str) -> pd.Series:
     return pd.to_numeric(data[column], errors="coerce")
 
@@ -4022,6 +4565,8 @@ def build_ml_diagnostics(
             _empty_score_inversion_diagnostics(),
             _empty_regime_score_direction_summary(),
             _empty_ml_reliability_by_regime(),
+            _empty_ml_reliability_gate_diagnostics(),
+            _empty_ml_reliability_gate_by_regime(),
             _empty_drawdown_risk_calibration_quality(),
             _empty_target_comparison(),
             _empty_opportunity_risk_joint_validation(),
@@ -4045,6 +4590,17 @@ def build_ml_diagnostics(
     score_inversion = build_score_inversion_diagnostics(score_panel)
     regime_score_direction = build_regime_score_direction_summary(score_panel, baseline_panel=baseline_panel)
     ml_reliability_by_regime = build_ml_reliability_by_regime(score_panel, baseline_panel=baseline_panel)
+    ml_reliability_gate_diagnostics = build_ml_reliability_gate_diagnostics(
+        score_panel,
+        baseline_panel=baseline_panel,
+        ml_reliability_by_regime=ml_reliability_by_regime,
+    )
+    ml_reliability_gate_by_regime = build_ml_reliability_gate_by_regime(
+        score_panel,
+        baseline_panel=baseline_panel,
+        gate_diagnostics=ml_reliability_gate_diagnostics,
+        ml_reliability_by_regime=ml_reliability_by_regime,
+    )
     opportunity_risk_joint_validation = build_opportunity_risk_joint_validation(score_panel)
     target_comparison = (
         build_ml_target_comparison(
@@ -4084,6 +4640,8 @@ def build_ml_diagnostics(
         score_inversion,
         regime_score_direction,
         ml_reliability_by_regime,
+        ml_reliability_gate_diagnostics,
+        ml_reliability_gate_by_regime,
         risk_calibration_quality,
         target_comparison,
         opportunity_risk_joint_validation,

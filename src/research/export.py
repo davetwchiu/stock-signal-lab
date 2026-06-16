@@ -222,6 +222,7 @@ def build_codex_handoff(
     )
     diagnostics_summary = _frame(tables.get("ml_diagnostics_summary"))
     ml_reliability = _frame(tables.get("ml_reliability_by_regime"))
+    ml_reliability_gate = _frame(tables.get("ml_reliability_gate_diagnostics"))
     drawdown_quality = _frame(tables.get("drawdown_risk_calibration_quality"))
     feature_audit = _frame(tables.get("feature_audit_summary"))
     redundancy = _frame(tables.get("feature_redundancy_selection"))
@@ -257,6 +258,9 @@ def build_codex_handoff(
         "",
         "## ML reliability by regime",
         _ml_reliability_evidence(ml_reliability),
+        "",
+        "## ML reliability gate diagnostics",
+        _ml_reliability_gate_evidence(ml_reliability_gate),
         "",
         "## Feature group findings",
         _feature_group_findings(feature_group, target_quality),
@@ -439,6 +443,24 @@ def _ml_reliability_evidence(reliability: pd.DataFrame) -> str:
     return (
         "This table shows where ML score historically worked, failed, or lacked enough evidence. "
         f"Exported {len(reliability)} regime rows"
+        + (f": {count_text}." if count_text else ".")
+    )
+
+
+def _ml_reliability_gate_evidence(gate_diagnostics: pd.DataFrame) -> str:
+    if gate_diagnostics.empty:
+        return "No ML reliability gate diagnostics table was exported."
+    if "classification" not in gate_diagnostics:
+        return (
+            "Research-only reliability gate diagnostics were exported. "
+            "These do not change production scoring."
+        )
+
+    counts = gate_diagnostics["classification"].astype(str).value_counts().sort_index()
+    count_text = ", ".join(f"{classification}={count}" for classification, count in counts.items())
+    return (
+        "Research-only reliability gates were tested without changing production scoring. "
+        f"Exported {len(gate_diagnostics)} gate rows"
         + (f": {count_text}." if count_text else ".")
     )
 
