@@ -1401,7 +1401,9 @@ with research_tab:
                             st.caption(
                                 "This table checks whether earnings windows or post-earnings drift explain "
                                 "when ML score works or fails. It is research-only and does not change "
-                                "production scoring."
+                                "production scoring. To use real event data, copy "
+                                "data/research_inputs/earnings_events.example.csv to "
+                                "data/research_inputs/earnings_events.csv and fill it with verified dates."
                             )
                             if diagnostics.earnings_pead_summary.empty:
                                 st.info("No earnings / PEAD diagnostics were available for this sample.")
