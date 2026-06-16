@@ -24,6 +24,7 @@ from src.ml.diagnostics import (
 from src.ml.models import MODEL_OPTIONS
 from src.ml.target_diagnostics import (
     add_target_candidate_labels,
+    build_target_arena_comparison,
     build_target_balance_diagnostics,
     build_target_feature_group_comparison,
     build_target_quality_summary,
@@ -216,6 +217,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         target_feature_group,
         target_regime,
     )
+    target_arena = build_target_arena_comparison(target_quality)
     diagnostics = build_ml_diagnostics(
         outperformance.predictions,
         risk.predictions,
@@ -275,6 +277,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "target_regime_comparison": target_regime,
         "target_stability_summary": target_stability,
         "target_quality_summary": target_quality,
+        "target_arena_comparison": target_arena,
         "opportunity_risk_joint_validation": diagnostics.opportunity_risk_joint_validation,
     }
     metadata = {
@@ -295,6 +298,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "classification_threshold": config.classification_threshold,
         "target_candidates_enabled": True,
         "extended_target_comparison_enabled": True,
+        "target_arena_enabled": True,
         "data_start": str(start_date),
         "data_end": str(end_date),
         "quick": config.quick,

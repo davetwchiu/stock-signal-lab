@@ -121,6 +121,7 @@ TARGET_QUALITY_SUMMARY_COLUMNS = [
     "best_feature_group_auc",
     "feature_group_consistency",
     "regime_stability",
+    "regime_inversion_count",
     "worst_regime_bucket_spread",
     "calibration_quality",
     "bucket_separation_quality",
@@ -128,6 +129,33 @@ TARGET_QUALITY_SUMMARY_COLUMNS = [
     "production_candidate_status",
     "recommended_next_step",
     "interpretation",
+]
+
+TARGET_ARENA_TARGET_IDS = (
+    "outperform_20d",
+    "top_tercile_excess_20d",
+    "risk_adjusted_excess_20d",
+    "drawdown_adjusted_opportunity_20d",
+    "pullback_recovery_20d",
+)
+
+TARGET_ARENA_COLUMNS = [
+    "target_id",
+    "display_name",
+    "sample_count",
+    "label_prevalence",
+    "roc_auc",
+    "pr_auc",
+    "brier_score",
+    "bucket_spread",
+    "calibration_gap",
+    "regime_inversion_count",
+    "feature_group_stability",
+    "evidence_classification",
+    "arena_decision",
+    "rejection_reason",
+    "future_production_experiment",
+    "suggested_next_research",
 ]
 
 DEFAULT_TARGET_FEATURE_GROUPS = ("technical", "technical_fourier", "technical_wavelet", "all")
@@ -326,6 +354,7 @@ def add_target_candidate_labels(
     tail_adjusted = _numeric(output[tail_adjusted_col])
     output["label_tail_adjusted_outperform_20d"] = (tail_adjusted > outperformance_threshold).astype(float)
     output.loc[tail_adjusted.isna(), "label_tail_adjusted_outperform_20d"] = np.nan
+    output["label_drawdown_adjusted_opportunity_20d"] = output["label_tail_adjusted_outperform_20d"]
 
     drawdown = _numeric(output[drawdown_col])
     excess = _numeric(output[excess_col])
@@ -1225,6 +1254,7 @@ def build_target_quality_summary(
                 "best_feature_group_auc": best_feature_group_auc,
                 "feature_group_consistency": feature_group_consistency,
                 "regime_stability": regime_stability,
+                "regime_inversion_count": inverted_regime_count,
                 "worst_regime_bucket_spread": worst_regime_bucket_spread,
                 "calibration_quality": calibration_quality,
                 "bucket_separation_quality": bucket_quality,
@@ -1248,3 +1278,156 @@ def build_target_quality_summary(
         row["candidate_rank"] = ranks[row["target_id"]]
     rows = sorted(rows, key=lambda row: (row["candidate_rank"], str(row["target_id"])))
     return pd.DataFrame(rows, columns=TARGET_QUALITY_SUMMARY_COLUMNS)
+
+
+def _arena_numeric(row: pd.Series, column: str) -> float:
+    return _numeric_value(row.get(column))
+
+
+def _arena_evidence_classification(row: pd.Series, baseline: pd.Series) -> str:
+    quality = str(row.get("overall_target_quality", ""))
+    class_balance = str(row.get("class_balance_status", ""))
+    bucket_quality = str(row.get("bucket_separation_quality", ""))
+    calibration_quality = str(row.get("calibration_quality", ""))
+    regime_stability = str(row.get("regime_stability", ""))
+    feature_stability = str(row.get("feature_group_consistency", ""))
+    target_id = str(row.get("target_id", ""))
+    sample_count = int(_arena_numeric(row, "sample_count")) if not np.isnan(_arena_numeric(row, "sample_count")) else 0
+    if sample_count < MIN_TARGET_DIAGNOSTIC_SAMPLE_COUNT or quality == "Unusable" or class_balance == "Unusable":
+        return "insufficient"
+    if quality == "Weak" or bucket_quality == "Inverted":
+        return "weak"
+    if target_id == "outperform_20d":
+        return "mixed" if quality == "Mixed" else "promising"
+
+    spread = _arena_numeric(row, "overall_bucket_spread")
+    baseline_spread = _arena_numeric(baseline, "overall_bucket_spread")
+    brier = _arena_numeric(row, "overall_brier_score")
+    baseline_brier = _arena_numeric(baseline, "overall_brier_score")
+    calibration_gap = abs(_arena_numeric(row, "overall_calibration_gap"))
+    baseline_gap = abs(_arena_numeric(baseline, "overall_calibration_gap"))
+    baseline_inversion_value = _arena_numeric(baseline, "regime_inversion_count")
+    inversion_value = _arena_numeric(row, "regime_inversion_count")
+    baseline_inversions = int(baseline_inversion_value) if not np.isnan(baseline_inversion_value) else 0
+    inversions = int(inversion_value) if not np.isnan(inversion_value) else 0
+    spread_ok = not np.isnan(spread) and spread > 0.0
+    spread_not_worse = np.isnan(baseline_spread) or spread >= baseline_spread - 0.005
+    brier_not_worse = np.isnan(baseline_brier) or np.isnan(brier) or brier <= baseline_brier + 0.02
+    calibration_not_worse = np.isnan(baseline_gap) or np.isnan(calibration_gap) or calibration_gap <= baseline_gap + 0.03
+    regime_not_worse = inversions <= baseline_inversions
+    feature_ok = feature_stability != "Weak across feature groups"
+    if (
+        quality == "Promising"
+        and spread_ok
+        and spread_not_worse
+        and brier_not_worse
+        and calibration_not_worse
+        and regime_not_worse
+        and feature_ok
+        and calibration_quality in {"Good", "Acceptable"}
+        and regime_stability == "Stable across regimes"
+    ):
+        return "strong"
+    if (
+        spread_ok
+        and spread_not_worse
+        and brier_not_worse
+        and calibration_not_worse
+        and regime_not_worse
+        and feature_ok
+        and calibration_quality != "Poor"
+    ):
+        return "promising"
+    if quality == "Weak":
+        return "weak"
+    return "mixed"
+
+
+def _arena_rejection_reason(row: pd.Series, classification: str) -> str:
+    if classification in {"strong", "promising"}:
+        return ""
+    reasons = []
+    if str(row.get("class_balance_status", "")) in {"Skewed", "Unusable"}:
+        reasons.append(f"class balance is {str(row.get('class_balance_status')).lower()}")
+    if str(row.get("calibration_quality", "")) == "Poor":
+        reasons.append("calibration is poor")
+    if str(row.get("bucket_separation_quality", "")) in {"Weak", "Inverted"}:
+        reasons.append(f"bucket separation is {str(row.get('bucket_separation_quality')).lower()}")
+    if str(row.get("regime_stability", "")) == "Inverted in some regimes":
+        reasons.append("some regimes are inverted")
+    elif str(row.get("regime_stability", "")) == "Regime-sensitive":
+        reasons.append("evidence is regime-sensitive")
+    if str(row.get("feature_group_consistency", "")) == "Weak across feature groups":
+        reasons.append("feature-group stability is weak")
+    return "; ".join(reasons) or "evidence is not clearly better than the current production target"
+
+
+def build_target_arena_comparison(
+    target_quality: pd.DataFrame,
+    *,
+    target_ids: tuple[str, ...] = TARGET_ARENA_TARGET_IDS,
+) -> pd.DataFrame:
+    """Return the research-only Target Arena v1 table.
+
+    This is a consolidation layer over exported diagnostics. It does not select or
+    change the production target.
+    """
+
+    if target_quality.empty or "target_id" not in target_quality:
+        return pd.DataFrame(columns=TARGET_ARENA_COLUMNS)
+
+    indexed = target_quality.set_index("target_id", drop=False)
+    baseline = indexed.loc["outperform_20d"] if "outperform_20d" in indexed.index else pd.Series(dtype=object)
+    rows: list[dict[str, object]] = []
+    for target_id in target_ids:
+        source_target_id = target_id
+        if target_id == "drawdown_adjusted_opportunity_20d" and source_target_id not in indexed.index:
+            source_target_id = "tail_adjusted_outperform_20d"
+        if source_target_id not in indexed.index:
+            continue
+        row = indexed.loc[source_target_id]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        if "regime_inversion_count" not in row:
+            row = row.copy()
+            row["regime_inversion_count"] = 0
+        classification = _arena_evidence_classification(row, baseline)
+        rejection_reason = _arena_rejection_reason(row, classification)
+        future_experiment = classification in {"strong", "promising"} and target_id != "outperform_20d"
+        if classification == "strong":
+            decision = "best_candidate"
+        elif classification == "promising":
+            decision = "future_research_candidate"
+        elif target_id == "outperform_20d":
+            decision = "current_baseline"
+        else:
+            decision = "reject_for_now"
+        rows.append(
+            {
+                "target_id": target_id,
+                "display_name": (
+                    "Drawdown-adjusted opportunity"
+                    if target_id == "drawdown_adjusted_opportunity_20d"
+                    else row.get("display_name", pd.NA)
+                ),
+                "sample_count": row.get("sample_count", pd.NA),
+                "label_prevalence": row.get("positive_rate", pd.NA),
+                "roc_auc": row.get("overall_auc", pd.NA),
+                "pr_auc": row.get("overall_pr_auc", pd.NA),
+                "brier_score": row.get("overall_brier_score", pd.NA),
+                "bucket_spread": row.get("overall_bucket_spread", pd.NA),
+                "calibration_gap": row.get("overall_calibration_gap", pd.NA),
+                "regime_inversion_count": row.get("regime_inversion_count", 0),
+                "feature_group_stability": row.get("feature_group_consistency", pd.NA),
+                "evidence_classification": classification,
+                "arena_decision": decision,
+                "rejection_reason": rejection_reason,
+                "future_production_experiment": future_experiment,
+                "suggested_next_research": (
+                    "Review Fourier/Wavelet signal features and regime reliability"
+                    if classification in {"mixed", "weak"}
+                    else "Validate in a future production-target experiment before any switch"
+                ),
+            }
+        )
+    return pd.DataFrame(rows, columns=TARGET_ARENA_COLUMNS)

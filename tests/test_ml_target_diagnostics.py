@@ -9,6 +9,7 @@ from src.ml.scoring import ml_score
 from src.ml.target_diagnostics import (
     TargetCandidate,
     add_target_candidate_labels,
+    build_target_arena_comparison,
     build_target_balance_diagnostics,
     build_target_feature_group_comparison,
     build_target_quality_summary,
@@ -63,6 +64,7 @@ def test_alternative_target_labels_are_created_with_expected_columns() -> None:
         "label_risk_adjusted_excess_20d",
         "label_top_tercile_excess_20d",
         "label_tail_adjusted_outperform_20d",
+        "label_drawdown_adjusted_opportunity_20d",
         "label_pullback_recovery_20d",
     }
     assert expected.issubset(result.columns)
@@ -121,6 +123,8 @@ def test_tail_adjusted_target_penalizes_large_forward_drawdown() -> None:
     indexed = result.set_index("Ticker")
     assert indexed.loc["AAA", "label_tail_adjusted_outperform_20d"] == 0.0
     assert indexed.loc["BBB", "label_tail_adjusted_outperform_20d"] == 1.0
+    assert indexed.loc["AAA", "label_drawdown_adjusted_opportunity_20d"] == 0.0
+    assert indexed.loc["BBB", "label_drawdown_adjusted_opportunity_20d"] == 1.0
 
 
 def test_target_balance_diagnostics_include_counts_rates_and_balance_status() -> None:
@@ -602,6 +606,79 @@ def test_target_quality_summary_ranking_is_deterministic() -> None:
 
     pd.testing.assert_frame_equal(first, second)
     assert first.iloc[0]["target_id"] == "strong_20d"
+
+
+def test_target_arena_comparison_exports_requested_research_candidates() -> None:
+    baseline = target_quality_inputs(
+        target_id="outperform_20d",
+        display_name="Current 20d outperformance",
+        roc_auc=0.52,
+        pr_auc=0.48,
+        brier_score=0.26,
+        calibration_gap=0.03,
+        bucket_spread=0.04,
+        regime_rows=[
+            {"target_id": "outperform_20d", "direction": "positive", "bucket_spread": 0.09},
+            {"target_id": "outperform_20d", "direction": "flat", "bucket_spread": 0.01},
+        ],
+    )
+    top_tercile = target_quality_inputs(
+        target_id="top_tercile_excess_20d",
+        display_name="Top-third relative performer",
+        positive_rate=0.34,
+        roc_auc=0.57,
+        pr_auc=0.42,
+        brier_score=0.24,
+        calibration_gap=0.04,
+        bucket_spread=0.09,
+    )
+    risk_adjusted = target_quality_inputs(
+        target_id="risk_adjusted_excess_20d",
+        display_name="Recent-vol adjusted excess",
+        roc_auc=0.48,
+        bucket_spread=-0.04,
+        regime_rows=[{"target_id": "risk_adjusted_excess_20d", "direction": "inverted", "bucket_spread": -0.07}],
+    )
+    drawdown_adjusted = target_quality_inputs(
+        target_id="drawdown_adjusted_opportunity_20d",
+        display_name="Drawdown-adjusted opportunity",
+        roc_auc=0.54,
+        pr_auc=0.40,
+        brier_score=0.24,
+        calibration_gap=0.04,
+        bucket_spread=0.06,
+    )
+    pullback = target_quality_inputs(
+        target_id="pullback_recovery_20d",
+        display_name="Pullback and recovery",
+        positive_rate=0.12,
+        class_balance_status="Skewed",
+        roc_auc=0.55,
+        pr_auc=0.20,
+        brier_score=0.16,
+        calibration_gap=0.08,
+        bucket_spread=0.03,
+    )
+    summary = build_target_quality_summary(
+        pd.concat([baseline[0], top_tercile[0], risk_adjusted[0], drawdown_adjusted[0], pullback[0]], ignore_index=True),
+        pd.concat([baseline[1], top_tercile[1], risk_adjusted[1], drawdown_adjusted[1], pullback[1]], ignore_index=True),
+        pd.concat([baseline[2], top_tercile[2], risk_adjusted[2], drawdown_adjusted[2], pullback[2]], ignore_index=True),
+        pd.concat([baseline[3], top_tercile[3], risk_adjusted[3], drawdown_adjusted[3], pullback[3]], ignore_index=True),
+    )
+
+    arena = build_target_arena_comparison(summary).set_index("target_id")
+
+    assert arena.index.tolist() == [
+        "outperform_20d",
+        "top_tercile_excess_20d",
+        "risk_adjusted_excess_20d",
+        "drawdown_adjusted_opportunity_20d",
+        "pullback_recovery_20d",
+    ]
+    assert set(arena["evidence_classification"]).issubset({"strong", "promising", "mixed", "weak", "insufficient"})
+    assert bool(arena.loc["top_tercile_excess_20d", "future_production_experiment"]) is True
+    assert arena.loc["risk_adjusted_excess_20d", "evidence_classification"] == "weak"
+    assert "class balance" in arena.loc["pullback_recovery_20d", "rejection_reason"]
 
 
 def test_production_ml_score_formula_remains_outperformance_probability_scaled() -> None:
