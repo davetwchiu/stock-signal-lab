@@ -137,6 +137,8 @@ def test_codex_handoff_contains_required_sections(tmp_path: Path) -> None:
     assert "## Main evidence" in handoff
     assert "## Production target status" in handoff
     assert "## Suggested next engineering direction" in handoff
+    assert "## How Codex should use this bundle" in handoff
+    assert "no production target switch is supported" in handoff
     assert "## Codex instructions for next iteration" in handoff
 
 
