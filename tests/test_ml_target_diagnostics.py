@@ -11,6 +11,7 @@ from src.ml.target_diagnostics import (
     add_target_candidate_labels,
     build_target_balance_diagnostics,
     build_target_feature_group_comparison,
+    build_target_quality_summary,
     build_target_regime_comparison,
     build_target_stability_summary,
     build_target_walk_forward_comparison,
@@ -370,6 +371,237 @@ def test_target_stability_summary_flags_inverted_regime_results() -> None:
     assert row["regime_negative_count"] == 1
     assert row["worst_regime_bucket_spread"] == pytest.approx(-0.08)
     assert row["overall_stability"] == "Promising but regime-sensitive"
+
+
+def target_quality_inputs(
+    *,
+    target_id: str = "alternative_20d",
+    display_name: str = "Alternative 20d",
+    sample_count: int = 240,
+    positive_rate: float = 0.48,
+    class_balance_status: str = "Healthy",
+    roc_auc: float = 0.62,
+    pr_auc: float = 0.66,
+    brier_score: float = 0.18,
+    calibration_gap: float = 0.04,
+    bucket_spread: float = 0.14,
+    feature_rows: list[dict[str, object]] | None = None,
+    regime_rows: list[dict[str, object]] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    balance = pd.DataFrame(
+        [
+            {
+                "target_id": target_id,
+                "display_name": display_name,
+                "sample_count": sample_count,
+                "positive_rate": positive_rate,
+                "class_balance_status": class_balance_status,
+            }
+        ]
+    )
+    walk_forward = pd.DataFrame(
+        [
+            {
+                "target_id": target_id,
+                "display_name": display_name,
+                "prediction_count": sample_count // 2,
+                "positive_rate": positive_rate,
+                "roc_auc": roc_auc,
+                "pr_auc": pr_auc,
+                "brier_score": brier_score,
+                "calibration_gap": calibration_gap,
+                "bucket_spread": bucket_spread,
+            }
+        ]
+    )
+    feature_group = pd.DataFrame(
+        feature_rows
+        if feature_rows is not None
+        else [
+            {
+                "target_id": target_id,
+                "display_name": display_name,
+                "feature_group": "technical",
+                "prediction_count": 80,
+                "positive_rate": positive_rate,
+                "roc_auc": 0.61,
+                "pr_auc": 0.64,
+                "bucket_spread": 0.12,
+                "quality_summary": "Promising",
+            },
+            {
+                "target_id": target_id,
+                "display_name": display_name,
+                "feature_group": "all",
+                "prediction_count": 80,
+                "positive_rate": positive_rate,
+                "roc_auc": 0.63,
+                "pr_auc": 0.66,
+                "bucket_spread": 0.15,
+                "quality_summary": "Promising",
+            },
+        ]
+    )
+    regime = pd.DataFrame(
+        regime_rows
+        if regime_rows is not None
+        else [
+            {"target_id": target_id, "direction": "positive", "bucket_spread": 0.11},
+            {"target_id": target_id, "direction": "positive", "bucket_spread": 0.08},
+        ]
+    )
+    return balance, walk_forward, feature_group, regime
+
+
+def test_target_quality_summary_marks_strong_alternative_as_production_trial_candidate() -> None:
+    summary = build_target_quality_summary(*target_quality_inputs())
+    row = summary.set_index("target_id").loc["alternative_20d"]
+
+    assert row["overall_target_quality"] == "Promising"
+    assert row["production_candidate_status"] == "Candidate for production trial"
+
+
+def test_target_quality_summary_keeps_baseline_when_alternative_does_not_clearly_beat_it() -> None:
+    baseline = target_quality_inputs(
+        target_id="outperform_20d",
+        display_name="Current 20d outperformance",
+        roc_auc=0.59,
+        bucket_spread=0.11,
+    )
+    alternative = target_quality_inputs(
+        target_id="alternative_20d",
+        display_name="Alternative 20d",
+        roc_auc=0.60,
+        bucket_spread=0.12,
+    )
+    summary = build_target_quality_summary(
+        pd.concat([baseline[0], alternative[0]], ignore_index=True),
+        pd.concat([baseline[1], alternative[1]], ignore_index=True),
+        pd.concat([baseline[2], alternative[2]], ignore_index=True),
+        pd.concat([baseline[3], alternative[3]], ignore_index=True),
+    ).set_index("target_id")
+
+    assert summary.loc["outperform_20d", "production_candidate_status"] == "Keep baseline"
+    assert summary.loc["alternative_20d", "production_candidate_status"] == "Research-only candidate"
+    assert "current production target" in summary.loc["outperform_20d", "recommended_next_step"]
+
+
+def test_target_quality_summary_flags_good_overall_but_regime_sensitive_target() -> None:
+    summary = build_target_quality_summary(
+        *target_quality_inputs(
+            regime_rows=[
+                {"target_id": "alternative_20d", "direction": "positive", "bucket_spread": 0.14},
+                {"target_id": "alternative_20d", "direction": "inverted", "bucket_spread": -0.07},
+            ]
+        )
+    )
+    row = summary.set_index("target_id").loc["alternative_20d"]
+
+    assert row["regime_stability"] in {"Regime-sensitive", "Inverted in some regimes"}
+    assert row["production_candidate_status"] != "Candidate for production trial"
+
+
+def test_target_quality_summary_blocks_promising_label_when_calibration_is_poor() -> None:
+    summary = build_target_quality_summary(
+        *target_quality_inputs(calibration_gap=0.18, brier_score=0.32)
+    )
+    row = summary.set_index("target_id").loc["alternative_20d"]
+
+    assert row["calibration_quality"] == "Poor"
+    assert row["overall_target_quality"] != "Promising"
+
+
+def test_target_quality_summary_marks_skewed_pullback_as_special_setup_only() -> None:
+    summary = build_target_quality_summary(
+        *target_quality_inputs(
+            target_id="pullback_recovery_20d",
+            display_name="Pullback and recovery",
+            positive_rate=0.12,
+            class_balance_status="Skewed",
+            pr_auc=0.24,
+        )
+    )
+    row = summary.set_index("target_id").loc["pullback_recovery_20d"]
+
+    assert row["production_candidate_status"] == "Special setup only"
+    assert row["production_candidate_status"] != "Candidate for production trial"
+
+
+def test_target_quality_summary_marks_unusable_class_balance() -> None:
+    summary = build_target_quality_summary(
+        *target_quality_inputs(positive_rate=0.03, class_balance_status="Unusable")
+    )
+    row = summary.set_index("target_id").loc["alternative_20d"]
+
+    assert row["overall_target_quality"] == "Unusable"
+
+
+def test_target_quality_summary_detects_feature_group_dependent_target() -> None:
+    feature_rows = [
+        {
+            "target_id": "alternative_20d",
+            "display_name": "Alternative 20d",
+            "feature_group": "technical",
+            "prediction_count": 80,
+            "positive_rate": 0.50,
+            "roc_auc": 0.63,
+            "pr_auc": 0.66,
+            "bucket_spread": 0.14,
+            "quality_summary": "Promising",
+        },
+        {
+            "target_id": "alternative_20d",
+            "display_name": "Alternative 20d",
+            "feature_group": "technical_wavelet",
+            "prediction_count": 80,
+            "positive_rate": 0.50,
+            "roc_auc": 0.49,
+            "pr_auc": 0.48,
+            "bucket_spread": -0.09,
+            "quality_summary": "Weak",
+        },
+    ]
+    summary = build_target_quality_summary(*target_quality_inputs(feature_rows=feature_rows))
+    row = summary.set_index("target_id").loc["alternative_20d"]
+
+    assert row["feature_group_consistency"] == "Feature-group dependent"
+
+
+def test_target_quality_summary_ranking_is_deterministic() -> None:
+    strong = target_quality_inputs(target_id="strong_20d", display_name="Strong 20d")
+    weak = target_quality_inputs(
+        target_id="weak_20d",
+        display_name="Weak 20d",
+        roc_auc=0.49,
+        pr_auc=0.47,
+        bucket_spread=-0.08,
+        feature_rows=[
+            {
+                "target_id": "weak_20d",
+                "display_name": "Weak 20d",
+                "feature_group": "technical",
+                "prediction_count": 80,
+                "positive_rate": 0.48,
+                "roc_auc": 0.49,
+                "pr_auc": 0.47,
+                "bucket_spread": -0.08,
+                "quality_summary": "Weak",
+            }
+        ],
+        regime_rows=[{"target_id": "weak_20d", "direction": "inverted", "bucket_spread": -0.08}],
+    )
+    args = (
+        pd.concat([strong[0], weak[0]], ignore_index=True),
+        pd.concat([strong[1], weak[1]], ignore_index=True),
+        pd.concat([strong[2], weak[2]], ignore_index=True),
+        pd.concat([strong[3], weak[3]], ignore_index=True),
+    )
+
+    first = build_target_quality_summary(*args)[["target_id", "candidate_rank"]]
+    second = build_target_quality_summary(*args)[["target_id", "candidate_rank"]]
+
+    pd.testing.assert_frame_equal(first, second)
+    assert first.iloc[0]["target_id"] == "strong_20d"
 
 
 def test_production_ml_score_formula_remains_outperformance_probability_scaled() -> None:

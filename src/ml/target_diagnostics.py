@@ -105,6 +105,31 @@ TARGET_STABILITY_SUMMARY_COLUMNS = [
     "interpretation",
 ]
 
+TARGET_QUALITY_SUMMARY_COLUMNS = [
+    "target_id",
+    "candidate_rank",
+    "display_name",
+    "sample_count",
+    "positive_rate",
+    "class_balance_status",
+    "overall_auc",
+    "overall_pr_auc",
+    "overall_brier_score",
+    "overall_calibration_gap",
+    "overall_bucket_spread",
+    "best_feature_group",
+    "best_feature_group_auc",
+    "feature_group_consistency",
+    "regime_stability",
+    "worst_regime_bucket_spread",
+    "calibration_quality",
+    "bucket_separation_quality",
+    "overall_target_quality",
+    "production_candidate_status",
+    "recommended_next_step",
+    "interpretation",
+]
+
 DEFAULT_TARGET_FEATURE_GROUPS = ("technical", "technical_fourier", "technical_wavelet", "all")
 DEFAULT_TARGET_REGIME_COLUMNS = ("regime",)
 
@@ -898,3 +923,328 @@ def build_target_stability_summary(
             }
         )
     return pd.DataFrame(rows, columns=TARGET_STABILITY_SUMMARY_COLUMNS)
+
+
+def _target_row_by_id(frame: pd.DataFrame | None, target_id: object) -> pd.Series:
+    if frame is None or frame.empty or "target_id" not in frame:
+        return pd.Series(dtype=object)
+    matches = frame[frame["target_id"] == target_id]
+    if matches.empty:
+        return pd.Series(dtype=object)
+    return matches.iloc[0]
+
+
+def _quality_summary_target_ids(
+    target_balance: pd.DataFrame,
+    target_walk_forward: pd.DataFrame,
+    feature_group_comparison: pd.DataFrame | None,
+    regime_comparison: pd.DataFrame | None,
+) -> list[object]:
+    ids: list[object] = []
+    for frame in (target_balance, target_walk_forward, feature_group_comparison, regime_comparison):
+        if frame is None or frame.empty or "target_id" not in frame:
+            continue
+        for target_id in frame["target_id"].dropna().tolist():
+            if target_id not in ids:
+                ids.append(target_id)
+    return ids
+
+
+def _feature_group_quality_summary(fg_rows: pd.DataFrame) -> tuple[object, object, str]:
+    if fg_rows.empty:
+        return pd.NA, pd.NA, "Insufficient data"
+
+    rows = fg_rows.copy()
+    rows["_score"] = rows.apply(_feature_group_score, axis=1)
+    rows["_order"] = rows["feature_group"].map(
+        {name: index for index, name in enumerate(DEFAULT_TARGET_FEATURE_GROUPS)}
+    ).fillna(len(DEFAULT_TARGET_FEATURE_GROUPS))
+    best = rows.sort_values(["_score", "prediction_count", "_order"], ascending=[False, False, True]).iloc[0]
+    directions = [_feature_group_direction(row) for _, row in rows.iterrows()]
+    supported = [direction for direction in directions if direction != "insufficient"]
+    if not supported:
+        consistency = "Insufficient data"
+    elif supported.count("positive") == len(supported):
+        consistency = "Stable across feature groups"
+    elif "positive" in supported and (supported.count("flat") or supported.count("inverted")):
+        consistency = "Feature-group dependent"
+    else:
+        consistency = "Weak across feature groups"
+    return best.get("feature_group", pd.NA), best.get("roc_auc", pd.NA), consistency
+
+
+def _regime_quality_summary(regime_rows: pd.DataFrame) -> tuple[str, object, int, int]:
+    if regime_rows.empty:
+        return "Insufficient data", pd.NA, 0, 0
+    directions = regime_rows.get("direction", pd.Series(dtype=object)).dropna().astype(str).tolist()
+    supported = [direction for direction in directions if direction != "insufficient"]
+    spreads = pd.to_numeric(regime_rows.get("bucket_spread", pd.Series(dtype=float)), errors="coerce").dropna()
+    worst_spread = float(spreads.min()) if not spreads.empty else pd.NA
+    positive_count = supported.count("positive")
+    inverted_count = supported.count("inverted")
+    if not supported:
+        return "Insufficient data", worst_spread, positive_count, inverted_count
+    if inverted_count:
+        return "Inverted in some regimes", worst_spread, positive_count, inverted_count
+    if positive_count == len(supported):
+        return "Stable across regimes", worst_spread, positive_count, inverted_count
+    return "Regime-sensitive", worst_spread, positive_count, inverted_count
+
+
+def _calibration_quality(calibration_gap: object, brier_score: object) -> str:
+    gap = _numeric_value(calibration_gap)
+    brier = _numeric_value(brier_score)
+    if np.isnan(gap) and np.isnan(brier):
+        return "Unavailable"
+    abs_gap = abs(gap) if not np.isnan(gap) else 0.0
+    if abs_gap <= 0.05 and (np.isnan(brier) or brier <= 0.20):
+        return "Good"
+    if abs_gap <= 0.10 and (np.isnan(brier) or brier <= 0.25):
+        return "Acceptable"
+    return "Poor"
+
+
+def _bucket_separation_quality(bucket_spread: object) -> str:
+    spread = _numeric_value(bucket_spread)
+    if np.isnan(spread):
+        return "Unavailable"
+    if spread >= 0.05:
+        return "Positive"
+    if spread <= -0.05:
+        return "Inverted"
+    return "Weak"
+
+
+def _overall_target_quality(
+    *,
+    sample_count: int,
+    positive_rate: object,
+    class_balance_status: object,
+    overall_auc: object,
+    calibration_quality: str,
+    bucket_quality: str,
+    feature_group_consistency: str,
+    regime_stability: str,
+    inverted_regime_count: int,
+) -> str:
+    rate = _numeric_value(positive_rate)
+    auc = _numeric_value(overall_auc)
+    if (
+        sample_count < MIN_TARGET_DIAGNOSTIC_SAMPLE_COUNT
+        or class_balance_status == "Unusable"
+        or (not np.isnan(rate) and (rate < 0.05 or rate > 0.95))
+    ):
+        return "Unusable"
+    if bucket_quality == "Inverted" or (not np.isnan(auc) and auc < 0.50) or inverted_regime_count > 1:
+        return "Weak"
+    if (
+        class_balance_status == "Healthy"
+        and bucket_quality == "Positive"
+        and calibration_quality in {"Good", "Acceptable"}
+        and feature_group_consistency != "Weak across feature groups"
+        and regime_stability in {"Stable across regimes", "Insufficient data"}
+    ):
+        return "Promising"
+    if calibration_quality == "Poor" or regime_stability in {"Regime-sensitive", "Inverted in some regimes"}:
+        return "Mixed"
+    if feature_group_consistency == "Weak across feature groups":
+        return "Weak"
+    return "Mixed"
+
+
+def _baseline_reference(summary_rows: list[dict[str, object]]) -> dict[str, object] | None:
+    for row in summary_rows:
+        if row["target_id"] == "outperform_20d":
+            return row
+    return None
+
+
+def _clearly_beats_baseline(row: dict[str, object], baseline: dict[str, object] | None) -> bool:
+    if baseline is None or row["target_id"] == "outperform_20d":
+        return True
+    baseline_quality = str(baseline.get("overall_target_quality", ""))
+    if baseline_quality in {"Weak", "Unusable"}:
+        return True
+    spread = _numeric_value(row.get("overall_bucket_spread"))
+    baseline_spread = _numeric_value(baseline.get("overall_bucket_spread"))
+    auc = _numeric_value(row.get("overall_auc"))
+    baseline_auc = _numeric_value(baseline.get("overall_auc"))
+    spread_better = not np.isnan(spread) and (np.isnan(baseline_spread) or spread >= baseline_spread + 0.03)
+    auc_better = not np.isnan(auc) and (np.isnan(baseline_auc) or auc >= baseline_auc + 0.02)
+    return spread_better or auc_better
+
+
+def _production_candidate_status(row: dict[str, object], baseline: dict[str, object] | None) -> tuple[str, str]:
+    target_id = str(row["target_id"])
+    quality = str(row["overall_target_quality"])
+    balance = str(row["class_balance_status"])
+    bucket_quality = str(row["bucket_separation_quality"])
+    regime_stability = str(row["regime_stability"])
+    feature_consistency = str(row["feature_group_consistency"])
+    if target_id == "outperform_20d":
+        if quality == "Unusable":
+            return "Insufficient evidence", "Keep the current target, but refresh diagnostics before using this sample."
+        return "Keep baseline", "Keep the current production target until an alternative clearly beats it."
+    if quality == "Unusable":
+        return "Reject for now", "Do not advance this target; class balance or sample size is unusable."
+    if balance == "Skewed" and bucket_quality == "Positive":
+        return "Special setup only", "Review only in a special-purpose setup with explicit balance handling."
+    if quality == "Promising" and _clearly_beats_baseline(row, baseline):
+        if regime_stability == "Inverted in some regimes" or feature_consistency == "Weak across feature groups":
+            return "Research-only candidate", "Run more segmented validation before any production trial."
+        return "Candidate for production trial", "Consider a future production trial after review; do not switch automatically."
+    if quality == "Weak":
+        return "Reject for now", "Keep this target in diagnostics only unless future evidence improves."
+    return "Research-only candidate", "Keep reviewing this target; current evidence is not enough for a production trial."
+
+
+def _quality_interpretation(row: dict[str, object]) -> str:
+    return (
+        f"{row['overall_target_quality']} evidence: "
+        f"{row['bucket_separation_quality'].lower()} bucket separation, "
+        f"{row['calibration_quality'].lower()} calibration, "
+        f"{row['feature_group_consistency'].lower()}, and "
+        f"{row['regime_stability'].lower()}."
+    )
+
+
+def _quality_rank_key(row: dict[str, object]) -> tuple[float, float, float, float, str]:
+    quality_order = {"Promising": 3.0, "Mixed": 2.0, "Weak": 1.0, "Unusable": 0.0}
+    status_order = {
+        "Candidate for production trial": 4.0,
+        "Keep baseline": 3.0,
+        "Special setup only": 2.0,
+        "Research-only candidate": 1.5,
+        "Insufficient evidence": 0.5,
+        "Reject for now": 0.0,
+    }
+    calibration_order = {"Good": 2.0, "Acceptable": 1.0, "Unavailable": 0.5, "Poor": 0.0}
+    stability_order = {
+        "Stable across regimes": 2.0,
+        "Regime-sensitive": 1.0,
+        "Insufficient data": 0.5,
+        "Inverted in some regimes": 0.0,
+    }
+    feature_order = {
+        "Stable across feature groups": 2.0,
+        "Feature-group dependent": 1.0,
+        "Insufficient data": 0.5,
+        "Weak across feature groups": 0.0,
+    }
+    spread = _numeric_value(row.get("overall_bucket_spread"))
+    auc = _numeric_value(row.get("overall_auc"))
+    metric_signal = 0.0
+    if not np.isnan(spread):
+        metric_signal += spread
+    if not np.isnan(auc):
+        metric_signal += auc - 0.5
+    evidence_signal = (
+        calibration_order.get(str(row.get("calibration_quality")), 0.0)
+        + stability_order.get(str(row.get("regime_stability")), 0.0)
+        + feature_order.get(str(row.get("feature_group_consistency")), 0.0)
+    )
+    return (
+        quality_order.get(str(row.get("overall_target_quality")), 0.0),
+        status_order.get(str(row.get("production_candidate_status")), 0.0),
+        metric_signal,
+        evidence_signal,
+        str(row.get("target_id")),
+    )
+
+
+def build_target_quality_summary(
+    target_balance: pd.DataFrame,
+    target_walk_forward: pd.DataFrame,
+    feature_group_comparison: pd.DataFrame | None = None,
+    regime_comparison: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Classify target candidates from existing diagnostics without changing production scoring.
+
+    The rules intentionally stay transparent: first reject unusable class balance,
+    then check separation, calibration, feature-group consistency, and regime stability.
+    The output is a research recommendation table, not a production target selector.
+    """
+
+    rows: list[dict[str, object]] = []
+    for target_id in _quality_summary_target_ids(
+        target_balance,
+        target_walk_forward,
+        feature_group_comparison,
+        regime_comparison,
+    ):
+        balance = _target_row_by_id(target_balance, target_id)
+        walk_forward = _target_row_by_id(target_walk_forward, target_id)
+        fg_rows = (
+            feature_group_comparison[feature_group_comparison["target_id"] == target_id].copy()
+            if feature_group_comparison is not None
+            and not feature_group_comparison.empty
+            and "target_id" in feature_group_comparison
+            else pd.DataFrame()
+        )
+        regime_rows = (
+            regime_comparison[regime_comparison["target_id"] == target_id].copy()
+            if regime_comparison is not None and not regime_comparison.empty and "target_id" in regime_comparison
+            else pd.DataFrame()
+        )
+
+        sample_count = int(_numeric_value(balance.get("sample_count")) if pd.notna(balance.get("sample_count")) else 0)
+        positive_rate = balance.get("positive_rate", walk_forward.get("positive_rate", pd.NA))
+        class_balance_status = balance.get("class_balance_status", "Unavailable")
+        best_feature_group, best_feature_group_auc, feature_group_consistency = _feature_group_quality_summary(fg_rows)
+        regime_stability, worst_regime_bucket_spread, _, inverted_regime_count = _regime_quality_summary(regime_rows)
+        calibration_quality = _calibration_quality(
+            walk_forward.get("calibration_gap", pd.NA),
+            walk_forward.get("brier_score", pd.NA),
+        )
+        bucket_quality = _bucket_separation_quality(walk_forward.get("bucket_spread", pd.NA))
+        overall_quality = _overall_target_quality(
+            sample_count=sample_count,
+            positive_rate=positive_rate,
+            class_balance_status=class_balance_status,
+            overall_auc=walk_forward.get("roc_auc", pd.NA),
+            calibration_quality=calibration_quality,
+            bucket_quality=bucket_quality,
+            feature_group_consistency=feature_group_consistency,
+            regime_stability=regime_stability,
+            inverted_regime_count=inverted_regime_count,
+        )
+        rows.append(
+            {
+                "target_id": target_id,
+                "candidate_rank": pd.NA,
+                "display_name": balance.get("display_name", walk_forward.get("display_name", pd.NA)),
+                "sample_count": sample_count,
+                "positive_rate": positive_rate,
+                "class_balance_status": class_balance_status,
+                "overall_auc": walk_forward.get("roc_auc", pd.NA),
+                "overall_pr_auc": walk_forward.get("pr_auc", pd.NA),
+                "overall_brier_score": walk_forward.get("brier_score", pd.NA),
+                "overall_calibration_gap": walk_forward.get("calibration_gap", pd.NA),
+                "overall_bucket_spread": walk_forward.get("bucket_spread", pd.NA),
+                "best_feature_group": best_feature_group,
+                "best_feature_group_auc": best_feature_group_auc,
+                "feature_group_consistency": feature_group_consistency,
+                "regime_stability": regime_stability,
+                "worst_regime_bucket_spread": worst_regime_bucket_spread,
+                "calibration_quality": calibration_quality,
+                "bucket_separation_quality": bucket_quality,
+                "overall_target_quality": overall_quality,
+                "production_candidate_status": pd.NA,
+                "recommended_next_step": pd.NA,
+                "interpretation": pd.NA,
+            }
+        )
+
+    baseline = _baseline_reference(rows)
+    for row in rows:
+        status, next_step = _production_candidate_status(row, baseline)
+        row["production_candidate_status"] = status
+        row["recommended_next_step"] = next_step
+        row["interpretation"] = _quality_interpretation(row)
+
+    ranked_rows = sorted(rows, key=_quality_rank_key, reverse=True)
+    ranks = {row["target_id"]: rank for rank, row in enumerate(ranked_rows, start=1)}
+    for row in rows:
+        row["candidate_rank"] = ranks[row["target_id"]]
+    rows = sorted(rows, key=lambda row: (row["candidate_rank"], str(row["target_id"])))
+    return pd.DataFrame(rows, columns=TARGET_QUALITY_SUMMARY_COLUMNS)

@@ -60,6 +60,7 @@ from src.ml.target_diagnostics import (
     add_target_candidate_labels,
     build_target_balance_diagnostics,
     build_target_feature_group_comparison,
+    build_target_quality_summary,
     build_target_regime_comparison,
     build_target_stability_summary,
     build_target_walk_forward_comparison,
@@ -993,6 +994,12 @@ with research_tab:
                             target_feature_group_comparison = pd.DataFrame()
                             target_regime_comparison = pd.DataFrame()
                             target_stability_summary = pd.DataFrame()
+                        target_quality_summary = build_target_quality_summary(
+                            target_balance,
+                            target_walk_forward,
+                            target_feature_group_comparison,
+                            target_regime_comparison,
+                        )
                         risk_result = walk_forward_validate_classifier(
                             supervised,
                             columns,
@@ -1169,6 +1176,38 @@ with research_tab:
                                 width="stretch",
                                 hide_index=True,
                             )
+                            st.write("Target quality summary and recommendation")
+                            st.caption(
+                                "This summary helps decide which target deserves future production testing. "
+                                "It does not change Decision Cockpit scoring or today's ML Score."
+                            )
+                            if target_quality_summary.empty:
+                                st.info("No target quality summary was available.")
+                            else:
+                                st.dataframe(
+                                    target_quality_summary[
+                                        [
+                                            "target_id",
+                                            "overall_target_quality",
+                                            "production_candidate_status",
+                                            "recommended_next_step",
+                                            "best_feature_group",
+                                            "feature_group_consistency",
+                                            "regime_stability",
+                                            "calibration_quality",
+                                            "bucket_separation_quality",
+                                            "interpretation",
+                                        ]
+                                    ],
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                                with st.expander("Target quality details"):
+                                    st.dataframe(
+                                        target_quality_summary,
+                                        width="stretch",
+                                        hide_index=True,
+                                    )
                             st.caption(
                                 "These diagnostics compare target candidates under different feature sets and "
                                 "regimes. They do not change Decision Cockpit scoring or today's ML Score."
