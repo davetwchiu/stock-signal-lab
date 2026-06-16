@@ -1384,6 +1384,17 @@ with research_tab:
                                 )
                             else:
                                 st.dataframe(diagnostics.regime_segmented, width="stretch")
+                            st.write("**ML reliability gate diagnostics**")
+                            st.caption(
+                                "This table tests simple research-only gates that would have discounted ML score "
+                                "when past evidence was weak, inverted, or unsafe. It does not change production scoring."
+                            )
+                            if diagnostics.ml_reliability_gate_diagnostics.empty:
+                                st.info("No ML reliability gate diagnostics were available for this sample.")
+                            else:
+                                st.dataframe(diagnostics.ml_reliability_gate_diagnostics, width="stretch")
+                            if not diagnostics.ml_reliability_gate_by_regime.empty:
+                                st.dataframe(diagnostics.ml_reliability_gate_by_regime, width="stretch")
                             st.write("**Drawdown-risk calibration**")
                             st.dataframe(diagnostics.drawdown_risk_calibration, width="stretch")
                             drawdown_calibration_export = diagnostic_export_frame(
@@ -1417,6 +1428,9 @@ with research_tab:
                                 "ml_baseline_comparison": diagnostics.baseline_comparison,
                                 "ml_probability_direction_check": diagnostics.probability_direction_check,
                                 "ml_score_direction_diagnostics": diagnostics.score_direction_summary,
+                                "ml_reliability_by_regime": diagnostics.ml_reliability_by_regime,
+                                "ml_reliability_gate_diagnostics": diagnostics.ml_reliability_gate_diagnostics,
+                                "ml_reliability_gate_by_regime": diagnostics.ml_reliability_gate_by_regime,
                                 "drawdown_risk_calibration": diagnostics.drawdown_risk_calibration,
                                 "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
                                 "model_selection_summary": combined_selection_summary,
