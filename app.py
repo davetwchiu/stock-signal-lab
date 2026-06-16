@@ -83,6 +83,7 @@ from src.research.export import (
     export_research_lab_payload,
     zip_research_bundle,
 )
+from src.research.earnings_events import load_earnings_events
 from src.robustness.ablation import run_feature_ablation
 from src.robustness.runner import run_robustness_tests
 from src.ui.charts import drawdown_chart, equity_curve_chart, feature_chart, price_chart
@@ -1077,6 +1078,7 @@ with research_tab:
                                 baseline_panel=supervised,
                                 risk_adjusted_predictions=risk_adjusted_result.predictions,
                                 tail_risk_predictions=tail_risk_result.predictions,
+                                earnings_events=load_earnings_events(),
                             )
                             show_research_lab_run_interpretation(
                                 interpret_research_lab_run(
@@ -1395,6 +1397,32 @@ with research_tab:
                                 st.dataframe(diagnostics.ml_reliability_gate_diagnostics, width="stretch")
                             if not diagnostics.ml_reliability_gate_by_regime.empty:
                                 st.dataframe(diagnostics.ml_reliability_gate_by_regime, width="stretch")
+                            st.write("**Earnings / PEAD diagnostics**")
+                            st.caption(
+                                "This table checks whether earnings windows or post-earnings drift explain "
+                                "when ML score works or fails. It is research-only and does not change "
+                                "production scoring."
+                            )
+                            if diagnostics.earnings_pead_summary.empty:
+                                st.info("No earnings / PEAD diagnostics were available for this sample.")
+                            else:
+                                st.dataframe(
+                                    diagnostics.earnings_pead_summary,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                            if not diagnostics.earnings_event_diagnostics.empty:
+                                st.dataframe(
+                                    diagnostics.earnings_event_diagnostics,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                            if not diagnostics.ml_score_by_earnings_window.empty:
+                                st.dataframe(
+                                    diagnostics.ml_score_by_earnings_window,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
                             st.write("**Drawdown-risk calibration**")
                             st.dataframe(diagnostics.drawdown_risk_calibration, width="stretch")
                             drawdown_calibration_export = diagnostic_export_frame(
@@ -1431,6 +1459,9 @@ with research_tab:
                                 "ml_reliability_by_regime": diagnostics.ml_reliability_by_regime,
                                 "ml_reliability_gate_diagnostics": diagnostics.ml_reliability_gate_diagnostics,
                                 "ml_reliability_gate_by_regime": diagnostics.ml_reliability_gate_by_regime,
+                                "earnings_event_diagnostics": diagnostics.earnings_event_diagnostics,
+                                "ml_score_by_earnings_window": diagnostics.ml_score_by_earnings_window,
+                                "earnings_pead_summary": diagnostics.earnings_pead_summary,
                                 "drawdown_risk_calibration": diagnostics.drawdown_risk_calibration,
                                 "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
                                 "model_selection_summary": combined_selection_summary,

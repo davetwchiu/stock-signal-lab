@@ -223,6 +223,7 @@ def build_codex_handoff(
     diagnostics_summary = _frame(tables.get("ml_diagnostics_summary"))
     ml_reliability = _frame(tables.get("ml_reliability_by_regime"))
     ml_reliability_gate = _frame(tables.get("ml_reliability_gate_diagnostics"))
+    earnings_pead = _frame(tables.get("earnings_pead_summary"))
     drawdown_quality = _frame(tables.get("drawdown_risk_calibration_quality"))
     feature_audit = _frame(tables.get("feature_audit_summary"))
     redundancy = _frame(tables.get("feature_redundancy_selection"))
@@ -261,6 +262,9 @@ def build_codex_handoff(
         "",
         "## ML reliability gate diagnostics",
         _ml_reliability_gate_evidence(ml_reliability_gate),
+        "",
+        "## Earnings / PEAD diagnostics",
+        _earnings_pead_evidence(earnings_pead),
         "",
         "## Feature group findings",
         _feature_group_findings(feature_group, target_quality),
@@ -462,6 +466,26 @@ def _ml_reliability_gate_evidence(gate_diagnostics: pd.DataFrame) -> str:
         "Research-only reliability gates were tested without changing production scoring. "
         f"Exported {len(gate_diagnostics)} gate rows"
         + (f": {count_text}." if count_text else ".")
+    )
+
+
+def _earnings_pead_evidence(earnings_pead: pd.DataFrame) -> str:
+    if earnings_pead.empty:
+        return "No earnings / PEAD diagnostics table was exported."
+    if "classification" not in earnings_pead:
+        return (
+            "Research-only earnings-window diagnostics were exported. "
+            "These do not change production scoring."
+        )
+
+    counts = earnings_pead["classification"].astype(str).value_counts().sort_index()
+    count_text = ", ".join(f"{classification}={count}" for classification, count in counts.items())
+    direction = _display(earnings_pead.iloc[0].get("pead_signal_direction"))
+    ml_effect = _display(earnings_pead.iloc[0].get("ml_near_earnings_effect"))
+    return (
+        "Research-only earnings / PEAD diagnostics were exported without changing production scoring. "
+        f"PEAD direction: {direction}; ML near earnings effect: {ml_effect}"
+        + (f"; classifications: {count_text}." if count_text else ".")
     )
 
 

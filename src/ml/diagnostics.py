@@ -221,6 +221,57 @@ OPPORTUNITY_RISK_JOINT_COLUMNS = [
     "joint_validation_result",
 ]
 
+EARNINGS_EVENT_DIAGNOSTIC_COLUMNS = [
+    "ticker",
+    "event_count",
+    "usable_event_count",
+    "pre_earnings_sample_count",
+    "post_earnings_5d_sample_count",
+    "post_earnings_20d_sample_count",
+    "avg_earnings_gap_return",
+    "avg_post_earnings_drift_5d",
+    "avg_post_earnings_drift_20d",
+    "avg_forward_excess_return_post_earnings",
+    "drawdown_rate_post_earnings",
+    "classification",
+    "reason",
+]
+
+ML_SCORE_BY_EARNINGS_WINDOW_COLUMNS = [
+    "earnings_window",
+    "sample_count",
+    "positive_rate",
+    "avg_forward_excess_return",
+    "avg_ml_score",
+    "high_ml_sample_count",
+    "high_ml_positive_rate",
+    "high_ml_avg_forward_excess_return",
+    "high_ml_drawdown_rate",
+    "bucket_spread",
+    "classification",
+    "reason",
+]
+
+EARNINGS_PEAD_SUMMARY_COLUMNS = [
+    "sample_count",
+    "event_count",
+    "usable_event_count",
+    "post_earnings_positive_rate",
+    "post_earnings_avg_forward_excess_return",
+    "post_earnings_drawdown_rate",
+    "pead_signal_direction",
+    "ml_near_earnings_effect",
+    "classification",
+    "reason",
+]
+
+PEAD_MIN_USABLE_EVENTS = 3
+PEAD_MIN_WINDOW_SAMPLES = 12
+PEAD_RETURN_TOLERANCE = 0.002
+PEAD_DRAWDOWN_TOLERANCE = 0.05
+PEAD_HIGH_ML_SCORE = 70.0
+PEAD_LOW_ML_SCORE = 40.0
+
 LABEL_PREVALENCE_COLUMNS = [
     "label",
     "sample_size",
@@ -443,6 +494,9 @@ class MLDiagnostics:
     opportunity_risk_joint_validation: pd.DataFrame
     probability_direction_check: pd.DataFrame
     formula_candidate_comparison: pd.DataFrame
+    earnings_event_diagnostics: pd.DataFrame
+    ml_score_by_earnings_window: pd.DataFrame
+    earnings_pead_summary: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -592,6 +646,18 @@ def _empty_target_comparison() -> pd.DataFrame:
 
 def _empty_opportunity_risk_joint_validation() -> pd.DataFrame:
     return pd.DataFrame(columns=OPPORTUNITY_RISK_JOINT_COLUMNS)
+
+
+def _empty_earnings_event_diagnostics() -> pd.DataFrame:
+    return pd.DataFrame(columns=EARNINGS_EVENT_DIAGNOSTIC_COLUMNS)
+
+
+def _empty_ml_score_by_earnings_window() -> pd.DataFrame:
+    return pd.DataFrame(columns=ML_SCORE_BY_EARNINGS_WINDOW_COLUMNS)
+
+
+def _empty_earnings_pead_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=EARNINGS_PEAD_SUMMARY_COLUMNS)
 
 
 def _empty_label_prevalence_summary() -> pd.DataFrame:
@@ -4419,6 +4485,441 @@ def interpret_ml_probability_direction_check(direction_check: pd.DataFrame) -> s
     return "direction evidence is mixed"
 
 
+def _earnings_unavailable_tables(
+    reason: str,
+    *,
+    sample_count: int = 0,
+    event_count: int = 0,
+    classification: str = "unavailable",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    event_row = {
+        "ticker": pd.NA,
+        "event_count": event_count,
+        "usable_event_count": 0,
+        "pre_earnings_sample_count": 0,
+        "post_earnings_5d_sample_count": 0,
+        "post_earnings_20d_sample_count": 0,
+        "avg_earnings_gap_return": pd.NA,
+        "avg_post_earnings_drift_5d": pd.NA,
+        "avg_post_earnings_drift_20d": pd.NA,
+        "avg_forward_excess_return_post_earnings": pd.NA,
+        "drawdown_rate_post_earnings": pd.NA,
+        "classification": classification,
+        "reason": reason,
+    }
+    window_row = {
+        "earnings_window": classification,
+        "sample_count": sample_count,
+        "positive_rate": pd.NA,
+        "avg_forward_excess_return": pd.NA,
+        "avg_ml_score": pd.NA,
+        "high_ml_sample_count": 0,
+        "high_ml_positive_rate": pd.NA,
+        "high_ml_avg_forward_excess_return": pd.NA,
+        "high_ml_drawdown_rate": pd.NA,
+        "bucket_spread": pd.NA,
+        "classification": classification,
+        "reason": reason,
+    }
+    summary_row = {
+        "sample_count": sample_count,
+        "event_count": event_count,
+        "usable_event_count": 0,
+        "post_earnings_positive_rate": pd.NA,
+        "post_earnings_avg_forward_excess_return": pd.NA,
+        "post_earnings_drawdown_rate": pd.NA,
+        "pead_signal_direction": "unavailable" if classification == "unavailable" else "insufficient",
+        "ml_near_earnings_effect": "unavailable" if classification == "unavailable" else "insufficient",
+        "classification": classification,
+        "reason": reason,
+    }
+    return (
+        pd.DataFrame([event_row], columns=EARNINGS_EVENT_DIAGNOSTIC_COLUMNS),
+        pd.DataFrame([window_row], columns=ML_SCORE_BY_EARNINGS_WINDOW_COLUMNS),
+        pd.DataFrame([summary_row], columns=EARNINGS_PEAD_SUMMARY_COLUMNS),
+    )
+
+
+def _normalized_event_frame(earnings_events: pd.DataFrame | None) -> pd.DataFrame:
+    if earnings_events is None or "ticker" not in earnings_events or "earnings_date" not in earnings_events:
+        return pd.DataFrame(columns=["ticker", "earnings_date"])
+    events = earnings_events.copy()
+    events["ticker"] = events["ticker"].astype("string").str.strip().str.upper()
+    events["earnings_date"] = pd.to_datetime(events["earnings_date"], errors="coerce").dt.normalize()
+    events = events.dropna(subset=["ticker", "earnings_date"])
+    events = events[events["ticker"] != ""]
+    return events.drop_duplicates(subset=["ticker", "earnings_date"], keep="last").sort_values(
+        ["ticker", "earnings_date"]
+    )
+
+
+def _with_earnings_windows(score_panel: pd.DataFrame, earnings_events: pd.DataFrame) -> pd.DataFrame:
+    data = score_panel.copy()
+    if data.empty or not {"Date", "Ticker"}.issubset(data.columns):
+        return data
+    data["Date"] = pd.to_datetime(data["Date"], errors="coerce").dt.normalize()
+    data["Ticker"] = data["Ticker"].astype("string").str.strip().str.upper()
+    data["days_since_earnings"] = pd.NA
+    data["days_to_next_earnings"] = pd.NA
+
+    for ticker, group in data.groupby("Ticker", dropna=False):
+        ticker_events = earnings_events.loc[earnings_events["ticker"] == ticker, "earnings_date"]
+        if ticker_events.empty:
+            continue
+        event_dates = pd.DatetimeIndex(ticker_events.sort_values().drop_duplicates())
+        for index, row_date in group["Date"].items():
+            if pd.isna(row_date):
+                continue
+            previous_position = event_dates.searchsorted(row_date, side="right") - 1
+            if previous_position >= 0:
+                data.at[index, "days_since_earnings"] = int((row_date - event_dates[previous_position]).days)
+            next_position = event_dates.searchsorted(row_date, side="left")
+            if next_position < len(event_dates):
+                data.at[index, "days_to_next_earnings"] = int((event_dates[next_position] - row_date).days)
+
+    days_since = pd.to_numeric(data["days_since_earnings"], errors="coerce")
+    days_to_next = pd.to_numeric(data["days_to_next_earnings"], errors="coerce")
+    data["is_pre_earnings_window_5d"] = days_to_next.between(0, 5, inclusive="both")
+    data["is_post_earnings_window_5d"] = days_since.between(0, 5, inclusive="both")
+    data["is_post_earnings_window_20d"] = days_since.between(0, 20, inclusive="both")
+    return data
+
+
+def _drawdown_event_rate(data: pd.DataFrame) -> object:
+    if data.empty:
+        return pd.NA
+    if "actual_risk" in data:
+        values = pd.to_numeric(data["actual_risk"], errors="coerce").dropna()
+        if not values.empty:
+            return float(values.mean())
+    if "forward_drawdown" in data:
+        values = pd.to_numeric(data["forward_drawdown"], errors="coerce").dropna()
+        if not values.empty:
+            return float((values <= -0.10).mean())
+    return pd.NA
+
+
+def _mean_optional(data: pd.DataFrame, column: str) -> object:
+    if column not in data or data.empty:
+        return pd.NA
+    values = pd.to_numeric(data[column], errors="coerce").dropna()
+    return float(values.mean()) if not values.empty else pd.NA
+
+
+def _numeric_cell(frame: pd.DataFrame, row: int, column: str) -> object:
+    return pd.to_numeric(pd.Series([frame.at[row, column]]), errors="coerce").iloc[0]
+
+
+def _ticker_event_price_metrics(
+    price_panel: pd.DataFrame,
+    ticker: str,
+    event_dates: pd.Series,
+) -> tuple[int, object, object, object]:
+    if price_panel.empty or not {"Date", "Ticker"}.issubset(price_panel.columns):
+        return 0, pd.NA, pd.NA, pd.NA
+
+    prices = price_panel.copy()
+    prices["Date"] = pd.to_datetime(prices["Date"], errors="coerce").dt.normalize()
+    prices["Ticker"] = prices["Ticker"].astype("string").str.strip().str.upper()
+    prices = prices[prices["Ticker"] == ticker].sort_values("Date").reset_index(drop=True)
+    if prices.empty:
+        return 0, pd.NA, pd.NA, pd.NA
+
+    gaps: list[float] = []
+    drift_5d: list[float] = []
+    drift_20d: list[float] = []
+    usable = 0
+    has_gap_columns = {"Open", "Close"}.issubset(prices.columns)
+    has_drift_column = "Adj Close" in prices.columns
+    dates = pd.DatetimeIndex(prices["Date"])
+
+    for event_date in event_dates.sort_values().drop_duplicates():
+        event_position = dates.searchsorted(event_date, side="left")
+        if event_position >= len(prices):
+            continue
+        usable += 1
+        if has_gap_columns and event_position > 0:
+            event_open = _numeric_cell(prices, event_position, "Open")
+            previous_close = _numeric_cell(prices, event_position - 1, "Close")
+            if pd.notna(event_open) and pd.notna(previous_close) and previous_close != 0:
+                gaps.append(float(event_open / previous_close - 1.0))
+        if has_drift_column:
+            start_price = _numeric_cell(prices, event_position, "Adj Close")
+            if pd.isna(start_price) or start_price == 0:
+                continue
+            for days, output in ((5, drift_5d), (20, drift_20d)):
+                end_position = dates.searchsorted(event_date + pd.Timedelta(days=days), side="left")
+                if end_position < len(prices):
+                    end_price = _numeric_cell(prices, end_position, "Adj Close")
+                    if pd.notna(end_price):
+                        output.append(float(end_price / start_price - 1.0))
+
+    return (
+        usable,
+        float(pd.Series(gaps).mean()) if gaps else pd.NA,
+        float(pd.Series(drift_5d).mean()) if drift_5d else pd.NA,
+        float(pd.Series(drift_20d).mean()) if drift_20d else pd.NA,
+    )
+
+
+def _classify_pead_evidence(
+    *,
+    usable_event_count: int,
+    sample_count: int,
+    post_return: object,
+    baseline_return: object,
+    post_drawdown: object,
+    baseline_drawdown: object,
+) -> tuple[str, str]:
+    if usable_event_count < PEAD_MIN_USABLE_EVENTS or sample_count < PEAD_MIN_WINDOW_SAMPLES:
+        return "insufficient_event_data", "Event data exists, but usable post-earnings samples are too few."
+    if pd.isna(post_return) or pd.isna(baseline_return):
+        return "unavailable", "Required forward-return columns were unavailable for PEAD classification."
+
+    return_worse = float(post_return) < float(baseline_return) - PEAD_RETURN_TOLERANCE
+    return_better = float(post_return) > float(baseline_return) + PEAD_RETURN_TOLERANCE
+    drawdown_worse = (
+        pd.notna(post_drawdown)
+        and pd.notna(baseline_drawdown)
+        and float(post_drawdown) > float(baseline_drawdown) + PEAD_DRAWDOWN_TOLERANCE
+    )
+    if return_worse or drawdown_worse:
+        return "harmful", "Post-earnings samples had worse forward-return evidence or materially higher drawdown."
+    if return_better:
+        return "useful", "Post-earnings samples improved forward-return evidence without materially worse drawdown."
+    return "mixed", "Post-earnings evidence was available but not clearly better or worse than baseline."
+
+
+def _earnings_event_table(
+    enriched: pd.DataFrame,
+    earnings_events: pd.DataFrame,
+    baseline_panel: pd.DataFrame | None,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    price_panel = baseline_panel if isinstance(baseline_panel, pd.DataFrame) else enriched
+    baseline = enriched[~enriched["is_post_earnings_window_20d"]]
+    baseline_return = _mean_optional(baseline, "forward_excess_return")
+    baseline_drawdown = _drawdown_event_rate(baseline)
+
+    for ticker, ticker_events in earnings_events.groupby("ticker"):
+        ticker_panel = enriched[enriched["Ticker"] == ticker]
+        event_dates = ticker_events["earnings_date"]
+        post_20d = ticker_panel[ticker_panel["is_post_earnings_window_20d"]]
+        pre_5d = ticker_panel[ticker_panel["is_pre_earnings_window_5d"]]
+        post_5d = ticker_panel[ticker_panel["is_post_earnings_window_5d"]]
+        price_usable_count, gap_return, drift_5d, drift_20d = _ticker_event_price_metrics(
+            price_panel,
+            ticker,
+            event_dates,
+        )
+        post_sample_count = int(len(post_20d))
+        usable_count = int(min(len(event_dates), max(price_usable_count, post_20d["days_since_earnings"].notna().sum())))
+        post_return = _mean_optional(post_20d, "forward_excess_return")
+        post_drawdown = _drawdown_event_rate(post_20d)
+        classification, reason = _classify_pead_evidence(
+            usable_event_count=usable_count,
+            sample_count=post_sample_count,
+            post_return=post_return,
+            baseline_return=baseline_return,
+            post_drawdown=post_drawdown,
+            baseline_drawdown=baseline_drawdown,
+        )
+        rows.append(
+            {
+                "ticker": ticker,
+                "event_count": int(len(event_dates)),
+                "usable_event_count": usable_count,
+                "pre_earnings_sample_count": int(len(pre_5d)),
+                "post_earnings_5d_sample_count": int(len(post_5d)),
+                "post_earnings_20d_sample_count": post_sample_count,
+                "avg_earnings_gap_return": gap_return,
+                "avg_post_earnings_drift_5d": drift_5d,
+                "avg_post_earnings_drift_20d": drift_20d,
+                "avg_forward_excess_return_post_earnings": post_return,
+                "drawdown_rate_post_earnings": post_drawdown,
+                "classification": classification,
+                "reason": reason,
+            }
+        )
+    return pd.DataFrame(rows, columns=EARNINGS_EVENT_DIAGNOSTIC_COLUMNS)
+
+
+def _earnings_window_table(enriched: pd.DataFrame) -> pd.DataFrame:
+    baseline = enriched[~enriched["is_post_earnings_window_20d"]]
+    baseline_return = _mean_optional(baseline, "forward_excess_return")
+    baseline_drawdown = _drawdown_event_rate(baseline)
+    windows = {
+        "pre_earnings_5d": enriched["is_pre_earnings_window_5d"],
+        "post_earnings_5d": enriched["is_post_earnings_window_5d"],
+        "post_earnings_20d": enriched["is_post_earnings_window_20d"],
+        "non_event": ~(enriched["is_pre_earnings_window_5d"] | enriched["is_post_earnings_window_20d"]),
+    }
+    rows: list[dict[str, object]] = []
+    score_values = pd.to_numeric(enriched.get("ML Score"), errors="coerce")
+    for name, mask in windows.items():
+        window = enriched[mask].copy()
+        window_scores = score_values.loc[window.index]
+        high_ml = window[window_scores >= PEAD_HIGH_ML_SCORE]
+        low_ml = window[window_scores < PEAD_LOW_ML_SCORE]
+        high_return = _mean_optional(high_ml, "forward_excess_return")
+        low_return = _mean_optional(low_ml, "forward_excess_return")
+        bucket_spread = (
+            float(high_return) - float(low_return)
+            if pd.notna(high_return) and pd.notna(low_return)
+            else pd.NA
+        )
+        window_return = _mean_optional(window, "forward_excess_return")
+        window_drawdown = _drawdown_event_rate(window)
+        classification, reason = _classify_pead_evidence(
+            usable_event_count=PEAD_MIN_USABLE_EVENTS,
+            sample_count=len(window),
+            post_return=window_return,
+            baseline_return=baseline_return,
+            post_drawdown=window_drawdown,
+            baseline_drawdown=baseline_drawdown,
+        )
+        if name == "non_event":
+            classification = "mixed"
+            reason = "Non-event baseline row for comparison."
+        rows.append(
+            {
+                "earnings_window": name,
+                "sample_count": int(len(window)),
+                "positive_rate": _mean_optional(window, "actual_out"),
+                "avg_forward_excess_return": window_return,
+                "avg_ml_score": _mean_optional(window, "ML Score"),
+                "high_ml_sample_count": int(len(high_ml)),
+                "high_ml_positive_rate": _mean_optional(high_ml, "actual_out"),
+                "high_ml_avg_forward_excess_return": high_return,
+                "high_ml_drawdown_rate": _drawdown_event_rate(high_ml),
+                "bucket_spread": bucket_spread,
+                "classification": classification,
+                "reason": reason,
+            }
+        )
+    return pd.DataFrame(rows, columns=ML_SCORE_BY_EARNINGS_WINDOW_COLUMNS)
+
+
+def _pead_summary_table(
+    enriched: pd.DataFrame,
+    earnings_events: pd.DataFrame,
+    event_table: pd.DataFrame,
+    window_table: pd.DataFrame,
+) -> pd.DataFrame:
+    post_20d = enriched[enriched["is_post_earnings_window_20d"]]
+    non_event = enriched[~enriched["is_post_earnings_window_20d"]]
+    usable_event_count = int(pd.to_numeric(event_table["usable_event_count"], errors="coerce").fillna(0).sum())
+    post_return = _mean_optional(post_20d, "forward_excess_return")
+    baseline_return = _mean_optional(non_event, "forward_excess_return")
+    post_drawdown = _drawdown_event_rate(post_20d)
+    baseline_drawdown = _drawdown_event_rate(non_event)
+    classification, reason = _classify_pead_evidence(
+        usable_event_count=usable_event_count,
+        sample_count=len(post_20d),
+        post_return=post_return,
+        baseline_return=baseline_return,
+        post_drawdown=post_drawdown,
+        baseline_drawdown=baseline_drawdown,
+    )
+
+    if pd.isna(post_return) or pd.isna(baseline_return):
+        pead_direction = "insufficient"
+    elif float(post_return) > float(baseline_return) + PEAD_RETURN_TOLERANCE:
+        pead_direction = "positive"
+    elif float(post_return) < float(baseline_return) - PEAD_RETURN_TOLERANCE:
+        pead_direction = "negative"
+    else:
+        pead_direction = "neutral"
+
+    indexed_windows = window_table.set_index("earnings_window") if not window_table.empty else pd.DataFrame()
+    high_post = (
+        indexed_windows.at["post_earnings_20d", "high_ml_avg_forward_excess_return"]
+        if "post_earnings_20d" in indexed_windows.index
+        else pd.NA
+    )
+    high_non_event = (
+        indexed_windows.at["non_event", "high_ml_avg_forward_excess_return"]
+        if "non_event" in indexed_windows.index
+        else pd.NA
+    )
+    if pd.isna(high_post) or pd.isna(high_non_event):
+        ml_effect = "insufficient"
+    elif float(high_post) > float(high_non_event) + PEAD_RETURN_TOLERANCE:
+        ml_effect = "supportive"
+    elif float(high_post) < float(high_non_event) - PEAD_RETURN_TOLERANCE:
+        ml_effect = "inverted"
+        if classification == "useful":
+            classification = "mixed"
+            reason = "PEAD evidence improved, but high ML score near earnings lagged non-event setups."
+    else:
+        ml_effect = "neutral"
+
+    row = {
+        "sample_count": int(len(enriched)),
+        "event_count": int(len(earnings_events)),
+        "usable_event_count": usable_event_count,
+        "post_earnings_positive_rate": _mean_optional(post_20d, "actual_out"),
+        "post_earnings_avg_forward_excess_return": post_return,
+        "post_earnings_drawdown_rate": post_drawdown,
+        "pead_signal_direction": pead_direction,
+        "ml_near_earnings_effect": ml_effect,
+        "classification": classification,
+        "reason": reason,
+    }
+    return pd.DataFrame([row], columns=EARNINGS_PEAD_SUMMARY_COLUMNS)
+
+
+def build_earnings_pead_diagnostics(
+    score_panel: pd.DataFrame,
+    earnings_events: pd.DataFrame | None = None,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build research-only earnings-window and PEAD diagnostics."""
+
+    sample_count = int(len(score_panel)) if isinstance(score_panel, pd.DataFrame) else 0
+    status = (
+        getattr(earnings_events, "attrs", {}).get("earnings_event_status")
+        if isinstance(earnings_events, pd.DataFrame)
+        else "missing"
+    )
+    reason = (
+        getattr(earnings_events, "attrs", {}).get("earnings_event_reason")
+        if isinstance(earnings_events, pd.DataFrame)
+        else "No local earnings event CSV was found."
+    )
+    if earnings_events is None or status in {"missing", "invalid_schema"}:
+        return _earnings_unavailable_tables(str(reason), sample_count=sample_count, classification="unavailable")
+
+    events = _normalized_event_frame(earnings_events)
+    if events.empty:
+        return _earnings_unavailable_tables(
+            "Earnings event data exists, but no usable ticker/date rows were available.",
+            sample_count=sample_count,
+            classification="insufficient_event_data",
+        )
+    if score_panel.empty or not {"Date", "Ticker", "ML Score"}.issubset(score_panel.columns):
+        return _earnings_unavailable_tables(
+            "ML score panel was unavailable for earnings-window diagnostics.",
+            sample_count=sample_count,
+            event_count=len(events),
+            classification="unavailable",
+        )
+
+    enriched = _with_earnings_windows(score_panel, events)
+    if "is_post_earnings_window_20d" not in enriched:
+        return _earnings_unavailable_tables(
+            "Earnings-window features could not be derived from the score panel.",
+            sample_count=sample_count,
+            event_count=len(events),
+            classification="unavailable",
+        )
+    event_table = _earnings_event_table(enriched, events, baseline_panel)
+    window_table = _earnings_window_table(enriched)
+    summary_table = _pead_summary_table(enriched, events, event_table, window_table)
+    return event_table, window_table, summary_table
+
+
 def build_regime_score_direction_summary(
     score_panel: pd.DataFrame,
     *,
@@ -4492,6 +4993,7 @@ def build_ml_diagnostics(
     baseline_panel: pd.DataFrame | None = None,
     risk_adjusted_predictions: pd.DataFrame | None = None,
     tail_risk_predictions: pd.DataFrame | None = None,
+    earnings_events: pd.DataFrame | None = None,
 ) -> MLDiagnostics:
     """Summarize out-of-sample usefulness of the existing ML signal.
 
@@ -4545,6 +5047,11 @@ def build_ml_diagnostics(
         )
     probability_direction_check = build_ml_probability_direction_check(probability_direction_panel)
     formula_candidate_comparison = build_ml_score_formula_candidate_comparison(probability_direction_panel)
+    unavailable_earnings = build_earnings_pead_diagnostics(
+        probability_direction_panel,
+        earnings_events,
+        baseline_panel=baseline_panel,
+    )
 
     if outperformance_predictions.empty or drawdown_risk_predictions.empty:
         summary = pd.DataFrame(
@@ -4572,6 +5079,9 @@ def build_ml_diagnostics(
             _empty_opportunity_risk_joint_validation(),
             probability_direction_check,
             formula_candidate_comparison,
+            unavailable_earnings[0],
+            unavailable_earnings[1],
+            unavailable_earnings[2],
         )
 
     keys = prediction_merge_keys(out, risk)
@@ -4582,6 +5092,11 @@ def build_ml_diagnostics(
     )
     if not score_panel.empty:
         score_panel["ML Score"] = ml_score(score_panel["probability_out"], score_panel["probability_risk"])
+    earnings_event_diagnostics, ml_score_by_earnings_window, earnings_pead_summary = build_earnings_pead_diagnostics(
+        score_panel,
+        earnings_events,
+        baseline_panel=baseline_panel,
+    )
     baseline_comparison = build_ml_baseline_comparison(score_panel, baseline_panel)
     regime_segmented = build_regime_segmented_ml_diagnostics(score_panel, baseline_panel=baseline_panel)
     score_direction_summary = build_ml_score_direction_diagnostics(score_panel)
@@ -4647,4 +5162,7 @@ def build_ml_diagnostics(
         opportunity_risk_joint_validation,
         probability_direction_check,
         formula_candidate_comparison,
+        earnings_event_diagnostics,
+        ml_score_by_earnings_window,
+        earnings_pead_summary,
     )
