@@ -59,6 +59,9 @@ from src.ml.scoring import current_ml_score_table
 from src.ml.target_diagnostics import (
     add_target_candidate_labels,
     build_target_balance_diagnostics,
+    build_target_feature_group_comparison,
+    build_target_regime_comparison,
+    build_target_stability_summary,
     build_target_walk_forward_comparison,
     target_candidate_registry,
     target_definition_table,
@@ -851,6 +854,11 @@ with research_tab:
             value=False,
             help="Run extra research-only diagnostics for existing walk-forward ML signal outputs.",
         )
+        run_extended_target_comparison = st.checkbox(
+            "Run extended target comparison",
+            value=False,
+            help="Run additional diagnostics-only target comparisons across feature groups and regimes.",
+        )
         run_validation = st.button("Run walk-forward validation")
 
         if run_validation and benchmark_frame is not None and not supervised.empty:
@@ -951,6 +959,40 @@ with research_tab:
                             probability_threshold=float(probability_threshold),
                             model_selection_mode=model_selection_mode,
                         )
+                        if run_extended_target_comparison:
+                            target_feature_group_comparison = build_target_feature_group_comparison(
+                                target_panel,
+                                group_options,
+                                target_candidates,
+                                model_name=model_name,
+                                train_window=int(train_window),
+                                test_window=int(test_window),
+                                step=int(step),
+                                embargo=int(embargo),
+                                probability_threshold=float(probability_threshold),
+                                model_selection_mode=model_selection_mode,
+                            )
+                            target_regime_comparison = build_target_regime_comparison(
+                                target_panel,
+                                columns,
+                                target_candidates,
+                                model_name=model_name,
+                                train_window=int(train_window),
+                                test_window=int(test_window),
+                                step=int(step),
+                                embargo=int(embargo),
+                                probability_threshold=float(probability_threshold),
+                                model_selection_mode=model_selection_mode,
+                            )
+                            target_stability_summary = build_target_stability_summary(
+                                target_feature_group_comparison,
+                                target_regime_comparison,
+                                target_candidates,
+                            )
+                        else:
+                            target_feature_group_comparison = pd.DataFrame()
+                            target_regime_comparison = pd.DataFrame()
+                            target_stability_summary = pd.DataFrame()
                         risk_result = walk_forward_validate_classifier(
                             supervised,
                             columns,
@@ -1127,6 +1169,71 @@ with research_tab:
                                 width="stretch",
                                 hide_index=True,
                             )
+                            st.caption(
+                                "These diagnostics compare target candidates under different feature sets and "
+                                "regimes. They do not change Decision Cockpit scoring or today's ML Score."
+                            )
+                            if run_extended_target_comparison:
+                                st.write("Target comparison by feature group")
+                                if target_feature_group_comparison.empty:
+                                    st.info("No feature-group target comparison was available.")
+                                else:
+                                    st.dataframe(
+                                        target_feature_group_comparison[
+                                            [
+                                                "target_id",
+                                                "feature_group",
+                                                "folds",
+                                                "prediction_count",
+                                                "positive_rate",
+                                                "roc_auc",
+                                                "pr_auc",
+                                                "brier_score",
+                                                "calibration_gap",
+                                                "bucket_spread",
+                                                "quality_summary",
+                                                "interpretation",
+                                            ]
+                                        ],
+                                        width="stretch",
+                                        hide_index=True,
+                                    )
+                                st.write("Target comparison by regime")
+                                st.caption("Regime comparison uses the currently selected feature group.")
+                                if target_regime_comparison.empty:
+                                    st.info("No regime target comparison was available.")
+                                else:
+                                    st.dataframe(
+                                        target_regime_comparison[
+                                            [
+                                                "target_id",
+                                                "regime",
+                                                "sample_size",
+                                                "positive_rate",
+                                                "roc_auc",
+                                                "pr_auc",
+                                                "top_bucket_positive_rate",
+                                                "bottom_bucket_positive_rate",
+                                                "bucket_spread",
+                                                "direction",
+                                                "quality_summary",
+                                                "interpretation",
+                                            ]
+                                        ],
+                                        width="stretch",
+                                        hide_index=True,
+                                    )
+                                st.write("Target stability summary")
+                                if target_stability_summary.empty:
+                                    st.info("No target stability summary was available.")
+                                else:
+                                    st.dataframe(
+                                        target_stability_summary,
+                                        width="stretch",
+                                        hide_index=True,
+                                    )
+                            else:
+                                st.info("Enable Run extended target comparison to compare targets by feature group and regime.")
                             st.write("**Opportunity-risk joint validation**")
                             st.caption(
                                 interpret_opportunity_risk_joint_validation(

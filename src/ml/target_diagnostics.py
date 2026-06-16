@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from src.ml.labels import make_forward_labels
-from src.ml.metrics import calibration_summary
+from src.ml.metrics import calibration_summary, classification_metrics
 from src.ml.validation import walk_forward_validate_classifier
 
 
@@ -58,6 +58,55 @@ TARGET_WALK_FORWARD_COLUMNS = [
     "quality_summary",
     "interpretation",
 ]
+
+TARGET_FEATURE_GROUP_COMPARISON_COLUMNS = [
+    "target_id",
+    "display_name",
+    "feature_group",
+    "folds",
+    "prediction_count",
+    "positive_rate",
+    "roc_auc",
+    "pr_auc",
+    "brier_score",
+    "calibration_gap",
+    "bucket_spread",
+    "quality_summary",
+    "interpretation",
+]
+
+TARGET_REGIME_COMPARISON_COLUMNS = [
+    "target_id",
+    "display_name",
+    "regime",
+    "sample_size",
+    "positive_rate",
+    "roc_auc",
+    "pr_auc",
+    "top_bucket_positive_rate",
+    "bottom_bucket_positive_rate",
+    "bucket_spread",
+    "direction",
+    "quality_summary",
+    "interpretation",
+]
+
+TARGET_STABILITY_SUMMARY_COLUMNS = [
+    "target_id",
+    "display_name",
+    "best_feature_group",
+    "best_feature_group_metric",
+    "feature_group_consistency",
+    "regime_positive_count",
+    "regime_negative_count",
+    "worst_regime_bucket_spread",
+    "overall_stability",
+    "next_step_candidate",
+    "interpretation",
+]
+
+DEFAULT_TARGET_FEATURE_GROUPS = ("technical", "technical_fourier", "technical_wavelet", "all")
+DEFAULT_TARGET_REGIME_COLUMNS = ("regime",)
 
 
 @dataclass(frozen=True)
@@ -402,6 +451,77 @@ def _target_quality_summary(balance_row: pd.Series, wf_row: dict[str, object]) -
     return "Mixed", "Mixed diagnostic evidence; useful for review but not decisive."
 
 
+def _target_walk_forward_row_and_predictions(
+    panel: pd.DataFrame,
+    feature_columns: list[str],
+    candidate: TargetCandidate,
+    balance_row: pd.Series,
+    *,
+    model_name: str,
+    train_window: int,
+    test_window: int,
+    step: int | None,
+    embargo: int,
+    probability_threshold: float,
+    model_selection_mode: str,
+    min_bucket_count: int,
+) -> tuple[dict[str, object], pd.DataFrame]:
+    row: dict[str, object] = {
+        "target_id": candidate.target_id,
+        "display_name": candidate.display_name,
+        "folds": 0,
+        "prediction_count": 0,
+        "positive_rate": balance_row["positive_rate"],
+        "roc_auc": pd.NA,
+        "pr_auc": pd.NA,
+        "brier_score": pd.NA,
+        "calibration_gap": pd.NA,
+        "top_bucket_positive_rate": pd.NA,
+        "bottom_bucket_positive_rate": pd.NA,
+        "bucket_spread": pd.NA,
+    }
+    predictions = pd.DataFrame()
+    if (
+        candidate.label_column in panel
+        and feature_columns
+        and not bool(balance_row["too_few_samples"])
+        and not bool(balance_row["too_rare_positive_class"])
+        and not bool(balance_row["too_common_positive_class"])
+    ):
+        result = walk_forward_validate_classifier(
+            panel,
+            feature_columns,
+            label_column=candidate.label_column,
+            model_name=model_name,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
+            embargo=embargo,
+            probability_threshold=probability_threshold,
+            model_selection_mode=model_selection_mode,
+        )
+        predictions = result.predictions
+        row["folds"] = int(len(result.fold_metrics))
+        row["prediction_count"] = int(len(result.predictions))
+        if not result.predictions.empty:
+            row["positive_rate"] = float(result.predictions["actual"].mean())
+            if not result.overall_metrics.empty:
+                for metric in ("roc_auc", "pr_auc", "brier_score"):
+                    row[metric] = result.overall_metrics.iloc[0].get(metric, pd.NA)
+            calibration = calibration_summary(result.predictions)
+            if not calibration.empty:
+                row["calibration_gap"] = calibration.iloc[0].get("calibration_gap", pd.NA)
+            top_rate, bottom_rate, spread = _bucket_positive_rates(result.predictions, min_bucket_count)
+            row["top_bucket_positive_rate"] = top_rate
+            row["bottom_bucket_positive_rate"] = bottom_rate
+            row["bucket_spread"] = spread
+
+    summary, interpretation = _target_quality_summary(balance_row, row)
+    row["quality_summary"] = summary
+    row["interpretation"] = interpretation
+    return row, predictions
+
+
 def build_target_walk_forward_comparison(
     panel: pd.DataFrame,
     feature_columns: list[str],
@@ -424,56 +544,357 @@ def build_target_walk_forward_comparison(
     rows: list[dict[str, object]] = []
     for candidate in active:
         balance_row = balance.loc[candidate.target_id]
-        row: dict[str, object] = {
-            "target_id": candidate.target_id,
-            "display_name": candidate.display_name,
-            "folds": 0,
-            "prediction_count": 0,
-            "positive_rate": balance_row["positive_rate"],
-            "roc_auc": pd.NA,
-            "pr_auc": pd.NA,
-            "brier_score": pd.NA,
-            "calibration_gap": pd.NA,
-            "top_bucket_positive_rate": pd.NA,
-            "bottom_bucket_positive_rate": pd.NA,
-            "bucket_spread": pd.NA,
-        }
-        if (
-            candidate.label_column in panel
-            and feature_columns
-            and not bool(balance_row["too_few_samples"])
-            and not bool(balance_row["too_rare_positive_class"])
-            and not bool(balance_row["too_common_positive_class"])
-        ):
-            result = walk_forward_validate_classifier(
-                panel,
-                feature_columns,
-                label_column=candidate.label_column,
-                model_name=model_name,
-                train_window=train_window,
-                test_window=test_window,
-                step=step,
-                embargo=embargo,
-                probability_threshold=probability_threshold,
-                model_selection_mode=model_selection_mode,
-            )
-            row["folds"] = int(len(result.fold_metrics))
-            row["prediction_count"] = int(len(result.predictions))
-            if not result.predictions.empty:
-                row["positive_rate"] = float(result.predictions["actual"].mean())
-                if not result.overall_metrics.empty:
-                    for metric in ("roc_auc", "pr_auc", "brier_score"):
-                        row[metric] = result.overall_metrics.iloc[0].get(metric, pd.NA)
-                calibration = calibration_summary(result.predictions)
-                if not calibration.empty:
-                    row["calibration_gap"] = calibration.iloc[0].get("calibration_gap", pd.NA)
-                top_rate, bottom_rate, spread = _bucket_positive_rates(result.predictions, min_bucket_count)
-                row["top_bucket_positive_rate"] = top_rate
-                row["bottom_bucket_positive_rate"] = bottom_rate
-                row["bucket_spread"] = spread
-
-        summary, interpretation = _target_quality_summary(balance_row, row)
-        row["quality_summary"] = summary
-        row["interpretation"] = interpretation
+        row, _ = _target_walk_forward_row_and_predictions(
+            panel,
+            feature_columns,
+            candidate,
+            balance_row,
+            model_name=model_name,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
+            embargo=embargo,
+            probability_threshold=probability_threshold,
+            model_selection_mode=model_selection_mode,
+            min_bucket_count=min_bucket_count,
+        )
         rows.append(row)
     return pd.DataFrame(rows, columns=TARGET_WALK_FORWARD_COLUMNS)
+
+
+def build_target_feature_group_comparison(
+    panel: pd.DataFrame,
+    feature_groups: dict[str, list[str]],
+    candidates: list[TargetCandidate] | None = None,
+    *,
+    model_name: str = "logistic_regression",
+    train_window: int = 252,
+    test_window: int = 63,
+    step: int | None = None,
+    embargo: int = 20,
+    probability_threshold: float = 0.5,
+    model_selection_mode: str = "current_default",
+    min_sample_count: int = MIN_TARGET_DIAGNOSTIC_SAMPLE_COUNT,
+    min_bucket_count: int = MIN_TARGET_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Compare diagnostics-only target candidates across existing feature groups."""
+
+    active = candidates or target_candidate_registry()
+    rows: list[dict[str, object]] = []
+    for feature_group, columns in feature_groups.items():
+        if not columns:
+            continue
+        comparison = build_target_walk_forward_comparison(
+            panel,
+            columns,
+            active,
+            model_name=model_name,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
+            embargo=embargo,
+            probability_threshold=probability_threshold,
+            model_selection_mode=model_selection_mode,
+            min_sample_count=min_sample_count,
+            min_bucket_count=min_bucket_count,
+        )
+        for row in comparison.to_dict("records"):
+            row["feature_group"] = feature_group
+            rows.append(row)
+    return pd.DataFrame(rows, columns=TARGET_FEATURE_GROUP_COMPARISON_COLUMNS)
+
+
+def _merge_prediction_regimes(
+    predictions: pd.DataFrame,
+    panel: pd.DataFrame,
+    regime_columns: tuple[str, ...],
+) -> pd.DataFrame:
+    if predictions.empty or panel.empty or "Date" not in predictions or "Ticker" not in predictions:
+        return pd.DataFrame()
+    available = [column for column in regime_columns if column in panel]
+    if not available:
+        return pd.DataFrame()
+    lookup = panel[["Date", "Ticker", *available]].copy()
+    lookup["Date"] = pd.to_datetime(lookup["Date"])
+    lookup = lookup.drop_duplicates(subset=["Date", "Ticker"], keep="last")
+    output = predictions.copy()
+    output["Date"] = pd.to_datetime(output["Date"])
+    return output.merge(lookup, on=["Date", "Ticker"], how="left")
+
+
+def _target_regime_direction(bucket_spread: object, sample_size: int, min_sample_count: int) -> tuple[str, str, str]:
+    spread = pd.to_numeric(pd.Series([bucket_spread]), errors="coerce").iloc[0]
+    if sample_size < min_sample_count or pd.isna(spread):
+        return (
+            "insufficient",
+            "Insufficient",
+            "Regime sample is too small or bucket separation is unavailable for this target.",
+        )
+    if float(spread) >= 0.05:
+        return (
+            "positive",
+            "Positive separation",
+            "Target probabilities separate higher-positive-rate buckets in this regime.",
+        )
+    if float(spread) <= -0.05:
+        return (
+            "inverted",
+            "Inverted",
+            "Target probabilities are inverted in this regime.",
+        )
+    return (
+        "flat",
+        "Weak",
+        "Target probabilities show weak or flat separation in this regime.",
+    )
+
+
+def _target_regime_rows(
+    predictions: pd.DataFrame,
+    panel: pd.DataFrame,
+    candidate: TargetCandidate,
+    *,
+    regime_columns: tuple[str, ...],
+    min_sample_count: int,
+    min_bucket_count: int,
+) -> list[dict[str, object]]:
+    data = _merge_prediction_regimes(predictions, panel, regime_columns)
+    if data.empty:
+        return []
+    rows: list[dict[str, object]] = []
+    available = [column for column in regime_columns if column in data]
+    for regime_col in available:
+        regime_data = data.dropna(subset=[regime_col]).copy()
+        if regime_data.empty:
+            continue
+        regime_data[regime_col] = regime_data[regime_col].astype(str).str.strip()
+        regime_data = regime_data[regime_data[regime_col] != ""]
+        for regime, group in regime_data.groupby(regime_col, sort=True):
+            metrics = classification_metrics(group["actual"], group["probability"])
+            top_rate, bottom_rate, spread = _bucket_positive_rates(group, min_bucket_count)
+            direction, summary, interpretation = _target_regime_direction(
+                spread,
+                int(len(group)),
+                min_sample_count,
+            )
+            if group["actual"].nunique(dropna=True) < 2:
+                interpretation += " ROC-AUC is unavailable because this regime has one class."
+            rows.append(
+                {
+                    "target_id": candidate.target_id,
+                    "display_name": candidate.display_name,
+                    "regime": regime,
+                    "sample_size": int(len(group)),
+                    "positive_rate": float(group["actual"].mean()) if len(group) else pd.NA,
+                    "roc_auc": metrics.get("roc_auc", pd.NA),
+                    "pr_auc": metrics.get("pr_auc", pd.NA),
+                    "top_bucket_positive_rate": top_rate,
+                    "bottom_bucket_positive_rate": bottom_rate,
+                    "bucket_spread": spread,
+                    "direction": direction,
+                    "quality_summary": summary,
+                    "interpretation": interpretation,
+                }
+            )
+    return rows
+
+
+def build_target_regime_comparison(
+    panel: pd.DataFrame,
+    feature_columns: list[str],
+    candidates: list[TargetCandidate] | None = None,
+    *,
+    model_name: str = "logistic_regression",
+    train_window: int = 252,
+    test_window: int = 63,
+    step: int | None = None,
+    embargo: int = 20,
+    probability_threshold: float = 0.5,
+    model_selection_mode: str = "current_default",
+    regime_columns: tuple[str, ...] = DEFAULT_TARGET_REGIME_COLUMNS,
+    min_sample_count: int = MIN_TARGET_BUCKET_COUNT,
+    min_target_sample_count: int = MIN_TARGET_DIAGNOSTIC_SAMPLE_COUNT,
+    min_bucket_count: int = MIN_TARGET_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Segment out-of-sample target predictions by existing regime labels."""
+
+    active = candidates or target_candidate_registry()
+    balance = build_target_balance_diagnostics(panel, active, min_sample_count=min_target_sample_count).set_index(
+        "target_id"
+    )
+    rows: list[dict[str, object]] = []
+    for candidate in active:
+        _, predictions = _target_walk_forward_row_and_predictions(
+            panel,
+            feature_columns,
+            candidate,
+            balance.loc[candidate.target_id],
+            model_name=model_name,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
+            embargo=embargo,
+            probability_threshold=probability_threshold,
+            model_selection_mode=model_selection_mode,
+            min_bucket_count=min_bucket_count,
+        )
+        rows.extend(
+            _target_regime_rows(
+                predictions,
+                panel,
+                candidate,
+                regime_columns=regime_columns,
+                min_sample_count=min_sample_count,
+                min_bucket_count=min_bucket_count,
+            )
+        )
+    return pd.DataFrame(rows, columns=TARGET_REGIME_COMPARISON_COLUMNS)
+
+
+def _numeric_value(value: object) -> float:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(numeric) if pd.notna(numeric) else float("nan")
+
+
+def _feature_group_score(row: pd.Series) -> float:
+    spread = _numeric_value(row.get("bucket_spread"))
+    roc_auc = _numeric_value(row.get("roc_auc"))
+    pr_auc = _numeric_value(row.get("pr_auc"))
+    positive_rate = _numeric_value(row.get("positive_rate"))
+    scores = []
+    if not np.isnan(spread):
+        scores.append(spread)
+    if not np.isnan(roc_auc):
+        scores.append((roc_auc - 0.5) * 2.0)
+    if not np.isnan(pr_auc) and not np.isnan(positive_rate):
+        scores.append(pr_auc - positive_rate)
+    return max(scores) if scores else float("-inf")
+
+
+def _feature_group_direction(row: pd.Series) -> str:
+    prediction_count = pd.to_numeric(pd.Series([row.get("prediction_count")]), errors="coerce").fillna(0).iloc[0]
+    if int(prediction_count) <= 0 or row.get("quality_summary") == "Unusable":
+        return "insufficient"
+    score = _feature_group_score(row)
+    if score >= 0.05:
+        return "positive"
+    if score <= -0.05:
+        return "inverted"
+    return "flat"
+
+
+def _feature_group_consistency(group: pd.DataFrame) -> str:
+    directions = [_feature_group_direction(row) for _, row in group.iterrows()]
+    supported = [direction for direction in directions if direction != "insufficient"]
+    if not supported:
+        return "No usable feature groups"
+    positives = supported.count("positive")
+    inverted = supported.count("inverted")
+    flat = supported.count("flat")
+    if positives == len(supported):
+        return "Consistent positive"
+    if positives and inverted == 0 and flat:
+        return "Mostly positive"
+    if positives and (inverted or flat):
+        return "Feature-group dependent"
+    if inverted:
+        return "Inverted or unstable"
+    return "Weak"
+
+
+def _stability_label(
+    *,
+    best_score: float,
+    feature_group_consistency: str,
+    regime_positive_count: int,
+    regime_negative_count: int,
+) -> tuple[str, str, str]:
+    if best_score == float("-inf"):
+        return "Unusable", "No", "Unusable target in this sample."
+    if regime_negative_count > 0 and best_score >= 0.05:
+        return (
+            "Promising but regime-sensitive",
+            "Review",
+            "Promising but regime-sensitive: this target shows useful separation overall, but weak or inverted results in some regimes.",
+        )
+    if feature_group_consistency in {"Feature-group dependent", "Inverted or unstable"} and best_score >= 0.05:
+        return (
+            "Feature-group dependent",
+            "Review",
+            "Feature-group dependent: this target works better with some feature sets than others.",
+        )
+    if best_score >= 0.10 and feature_group_consistency in {"Consistent positive", "Mostly positive"}:
+        return (
+            "Strong candidate",
+            "Yes",
+            "Strong candidate: this target has useful separation across feature sets without obvious regime inversion.",
+        )
+    if best_score >= 0.05 or regime_positive_count > 0:
+        return (
+            "Promising but regime-sensitive",
+            "Review",
+            "Promising but needs more evidence across feature groups and regimes.",
+        )
+    return "Weak", "No", "Weak target evidence in this sample."
+
+
+def build_target_stability_summary(
+    feature_group_comparison: pd.DataFrame,
+    regime_comparison: pd.DataFrame,
+    candidates: list[TargetCandidate] | None = None,
+) -> pd.DataFrame:
+    """Summarize target stability across feature groups and regimes."""
+
+    active = candidates or target_candidate_registry()
+    rows: list[dict[str, object]] = []
+    feature_group_order = {name: index for index, name in enumerate(DEFAULT_TARGET_FEATURE_GROUPS)}
+    for candidate in active:
+        fg_rows = feature_group_comparison[
+            feature_group_comparison.get("target_id", pd.Series(dtype=object)) == candidate.target_id
+        ].copy()
+        if fg_rows.empty:
+            best_feature_group = pd.NA
+            best_metric = pd.NA
+            best_score = float("-inf")
+            consistency = "No usable feature groups"
+        else:
+            fg_rows["_score"] = fg_rows.apply(_feature_group_score, axis=1)
+            fg_rows["_order"] = fg_rows["feature_group"].map(feature_group_order).fillna(len(feature_group_order))
+            best = fg_rows.sort_values(
+                ["_score", "prediction_count", "_order"],
+                ascending=[False, False, True],
+            ).iloc[0]
+            best_feature_group = best["feature_group"]
+            best_metric = best["bucket_spread"] if pd.notna(best["bucket_spread"]) else best["roc_auc"]
+            best_score = float(best["_score"])
+            consistency = _feature_group_consistency(fg_rows)
+
+        regime_rows = regime_comparison[
+            regime_comparison.get("target_id", pd.Series(dtype=object)) == candidate.target_id
+        ]
+        regime_positive_count = int((regime_rows.get("direction", pd.Series(dtype=object)) == "positive").sum())
+        regime_negative_count = int((regime_rows.get("direction", pd.Series(dtype=object)) == "inverted").sum())
+        spreads = pd.to_numeric(regime_rows.get("bucket_spread", pd.Series(dtype=float)), errors="coerce").dropna()
+        worst_regime_bucket_spread = float(spreads.min()) if not spreads.empty else pd.NA
+        label, next_step, interpretation = _stability_label(
+            best_score=best_score,
+            feature_group_consistency=consistency,
+            regime_positive_count=regime_positive_count,
+            regime_negative_count=regime_negative_count,
+        )
+        rows.append(
+            {
+                "target_id": candidate.target_id,
+                "display_name": candidate.display_name,
+                "best_feature_group": best_feature_group,
+                "best_feature_group_metric": best_metric,
+                "feature_group_consistency": consistency,
+                "regime_positive_count": regime_positive_count,
+                "regime_negative_count": regime_negative_count,
+                "worst_regime_bucket_spread": worst_regime_bucket_spread,
+                "overall_stability": label,
+                "next_step_candidate": next_step,
+                "interpretation": interpretation,
+            }
+        )
+    return pd.DataFrame(rows, columns=TARGET_STABILITY_SUMMARY_COLUMNS)

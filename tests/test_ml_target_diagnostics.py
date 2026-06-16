@@ -10,6 +10,9 @@ from src.ml.target_diagnostics import (
     TargetCandidate,
     add_target_candidate_labels,
     build_target_balance_diagnostics,
+    build_target_feature_group_comparison,
+    build_target_regime_comparison,
+    build_target_stability_summary,
     build_target_walk_forward_comparison,
     target_candidate_registry,
 )
@@ -142,6 +145,9 @@ def walk_forward_panel() -> pd.DataFrame:
                     "Ticker": ticker,
                     "Date": date_value,
                     "feature_signal": float(label) + 0.1 * ticker_offset,
+                    "feature_fourier": float(label) * 0.8 + 0.05 * date_index,
+                    "feature_wavelet": float(label) * 0.6 + 0.02 * ticker_offset,
+                    "regime": "Uptrend" if label else "Downtrend",
                     "label_custom_20d": label,
                     "forward_20d_excess_return": 0.02 if label else -0.01,
                     "forward_20d_drawdown": -0.02 if label else -0.06,
@@ -207,6 +213,163 @@ def test_extreme_class_balance_is_flagged_without_crashing_walk_forward() -> Non
     row = comparison.iloc[0]
     assert row["quality_summary"] == "Unusable"
     assert row["prediction_count"] == 0
+
+
+def test_target_feature_group_comparison_represents_available_feature_groups() -> None:
+    panel = walk_forward_panel()
+    candidate = TargetCandidate(
+        target_id="custom_20d",
+        display_name="Custom 20d",
+        label_column="label_custom_20d",
+        target_type="test",
+        horizon=20,
+        description="Test target.",
+        positive_label_meaning="Test positive.",
+    )
+    feature_groups = {
+        "technical": ["feature_signal"],
+        "technical_fourier": ["feature_signal", "feature_fourier"],
+        "technical_wavelet": ["feature_signal", "feature_wavelet"],
+        "all": ["feature_signal", "feature_fourier", "feature_wavelet"],
+    }
+
+    comparison = build_target_feature_group_comparison(
+        panel,
+        feature_groups,
+        [candidate],
+        train_window=20,
+        test_window=10,
+        step=10,
+        embargo=20,
+        min_sample_count=20,
+        min_bucket_count=2,
+    )
+
+    assert set(comparison["feature_group"]) == {"technical", "technical_fourier", "technical_wavelet", "all"}
+    assert (comparison["target_id"] == "custom_20d").all()
+    assert (comparison["prediction_count"] > 0).all()
+
+
+def test_target_regime_comparison_handles_single_class_regimes_without_crashing() -> None:
+    panel = walk_forward_panel()
+    panel["regime"] = np.where(panel["label_custom_20d"] == 1, "Positive-only regime", "Negative-only regime")
+    candidate = TargetCandidate(
+        target_id="custom_20d",
+        display_name="Custom 20d",
+        label_column="label_custom_20d",
+        target_type="test",
+        horizon=20,
+        description="Test target.",
+        positive_label_meaning="Test positive.",
+    )
+
+    comparison = build_target_regime_comparison(
+        panel,
+        ["feature_signal"],
+        [candidate],
+        train_window=20,
+        test_window=10,
+        step=10,
+        embargo=20,
+        min_target_sample_count=20,
+        min_sample_count=2,
+        min_bucket_count=2,
+    )
+
+    assert set(comparison["regime"]) == {"Positive-only regime", "Negative-only regime"}
+    assert comparison["roc_auc"].isna().all()
+    assert comparison["interpretation"].str.contains("one class").all()
+
+
+def test_target_stability_summary_selects_best_feature_group_deterministically() -> None:
+    candidate = TargetCandidate(
+        target_id="custom_20d",
+        display_name="Custom 20d",
+        label_column="label_custom_20d",
+        target_type="test",
+        horizon=20,
+        description="Test target.",
+        positive_label_meaning="Test positive.",
+    )
+    feature_group_comparison = pd.DataFrame(
+        [
+            {
+                "target_id": "custom_20d",
+                "display_name": "Custom 20d",
+                "feature_group": "technical",
+                "prediction_count": 20,
+                "positive_rate": 0.50,
+                "roc_auc": 0.54,
+                "pr_auc": 0.55,
+                "bucket_spread": 0.04,
+                "quality_summary": "Mixed",
+            },
+            {
+                "target_id": "custom_20d",
+                "display_name": "Custom 20d",
+                "feature_group": "technical_wavelet",
+                "prediction_count": 20,
+                "positive_rate": 0.50,
+                "roc_auc": 0.57,
+                "pr_auc": 0.58,
+                "bucket_spread": 0.12,
+                "quality_summary": "Promising",
+            },
+        ]
+    )
+    regime_comparison = pd.DataFrame(
+        [
+            {"target_id": "custom_20d", "direction": "positive", "bucket_spread": 0.10},
+            {"target_id": "custom_20d", "direction": "flat", "bucket_spread": 0.02},
+        ]
+    )
+
+    summary = build_target_stability_summary(feature_group_comparison, regime_comparison, [candidate])
+    row = summary.iloc[0]
+
+    assert row["best_feature_group"] == "technical_wavelet"
+    assert row["best_feature_group_metric"] == pytest.approx(0.12)
+    assert row["overall_stability"] in {"Strong candidate", "Promising but regime-sensitive", "Feature-group dependent"}
+
+
+def test_target_stability_summary_flags_inverted_regime_results() -> None:
+    candidate = TargetCandidate(
+        target_id="custom_20d",
+        display_name="Custom 20d",
+        label_column="label_custom_20d",
+        target_type="test",
+        horizon=20,
+        description="Test target.",
+        positive_label_meaning="Test positive.",
+    )
+    feature_group_comparison = pd.DataFrame(
+        [
+            {
+                "target_id": "custom_20d",
+                "display_name": "Custom 20d",
+                "feature_group": "technical",
+                "prediction_count": 20,
+                "positive_rate": 0.50,
+                "roc_auc": 0.60,
+                "pr_auc": 0.62,
+                "bucket_spread": 0.15,
+                "quality_summary": "Promising",
+            }
+        ]
+    )
+    regime_comparison = pd.DataFrame(
+        [
+            {"target_id": "custom_20d", "direction": "positive", "bucket_spread": 0.12},
+            {"target_id": "custom_20d", "direction": "inverted", "bucket_spread": -0.08},
+        ]
+    )
+
+    summary = build_target_stability_summary(feature_group_comparison, regime_comparison, [candidate])
+    row = summary.iloc[0]
+
+    assert row["regime_negative_count"] == 1
+    assert row["worst_regime_bucket_spread"] == pytest.approx(-0.08)
+    assert row["overall_stability"] == "Promising but regime-sensitive"
 
 
 def test_production_ml_score_formula_remains_outperformance_probability_scaled() -> None:
