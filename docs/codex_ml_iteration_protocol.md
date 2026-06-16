@@ -4,16 +4,26 @@ This protocol is for evidence-driven Research Lab work only. It is not permissio
 
 ## Required Loop
 
-1. Run headless Research Lab baseline export.
+1. Run or reuse a valid headless Research Lab baseline export.
 2. Read `codex_handoff.md` and key CSV files.
 3. State evidence summary before changing code.
 4. Propose one coherent enhancement.
 5. Make bounded code changes.
-6. Run focused tests and full pytest.
-7. Run headless Research Lab candidate export.
+6. Run focused tests relevant to the changed files.
+7. Run headless Research Lab candidate export with the staged universe workflow.
 8. Compare baseline vs candidate export.
-9. Commit only if tests pass and diagnostics are not worse overall.
+9. Before commit, run full pytest and one full-universe candidate export only if the candidate remains viable.
 10. If evidence worsens or is mixed, stop and report instead of forcing a win.
+
+## Staged Universe Workflow
+
+Do not run the full default universe for every Research Lab round. Use smaller universes to fail weak feature candidates quickly.
+
+- Fast smoke universe: `NVDA,MSFT,AAPL,QQQ,TSM,PLTR`.
+- Balanced research universe: `NVDA,MSFT,AAPL,TSM,AVGO,PLTR,TSLA,QQQ,SMH,XLK`.
+- Full default universe: run only once near final consolidation, and only when smoke and balanced evidence have not already failed early-stop rules.
+
+Use the fast smoke universe to confirm feature generation, missing-column handling, focused tests, and headless export wiring. Use the balanced research universe for baseline-vs-candidate comparison during feature iteration. If a clean full-universe baseline already exists in `data/research_runs/latest` and the code change does not invalidate it, reuse it instead of repeating a full baseline export.
 
 ## Stop Rules
 
