@@ -1394,12 +1394,12 @@ def build_target_arena_comparison(
         classification = _arena_evidence_classification(row, baseline)
         rejection_reason = _arena_rejection_reason(row, classification)
         future_experiment = classification in {"strong", "promising"} and target_id != "outperform_20d"
-        if classification == "strong":
+        if target_id == "outperform_20d":
+            decision = "current_baseline"
+        elif classification == "strong":
             decision = "best_candidate"
         elif classification == "promising":
             decision = "future_research_candidate"
-        elif target_id == "outperform_20d":
-            decision = "current_baseline"
         else:
             decision = "reject_for_now"
         rows.append(

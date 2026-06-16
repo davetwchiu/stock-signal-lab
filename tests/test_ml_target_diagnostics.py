@@ -681,6 +681,20 @@ def test_target_arena_comparison_exports_requested_research_candidates() -> None
     assert "class balance" in arena.loc["pullback_recovery_20d", "rejection_reason"]
 
 
+def test_target_arena_keeps_promising_production_baseline_as_current_baseline() -> None:
+    summary = build_target_quality_summary(
+        *target_quality_inputs(
+            target_id="outperform_20d",
+            display_name="Current 20d outperformance",
+        )
+    )
+
+    arena = build_target_arena_comparison(summary, target_ids=("outperform_20d",)).set_index("target_id")
+
+    assert arena.loc["outperform_20d", "evidence_classification"] == "promising"
+    assert arena.loc["outperform_20d", "arena_decision"] == "current_baseline"
+
+
 def test_production_ml_score_formula_remains_outperformance_probability_scaled() -> None:
     score = ml_score(pd.Series([0.25, 0.75]), pd.Series([0.90, 0.10]))
 
