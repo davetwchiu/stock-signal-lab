@@ -35,6 +35,7 @@ from src.ml.target_diagnostics import (
     target_definition_table,
 )
 from src.ml.validation import compare_feature_groups, summarize_model_selection, walk_forward_validate_classifier
+from src.research.earnings_events import load_earnings_events
 from src.research.export import build_research_lab_export_payload
 from src.utils.config import FeatureConfig
 
@@ -226,6 +227,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         baseline_panel=supervised,
         risk_adjusted_predictions=risk_adjusted.predictions,
         tail_risk_predictions=tail_risk.predictions,
+        earnings_events=load_earnings_events(),
     )
     comparison = compare_feature_groups(
         supervised,
@@ -249,6 +251,9 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "ml_reliability_by_regime": diagnostics.ml_reliability_by_regime,
         "ml_reliability_gate_diagnostics": diagnostics.ml_reliability_gate_diagnostics,
         "ml_reliability_gate_by_regime": diagnostics.ml_reliability_gate_by_regime,
+        "earnings_event_diagnostics": diagnostics.earnings_event_diagnostics,
+        "ml_score_by_earnings_window": diagnostics.ml_score_by_earnings_window,
+        "earnings_pead_summary": diagnostics.earnings_pead_summary,
         "drawdown_risk_calibration": diagnostics.drawdown_risk_calibration,
         "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
         "model_selection_summary": pd.concat(
