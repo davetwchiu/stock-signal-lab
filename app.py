@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -77,6 +78,11 @@ from src.ml.validation import (
 from src.portfolio.allocation import AllocationConfig
 from src.portfolio.risk import RiskControlConfig
 from src.portfolio.simulator import simulate_portfolio
+from src.research.export import (
+    build_research_lab_export_payload,
+    export_research_lab_payload,
+    zip_research_bundle,
+)
 from src.robustness.ablation import run_feature_ablation
 from src.robustness.runner import run_robustness_tests
 from src.ui.charts import drawdown_chart, equity_curve_chart, feature_chart, price_chart
@@ -99,6 +105,8 @@ DECISION_TABLE_COLUMN_LABELS = {
     "One-line reason": "Reason",
 }
 BENCHMARK_OPTIONS = ["SPY", "QQQ", "SMH", "SOXX"]
+REPO_ROOT = Path(__file__).resolve().parent
+RESEARCH_RUNS_DIR = REPO_ROOT / "data" / "research_runs"
 
 
 @st.cache_data(show_spinner=False)
@@ -132,6 +140,18 @@ def diagnostic_export_frame(data: object) -> pd.DataFrame:
     if data is None:
         return pd.DataFrame()
     return pd.DataFrame([{"metric": "value", "value": data}])
+
+
+def fold_details_for_export(**fold_tables: pd.DataFrame) -> pd.DataFrame:
+    """Combine walk-forward fold details without rerunning validation."""
+
+    frames = []
+    for target_name, frame in fold_tables.items():
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            output = frame.copy()
+            output.insert(0, "target", target_name)
+            frames.append(output)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def parse_float_list(raw: str) -> list[float]:
@@ -933,15 +953,15 @@ with research_tab:
                             ),
                         )
                         show_ml_feature_audit(feature_audit)
-                        show_ml_feature_signal_diagnostics(
-                            build_ml_feature_signal_diagnostics(
-                                supervised,
-                                columns,
-                                horizon=config.default_label_horizon,
-                                high_correlation_pairs=feature_audit.high_correlation_pairs,
-                            )
+                        feature_signal_diagnostics = build_ml_feature_signal_diagnostics(
+                            supervised,
+                            columns,
+                            horizon=config.default_label_horizon,
+                            high_correlation_pairs=feature_audit.high_correlation_pairs,
                         )
+                        show_ml_feature_signal_diagnostics(feature_signal_diagnostics)
                         target_candidates = target_candidate_registry(config.default_label_horizon)
+                        target_definitions = target_definition_table(target_candidates)
                         target_panel = add_target_candidate_labels(
                             supervised,
                             benchmark_price=benchmark_frame["Adj Close"],
@@ -1145,7 +1165,7 @@ with research_tab:
                             )
                             st.write("Candidate target definitions")
                             st.dataframe(
-                                target_definition_table(target_candidates)[
+                                target_definitions[
                                     ["target_id", "display_name", "horizon", "positive_label_meaning"]
                                 ],
                                 width="stretch",
@@ -1391,8 +1411,85 @@ with research_tab:
                                     width="stretch",
                                     hide_index=True,
                                 )
+                            research_export_tables = {
+                                "ml_diagnostics_summary": diagnostics.summary,
+                                "ml_score_buckets": diagnostics.score_buckets,
+                                "ml_baseline_comparison": diagnostics.baseline_comparison,
+                                "ml_probability_direction_check": diagnostics.probability_direction_check,
+                                "ml_score_direction_diagnostics": diagnostics.score_direction_summary,
+                                "drawdown_risk_calibration": diagnostics.drawdown_risk_calibration,
+                                "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
+                                "model_selection_summary": combined_selection_summary,
+                                "model_selection_fold_details": fold_details_for_export(
+                                    outperformance=result.fold_metrics,
+                                    drawdown_risk=risk_result.fold_metrics,
+                                    risk_adjusted_outperform=risk_adjusted_result.fold_metrics,
+                                    tail_risk_adjusted_outperform=tail_risk_result.fold_metrics,
+                                ),
+                                "feature_group_comparison": comparison,
+                                "feature_audit_summary": feature_audit.inventory_summary,
+                                "feature_family_summary": feature_audit.family_summary,
+                                "feature_redundancy_selection": feature_audit.redundancy_selection_summary,
+                                "feature_redundancy_dropped_features": feature_audit.redundancy_selection_report,
+                                "feature_signal_summary": feature_signal_diagnostics.signal_table,
+                                "regime_segmented_ml_diagnostics": diagnostics.regime_segmented,
+                                "target_candidate_definitions": target_definitions,
+                                "target_balance": target_balance,
+                                "target_walk_forward_comparison": target_walk_forward,
+                                "target_feature_group_comparison": target_feature_group_comparison,
+                                "target_regime_comparison": target_regime_comparison,
+                                "target_quality_summary": target_quality_summary,
+                                "opportunity_risk_joint_validation": diagnostics.opportunity_risk_joint_validation,
+                            }
+                            research_export_metadata = {
+                                "app_name": "Stock Signal Lab",
+                                "benchmark": benchmark,
+                                "portfolio_name": active_portfolio.name,
+                                "ticker_count": len(tickers),
+                                "tickers": tickers,
+                                "feature_group": feature_group,
+                                "model_name": model_name,
+                                "model_mode": model_selection_mode,
+                                "train_window": int(train_window),
+                                "test_window": int(test_window),
+                                "step_size": int(step),
+                                "embargo_requested": int(embargo),
+                                "embargo_effective": max(int(embargo), int(config.default_label_horizon)),
+                                "classification_threshold": float(probability_threshold),
+                                "target_candidates_enabled": True,
+                                "extended_target_comparison_enabled": bool(run_extended_target_comparison),
+                                "data_start": str(start_date),
+                                "data_end": str(end_date),
+                            }
+                            st.session_state["research_lab_export_payload"] = build_research_lab_export_payload(
+                                run_metadata=research_export_metadata,
+                                tables=research_export_tables,
+                            )
                     except Exception as exc:
                         st.warning(f"ML diagnostics could not be built: {exc}")
+
+        research_export_payload = st.session_state.get("research_lab_export_payload")
+        if research_export_payload:
+            st.caption(
+                "This export is for research iteration. It does not change Decision Cockpit "
+                "scoring or today's ML Score."
+            )
+            if st.button("Export Research Lab diagnostics bundle", key="export_research_lab_diagnostics_bundle"):
+                try:
+                    export_result = export_research_lab_payload(
+                        research_export_payload,
+                        output_root=RESEARCH_RUNS_DIR,
+                    )
+                    st.success(f"Saved Research Lab diagnostics bundle to {export_result.run_dir}")
+                    st.download_button(
+                        "Download diagnostics bundle ZIP",
+                        zip_research_bundle(export_result.run_dir),
+                        file_name=f"{export_result.run_dir.name}.zip",
+                        mime="application/zip",
+                        key="download_research_lab_diagnostics_bundle_zip",
+                    )
+                except Exception as export_error:
+                    st.warning(f"Research Lab diagnostics export failed: {export_error}")
 
     with st.expander("Feature ablation, portfolio simulation, and robustness", expanded=False):
         run_ablation = st.button("Run feature ablation")
