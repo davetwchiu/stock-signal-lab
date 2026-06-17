@@ -1500,6 +1500,37 @@ with research_tab:
                                 )
                             else:
                                 st.dataframe(diagnostics.regime_segmented, width="stretch")
+                            st.write("**ML score regime bucket audit**")
+                            st.caption(
+                                "ML Score is not always a one-way opportunity signal. In high-volatility "
+                                "uptrends, high scores can mark extended setups with more reversal/drawdown "
+                                "risk. This is audit evidence only and does not change production ML Score, "
+                                "action, sizing, ranking, or allocation."
+                            )
+                            if diagnostics.ml_score_regime_bucket_audit.empty:
+                                st.info("No ML score regime bucket audit was available for this sample.")
+                            else:
+                                risk_classes = {
+                                    "overextension_risk",
+                                    "worse_opportunity_outcome",
+                                    "higher_drawdown_reversal_risk",
+                                }
+                                if "classification" in diagnostics.ml_score_regime_bucket_audit:
+                                    classifications = set(
+                                        diagnostics.ml_score_regime_bucket_audit["classification"]
+                                        .dropna()
+                                        .astype(str)
+                                    )
+                                    if classifications & risk_classes:
+                                        st.caption(
+                                            "Current audit read: at least one regime shows extended-setup "
+                                            "or reversal/drawdown-risk evidence. Hold this as audit-only context."
+                                        )
+                                st.dataframe(
+                                    diagnostics.ml_score_regime_bucket_audit,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
                             st.write("**ML reliability gate diagnostics**")
                             st.caption(
                                 "This table tests simple research-only gates that would have discounted ML score "
