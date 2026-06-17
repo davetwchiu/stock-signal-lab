@@ -16,6 +16,7 @@ from src.features.technical import build_technical_features
 from src.features.wavelet import rolling_wavelet_features
 from src.ml.datasets import build_supervised_panel, feature_group_columns
 from src.ml.diagnostics import (
+    build_drawdown_risk_prevalence_baseline_comparison,
     build_feature_family_importance_stability,
     build_feature_importance_production_readiness,
     build_feature_importance_stability,
@@ -264,6 +265,11 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         label_horizon_days=label_horizon,
     )
     validation_fold_stability = build_validation_fold_stability(fold_details)
+    drawdown_risk_prevalence_baseline = build_drawdown_risk_prevalence_baseline_comparison(
+        risk.predictions,
+        supervised,
+        risk.fold_metrics,
+    )
     validation_overfit_warnings = build_validation_overfit_warnings(
         outperformance.predictions,
         baseline_panel=supervised,
@@ -311,6 +317,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "drawdown_risk_calibration": diagnostics.drawdown_risk_calibration,
         "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
         "drawdown_risk_regime_calibration": diagnostics.drawdown_risk_regime_calibration,
+        "drawdown_risk_prevalence_baseline_comparison": drawdown_risk_prevalence_baseline,
         "model_selection_summary": pd.concat(
             [
                 summarize_model_selection(outperformance.fold_metrics, "outperformance"),

@@ -239,6 +239,26 @@ DRAWDOWN_RISK_REGIME_CALIBRATION_COLUMNS = [
     "classification",
 ]
 
+DRAWDOWN_RISK_PREVALENCE_BASELINE_COLUMNS = [
+    "comparator",
+    "sample_count",
+    "ticker_count",
+    "fold_count",
+    "event_prevalence",
+    "mean_predicted_risk",
+    "calibration_gap",
+    "brier_score",
+    "roc_auc",
+    "pr_auc",
+    "bucket_spread",
+    "worst_regime",
+    "worst_fold",
+    "worst_ticker",
+    "fallback_count",
+    "fold_train_prevalence_details",
+    "classification",
+]
+
 TARGET_COMPARISON_COLUMNS = [
     "target_version",
     "target_column",
@@ -859,6 +879,10 @@ def _empty_drawdown_risk_calibration_quality() -> pd.DataFrame:
 
 def _empty_drawdown_risk_regime_calibration() -> pd.DataFrame:
     return pd.DataFrame(columns=DRAWDOWN_RISK_REGIME_CALIBRATION_COLUMNS)
+
+
+def _empty_drawdown_risk_prevalence_baseline_comparison() -> pd.DataFrame:
+    return pd.DataFrame(columns=DRAWDOWN_RISK_PREVALENCE_BASELINE_COLUMNS)
 
 
 def _empty_target_comparison() -> pd.DataFrame:
@@ -2853,6 +2877,246 @@ def build_drawdown_risk_regime_calibration(
     if not rows:
         return _empty_drawdown_risk_regime_calibration()
     return pd.DataFrame(rows, columns=DRAWDOWN_RISK_REGIME_CALIBRATION_COLUMNS)
+
+
+def _metric_worst_group(data: pd.DataFrame, probability_col: str, group_col: str) -> object:
+    if group_col not in data:
+        return pd.NA
+    rows = []
+    for value, group in data.groupby(group_col, dropna=True, sort=True):
+        if group.empty:
+            continue
+        brier = float(((group[probability_col] - group["actual"]) ** 2).mean())
+        rows.append((value, brier))
+    return pd.NA if not rows else max(rows, key=lambda item: item[1])[0]
+
+
+def _drawdown_prevalence_metrics(
+    data: pd.DataFrame,
+    *,
+    comparator: str,
+    probability_col: str,
+    regime_col: str | None,
+    fallback_count: int,
+    fold_details: str,
+    min_bucket_size: int,
+) -> dict[str, object]:
+    roc_auc, pr_auc, brier = _binary_metrics(data, "actual", probability_col)
+    event_prevalence = float(data["actual"].mean()) if not data.empty else pd.NA
+    mean_predicted = float(data[probability_col].mean()) if not data.empty else pd.NA
+    calibration_gap = (
+        float(event_prevalence - mean_predicted)
+        if pd.notna(event_prevalence) and pd.notna(mean_predicted)
+        else pd.NA
+    )
+    bucket_spread, _ = _bucket_metric_spread(
+        data,
+        score_col=probability_col,
+        value_col="actual",
+        min_bucket_size=min_bucket_size,
+    )
+    return {
+        "comparator": comparator,
+        "sample_count": int(len(data)),
+        "ticker_count": int(data["Ticker"].nunique()) if "Ticker" in data else 0,
+        "fold_count": int(data["fold"].nunique()) if "fold" in data else 0,
+        "event_prevalence": event_prevalence,
+        "mean_predicted_risk": mean_predicted,
+        "calibration_gap": calibration_gap,
+        "brier_score": brier,
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "bucket_spread": bucket_spread,
+        "worst_regime": _metric_worst_group(data, probability_col, regime_col) if regime_col else pd.NA,
+        "worst_fold": _metric_worst_group(data, probability_col, "fold"),
+        "worst_ticker": _metric_worst_group(data, probability_col, "Ticker"),
+        "fallback_count": fallback_count,
+        "fold_train_prevalence_details": fold_details,
+        "classification": "insufficient_evidence",
+    }
+
+
+def _prevalence_classification(model: dict[str, object], baseline: dict[str, object]) -> str:
+    values = {
+        name: pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
+        for name, row, column in (
+            ("model_brier", model, "brier_score"),
+            ("baseline_brier", baseline, "brier_score"),
+            ("model_gap", model, "calibration_gap"),
+            ("baseline_gap", baseline, "calibration_gap"),
+            ("model_worst", model, "worst_fold_brier"),
+            ("baseline_worst", baseline, "worst_fold_brier"),
+        )
+    }
+    if any(pd.isna(value) for value in values.values()):
+        return "insufficient_evidence"
+
+    brier_margin = 0.0025
+    gap_margin = 0.025
+    worst_margin = 0.01
+    model_wins = sum(
+        (
+            values["model_brier"] + brier_margin < values["baseline_brier"],
+            abs(values["model_gap"]) + gap_margin < abs(values["baseline_gap"]),
+            values["model_worst"] + worst_margin < values["baseline_worst"],
+        )
+    )
+    baseline_wins = sum(
+        (
+            values["baseline_brier"] + brier_margin < values["model_brier"],
+            abs(values["baseline_gap"]) + gap_margin < abs(values["model_gap"]),
+            values["baseline_worst"] + worst_margin < values["model_worst"],
+        )
+    )
+    if model_wins >= 2 and baseline_wins == 0:
+        return "model_beats_baseline"
+    if baseline_wins >= 2 and model_wins == 0:
+        return "baseline_beats_model"
+    return "baseline_matches_model"
+
+
+def _worst_fold_brier(data: pd.DataFrame, probability_col: str) -> object:
+    if "fold" not in data:
+        return pd.NA
+    values = [
+        float(((group[probability_col] - group["actual"]) ** 2).mean())
+        for _, group in data.groupby("fold", dropna=True)
+        if not group.empty
+    ]
+    return pd.NA if not values else max(values)
+
+
+def build_drawdown_risk_prevalence_baseline_comparison(
+    drawdown_risk_predictions: pd.DataFrame,
+    baseline_panel: pd.DataFrame | None,
+    fold_details: pd.DataFrame,
+    *,
+    label_col: str = "label_drawdown_risk_20d",
+    probability_col: str = "probability",
+    regime_cols: list[str] | None = None,
+    min_regime_train_samples: int = MIN_REGIME_SAMPLE_COUNT,
+    min_regime_train_events: int = MIN_RELIABILITY_CLASS_COUNT,
+    min_bucket_size: int = MIN_REGIME_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Compare OOS drawdown-risk probabilities with train-period prevalence baselines."""
+
+    required_predictions = {"fold", "Date", "Ticker", "actual", probability_col}
+    required_baseline = {"Date", "Ticker", label_col}
+    required_folds = {"fold", "train_start", "train_end"}
+    if (
+        drawdown_risk_predictions.empty
+        or baseline_panel is None
+        or baseline_panel.empty
+        or fold_details.empty
+        or not required_predictions.issubset(drawdown_risk_predictions.columns)
+        or not required_baseline.issubset(baseline_panel.columns)
+        or not required_folds.issubset(fold_details.columns)
+    ):
+        return _empty_drawdown_risk_prevalence_baseline_comparison()
+
+    candidate_regime_cols = list(regime_cols or DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(
+        drawdown_risk_predictions.rename(columns={probability_col: "model_probability"}),
+        baseline_panel,
+        candidate_regime_cols,
+    )
+    regime_col = _first_available_regime_column(data, tuple(candidate_regime_cols))
+    if regime_col and regime_col not in baseline_panel:
+        regime_col = None
+    data = data.rename(columns={"model_probability": probability_col})
+
+    columns = ["fold", "Date", "Ticker", "actual", probability_col]
+    if regime_col:
+        columns.append(regime_col)
+    usable = data[columns].copy()
+    usable["Date"] = pd.to_datetime(usable["Date"])
+    usable["actual"] = pd.to_numeric(usable["actual"], errors="coerce")
+    usable[probability_col] = pd.to_numeric(usable[probability_col], errors="coerce").clip(0.0, 1.0)
+    usable = usable.dropna(subset=["fold", "Date", "Ticker", "actual", probability_col])
+    if usable.empty:
+        return _empty_drawdown_risk_prevalence_baseline_comparison()
+
+    training = baseline_panel.copy()
+    training["Date"] = pd.to_datetime(training["Date"])
+    training[label_col] = pd.to_numeric(training[label_col], errors="coerce")
+    if regime_col and regime_col in training:
+        training[regime_col] = training[regime_col].astype(str).str.strip()
+
+    fold_rows = fold_details.drop_duplicates(subset=["fold"], keep="last").set_index("fold")
+    details: list[str] = []
+    fallback_count = 0
+    scored_frames: list[pd.DataFrame] = []
+    for fold, group in usable.groupby("fold", sort=True):
+        if fold not in fold_rows.index:
+            continue
+        fold_row = fold_rows.loc[fold]
+        train_start = pd.to_datetime(fold_row["train_start"])
+        train_end = pd.to_datetime(fold_row["train_end"])
+        train = training[
+            (training["Date"] >= train_start)
+            & (training["Date"] <= train_end)
+            & training[label_col].notna()
+        ]
+        if train.empty:
+            continue
+        global_prevalence = float(train[label_col].mean())
+        output = group.copy()
+        output["global_fold_prevalence"] = global_prevalence
+        output["regime_fold_prevalence"] = global_prevalence
+        if regime_col:
+            for regime, indexes in output.groupby(regime_col, dropna=False).groups.items():
+                regime_train = train[train[regime_col] == str(regime).strip()]
+                event_count = int((regime_train[label_col] == 1).sum())
+                if len(regime_train) >= min_regime_train_samples and event_count >= min_regime_train_events:
+                    output.loc[indexes, "regime_fold_prevalence"] = float(regime_train[label_col].mean())
+                else:
+                    fallback_count += len(indexes)
+        details.append(f"{int(fold)}:{len(train)}:{global_prevalence:.6f}")
+        scored_frames.append(output)
+    if not scored_frames:
+        return _empty_drawdown_risk_prevalence_baseline_comparison()
+
+    scored = pd.concat(scored_frames, ignore_index=True)
+    fold_detail_text = ";".join(details)
+    metric_inputs = [
+        ("model_predicted_risk", probability_col, 0),
+        ("global_fold_prevalence_baseline", "global_fold_prevalence", 0),
+        ("regime_fold_prevalence_baseline", "regime_fold_prevalence", fallback_count),
+    ]
+    rows = [
+        _drawdown_prevalence_metrics(
+            scored,
+            comparator=comparator,
+            probability_col=column,
+            regime_col=regime_col,
+            fallback_count=fallbacks,
+            fold_details=fold_detail_text,
+            min_bucket_size=min_bucket_size,
+        )
+        for comparator, column, fallbacks in metric_inputs
+    ]
+    by_name = {row["comparator"]: row for row in rows}
+    for comparator, column, _ in metric_inputs:
+        by_name[comparator]["worst_fold_brier"] = _worst_fold_brier(scored, column)
+
+    model_row = by_name["model_predicted_risk"]
+    baseline_classes = [
+        _prevalence_classification(model_row, by_name["global_fold_prevalence_baseline"]),
+        _prevalence_classification(model_row, by_name["regime_fold_prevalence_baseline"]),
+    ]
+    if "baseline_beats_model" in baseline_classes:
+        model_row["classification"] = "baseline_beats_model"
+    elif all(value == "model_beats_baseline" for value in baseline_classes):
+        model_row["classification"] = "model_beats_baseline"
+    elif "insufficient_evidence" in baseline_classes:
+        model_row["classification"] = "insufficient_evidence"
+    else:
+        model_row["classification"] = "baseline_matches_model"
+    by_name["global_fold_prevalence_baseline"]["classification"] = baseline_classes[0]
+    by_name["regime_fold_prevalence_baseline"]["classification"] = baseline_classes[1]
+    for row in rows:
+        row.pop("worst_fold_brier", None)
+    return pd.DataFrame(rows, columns=DRAWDOWN_RISK_PREVALENCE_BASELINE_COLUMNS)
 
 
 def _comparison_direction(spread: object) -> str:
