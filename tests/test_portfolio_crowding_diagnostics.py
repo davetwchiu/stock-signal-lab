@@ -125,3 +125,5 @@ def test_codex_handoff_summarizes_portfolio_crowding() -> None:
 
     assert "Correlation crowding: moderate_crowding" in handoff
     assert "Factor proxy rows=1: watch=1." in handoff
+    assert "Risk-visibility only, not alpha" in handoff
+    assert "one large bet" in handoff
