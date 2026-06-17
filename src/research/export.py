@@ -223,6 +223,7 @@ def build_codex_handoff(
     diagnostics_summary = _frame(tables.get("ml_diagnostics_summary"))
     ml_reliability = _frame(tables.get("ml_reliability_by_regime"))
     ml_reliability_gate = _frame(tables.get("ml_reliability_gate_diagnostics"))
+    momentum_quality = _frame(tables.get("momentum_quality_diagnostics"))
     earnings_pead = _frame(tables.get("earnings_pead_summary"))
     drawdown_quality = _frame(tables.get("drawdown_risk_calibration_quality"))
     feature_audit = _frame(tables.get("feature_audit_summary"))
@@ -262,6 +263,9 @@ def build_codex_handoff(
         "",
         "## ML reliability gate diagnostics",
         _ml_reliability_gate_evidence(ml_reliability_gate),
+        "",
+        "## Momentum quality diagnostics",
+        _momentum_quality_evidence(momentum_quality),
         "",
         "## Earnings / PEAD diagnostics",
         _earnings_pead_evidence(earnings_pead),
@@ -466,6 +470,34 @@ def _ml_reliability_gate_evidence(gate_diagnostics: pd.DataFrame) -> str:
         "Research-only reliability gates were tested without changing production scoring. "
         f"Exported {len(gate_diagnostics)} gate rows"
         + (f": {count_text}." if count_text else ".")
+    )
+
+
+def _momentum_quality_evidence(momentum_quality: pd.DataFrame) -> str:
+    if momentum_quality.empty:
+        return "No momentum quality diagnostics table was exported."
+    if "classification" not in momentum_quality:
+        return (
+            "Research-only momentum quality diagnostics were exported. "
+            "These do not change production scoring."
+        )
+
+    counts = momentum_quality["classification"].astype(str).value_counts().sort_index()
+    count_text = ", ".join(f"{classification}={count}" for classification, count in counts.items())
+    overall = (
+        momentum_quality[momentum_quality["ticker"].astype(str) == "ALL"]
+        if "ticker" in momentum_quality
+        else pd.DataFrame()
+    )
+    bucket_spread = (
+        _display(overall["bucket_spread"].dropna().iloc[0])
+        if not overall.empty and "bucket_spread" in overall and overall["bucket_spread"].notna().any()
+        else "Unavailable"
+    )
+    return (
+        "Research-only momentum quality diagnostics checked steady, broad-based momentum versus fragile momentum. "
+        f"Overall bucket spread: {bucket_spread}"
+        + (f"; classifications: {count_text}." if count_text else ".")
     )
 
 
