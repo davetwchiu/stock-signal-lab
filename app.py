@@ -41,6 +41,9 @@ from src.ml.diagnostics import (
     build_ml_feature_audit,
     build_ml_feature_signal_diagnostics,
     build_ml_label_audit,
+    build_validation_fold_stability,
+    build_validation_leakage_diagnostics,
+    build_validation_overfit_warnings,
     interpret_ml_probability_direction_check,
     interpret_ml_score_formula_candidate_comparison,
     interpret_opportunity_risk_joint_validation,
@@ -1080,6 +1083,24 @@ with research_tab:
                                 tail_risk_predictions=tail_risk_result.predictions,
                                 earnings_events=load_earnings_events(),
                             )
+                            validation_fold_details = fold_details_for_export(
+                                outperformance=result.fold_metrics,
+                                drawdown_risk=risk_result.fold_metrics,
+                                risk_adjusted_outperform=risk_adjusted_result.fold_metrics,
+                                tail_risk_adjusted_outperform=tail_risk_result.fold_metrics,
+                            )
+                            validation_leakage = build_validation_leakage_diagnostics(
+                                validation_fold_details,
+                                label_horizon_days=int(config.default_label_horizon),
+                            )
+                            validation_fold_stability = build_validation_fold_stability(
+                                validation_fold_details
+                            )
+                            validation_overfit_warnings = build_validation_overfit_warnings(
+                                result.predictions,
+                                baseline_panel=supervised,
+                                universe=",".join(tickers),
+                            )
                             show_research_lab_run_interpretation(
                                 interpret_research_lab_run(
                                     diagnostics.summary,
@@ -1397,6 +1418,35 @@ with research_tab:
                                 st.dataframe(diagnostics.ml_reliability_gate_diagnostics, width="stretch")
                             if not diagnostics.ml_reliability_gate_by_regime.empty:
                                 st.dataframe(diagnostics.ml_reliability_gate_by_regime, width="stretch")
+                            st.write("**Validation leakage / overfit diagnostics**")
+                            st.caption(
+                                "Research-only checks for fold gaps, fold instability, and thin or concentrated "
+                                "validation evidence. These do not change production scoring, labels, ranking, or sizing."
+                            )
+                            if validation_leakage.empty:
+                                st.info("No validation leakage diagnostics were available for this sample.")
+                            else:
+                                st.dataframe(
+                                    validation_leakage,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                            if validation_fold_stability.empty:
+                                st.info("No validation fold stability diagnostics were available for this sample.")
+                            else:
+                                st.dataframe(
+                                    validation_fold_stability,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
+                            if validation_overfit_warnings.empty:
+                                st.info("No validation overfit warnings were available for this sample.")
+                            else:
+                                st.dataframe(
+                                    validation_overfit_warnings,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
                             st.write("**Earnings / PEAD diagnostics**")
                             st.caption(
                                 "This table checks whether earnings windows or post-earnings drift explain "
@@ -1464,18 +1514,16 @@ with research_tab:
                                 "momentum_quality_diagnostics": diagnostics.momentum_quality_diagnostics,
                                 "momentum_quality_by_regime": diagnostics.momentum_quality_by_regime,
                                 "momentum_quality_feature_summary": diagnostics.momentum_quality_feature_summary,
+                                "validation_leakage_diagnostics": validation_leakage,
+                                "validation_fold_stability": validation_fold_stability,
+                                "validation_overfit_warnings": validation_overfit_warnings,
                                 "earnings_event_diagnostics": diagnostics.earnings_event_diagnostics,
                                 "ml_score_by_earnings_window": diagnostics.ml_score_by_earnings_window,
                                 "earnings_pead_summary": diagnostics.earnings_pead_summary,
                                 "drawdown_risk_calibration": diagnostics.drawdown_risk_calibration,
                                 "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
                                 "model_selection_summary": combined_selection_summary,
-                                "model_selection_fold_details": fold_details_for_export(
-                                    outperformance=result.fold_metrics,
-                                    drawdown_risk=risk_result.fold_metrics,
-                                    risk_adjusted_outperform=risk_adjusted_result.fold_metrics,
-                                    tail_risk_adjusted_outperform=tail_risk_result.fold_metrics,
-                                ),
+                                "model_selection_fold_details": validation_fold_details,
                                 "feature_group_comparison": comparison,
                                 "feature_audit_summary": feature_audit.inventory_summary,
                                 "feature_family_summary": feature_audit.family_summary,
