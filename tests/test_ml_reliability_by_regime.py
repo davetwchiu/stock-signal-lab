@@ -3,7 +3,11 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from src.ml.diagnostics import build_ml_reliability_by_regime, build_ml_score_regime_bucket_audit
+from src.ml.diagnostics import (
+    build_drawdown_risk_regime_calibration,
+    build_ml_reliability_by_regime,
+    build_ml_score_regime_bucket_audit,
+)
 from src.research.export import export_research_lab_diagnostics
 
 
@@ -50,6 +54,79 @@ def reliability_panel(
 
 def reliability_by_regime(table: pd.DataFrame) -> pd.DataFrame:
     return table.set_index("regime")
+
+
+def risk_calibration_panel(rows_per_bucket: int = 10) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows: list[dict[str, object]] = []
+    baseline_rows: list[dict[str, object]] = []
+    dates = pd.date_range("2024-01-01", periods=rows_per_bucket * 3, freq="B")
+    row_index = 0
+    for bucket, ticker, probability in (
+        ("low", "LOW", 0.10),
+        ("mid", "MID", 0.50),
+        ("high", "HIGH", 0.90),
+    ):
+        for bucket_index in range(rows_per_bucket):
+            actual_risk = int(bucket == "high" or (bucket == "mid" and bucket_index % 2 == 0))
+            date = dates[row_index]
+            rows.append(
+                {
+                    "Date": date,
+                    "Ticker": ticker,
+                    "fold": 1 + (row_index % 3),
+                    "probability_risk": probability,
+                    "actual_risk": actual_risk,
+                }
+            )
+            baseline_rows.append({"Date": date, "Ticker": ticker, "regime": "Uptrend / low volatility"})
+            row_index += 1
+    return pd.DataFrame(rows), pd.DataFrame(baseline_rows)
+
+
+def test_drawdown_risk_regime_calibration_classifies_usable_signal() -> None:
+    panel, baseline = risk_calibration_panel()
+
+    diagnostics = build_drawdown_risk_regime_calibration(
+        panel,
+        baseline_panel=baseline,
+        min_samples=10,
+        min_class_count=3,
+        min_bucket_size=3,
+    ).set_index("regime")
+
+    row = diagnostics.loc["Uptrend / low volatility"]
+    assert row["sample_count"] == 30
+    assert row["ticker_count"] == 3
+    assert row["fold_count"] == 3
+    assert row["event_prevalence"] == pytest.approx(0.5)
+    assert row["calibration_gap"] == pytest.approx(0.0)
+    assert row["pr_auc"] > row["event_prevalence"]
+    assert row["bucket_spread"] == pytest.approx(1.0)
+    assert row["monotonicity"] == "aligned"
+    assert row["worst_ticker"] == "MID"
+    assert row["classification"] == "usable_risk_signal"
+
+
+def test_drawdown_risk_regime_calibration_export_writes_csv(tmp_path) -> None:
+    panel, baseline = risk_calibration_panel()
+    table = build_drawdown_risk_regime_calibration(
+        panel,
+        baseline_panel=baseline,
+        min_samples=10,
+        min_class_count=3,
+        min_bucket_size=3,
+    )
+
+    result = export_research_lab_diagnostics(
+        run_metadata={"created_at": "2026-06-17T10:13:30", "ticker_count": 3},
+        tables={"drawdown_risk_regime_calibration": table},
+        output_root=tmp_path,
+        run_id="run",
+    )
+
+    exported = pd.read_csv(result.run_dir / "drawdown_risk_regime_calibration.csv")
+    assert "classification" in exported.columns
+    assert result.manifest["row_counts"]["drawdown_risk_regime_calibration.csv"] == len(table)
 
 
 def test_ml_reliability_by_regime_classifies_reliable_regime() -> None:

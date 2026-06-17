@@ -310,6 +310,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "earnings_pead_summary": diagnostics.earnings_pead_summary,
         "drawdown_risk_calibration": diagnostics.drawdown_risk_calibration,
         "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
+        "drawdown_risk_regime_calibration": diagnostics.drawdown_risk_regime_calibration,
         "model_selection_summary": pd.concat(
             [
                 summarize_model_selection(outperformance.fold_metrics, "outperformance"),

@@ -219,6 +219,26 @@ DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS = [
     "interpretation",
 ]
 
+DRAWDOWN_RISK_REGIME_CALIBRATION_COLUMNS = [
+    "regime",
+    "sample_count",
+    "ticker_count",
+    "fold_count",
+    "event_prevalence",
+    "mean_predicted_risk",
+    "observed_risk_rate",
+    "calibration_gap",
+    "brier_score",
+    "pr_auc",
+    "low_bucket_event_rate",
+    "mid_bucket_event_rate",
+    "high_bucket_event_rate",
+    "bucket_spread",
+    "monotonicity",
+    "worst_ticker",
+    "classification",
+]
+
 TARGET_COMPARISON_COLUMNS = [
     "target_version",
     "target_column",
@@ -665,6 +685,7 @@ class MLDiagnostics:
     momentum_quality_diagnostics: pd.DataFrame
     momentum_quality_by_regime: pd.DataFrame
     momentum_quality_feature_summary: pd.DataFrame
+    drawdown_risk_regime_calibration: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -834,6 +855,10 @@ def _empty_regime_score_direction_summary() -> pd.DataFrame:
 
 def _empty_drawdown_risk_calibration_quality() -> pd.DataFrame:
     return pd.DataFrame(columns=DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS)
+
+
+def _empty_drawdown_risk_regime_calibration() -> pd.DataFrame:
+    return pd.DataFrame(columns=DRAWDOWN_RISK_REGIME_CALIBRATION_COLUMNS)
 
 
 def _empty_target_comparison() -> pd.DataFrame:
@@ -2628,6 +2653,206 @@ def build_drawdown_risk_calibration_quality(
         ],
         columns=DRAWDOWN_RISK_CALIBRATION_QUALITY_COLUMNS,
     )
+
+
+def _risk_bucket_event_rates(
+    data: pd.DataFrame,
+    *,
+    probability_col: str,
+    label_col: str,
+) -> tuple[dict[str, object], dict[str, int]]:
+    bucketed = data[[probability_col, label_col]].copy()
+    bucketed["risk_bucket"] = pd.cut(
+        bucketed[probability_col],
+        bins=[-float("inf"), 1 / 3, 2 / 3, float("inf")],
+        labels=["low", "mid", "high"],
+    )
+    rates: dict[str, object] = {}
+    counts: dict[str, int] = {}
+    for bucket in ("low", "mid", "high"):
+        group = bucketed[bucketed["risk_bucket"] == bucket]
+        counts[bucket] = int(len(group))
+        rates[bucket] = pd.NA if group.empty else float(group[label_col].mean())
+    return rates, counts
+
+
+def _worst_risk_ticker(
+    data: pd.DataFrame,
+    *,
+    probability_col: str,
+    label_col: str,
+    min_samples: int,
+) -> object:
+    if "Ticker" not in data:
+        return pd.NA
+    rows: list[dict[str, object]] = []
+    for ticker, group in data.groupby("Ticker", sort=True):
+        if len(group) < min_samples:
+            continue
+        brier = float(((group[probability_col] - group[label_col]) ** 2).mean())
+        rows.append({"ticker": str(ticker), "brier": brier})
+    if not rows:
+        return pd.NA
+    return max(rows, key=lambda row: row["brier"])["ticker"]
+
+
+def _drawdown_regime_classification(
+    *,
+    sample_count: int,
+    event_count: int,
+    non_event_count: int,
+    prevalence: object,
+    calibration_gap: object,
+    brier: object,
+    pr_auc: object,
+    bucket_spread: object,
+    monotonicity: str,
+    low_bucket_count: int,
+    high_bucket_count: int,
+    min_samples: int,
+    min_class_count: int,
+    min_bucket_size: int,
+) -> str:
+    insufficient = (
+        sample_count < min_samples
+        or event_count < min_class_count
+        or non_event_count < min_class_count
+        or low_bucket_count < min_bucket_size
+        or high_bucket_count < min_bucket_size
+        or pd.isna(pr_auc)
+        or pd.isna(bucket_spread)
+    )
+    if insufficient:
+        return "insufficient_evidence"
+    if monotonicity == "inverted" or float(bucket_spread) < -SPREAD_SIMILARITY_TOLERANCE:
+        return "inverted"
+    useful = (
+        monotonicity == "aligned"
+        and float(bucket_spread) > SPREAD_SIMILARITY_TOLERANCE
+        and pd.notna(prevalence)
+        and pd.notna(pr_auc)
+        and float(pr_auc) > float(prevalence) + RELIABILITY_WEAK_PR_MARGIN
+        and pd.notna(calibration_gap)
+        and abs(float(calibration_gap)) <= RELIABILITY_DRAWDOWN_GAP_LIMIT
+        and pd.notna(brier)
+        and float(brier) <= RELIABILITY_DRAWDOWN_BRIER_LIMIT
+    )
+    return "usable_risk_signal" if useful else "miscalibrated"
+
+
+def build_drawdown_risk_regime_calibration(
+    score_panel: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    regime_cols: list[str] | None = None,
+    probability_col: str = "probability_risk",
+    label_col: str = "actual_risk",
+    min_samples: int = MIN_REGIME_SAMPLE_COUNT,
+    min_class_count: int = MIN_RELIABILITY_CLASS_COUNT,
+    min_bucket_size: int = MIN_REGIME_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Evaluate drawdown-risk probability calibration by regime."""
+
+    if score_panel.empty:
+        return _empty_drawdown_risk_regime_calibration()
+
+    candidate_regime_cols = list(regime_cols or DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(score_panel, baseline_panel, candidate_regime_cols)
+    if probability_col not in data or label_col not in data:
+        return _empty_drawdown_risk_regime_calibration()
+
+    regime_col = _first_available_regime_column(data, tuple(candidate_regime_cols))
+    if regime_col is None:
+        return _empty_drawdown_risk_regime_calibration()
+
+    columns = [regime_col, probability_col, label_col]
+    for optional in ("Date", "Ticker", "fold"):
+        if optional in data:
+            columns.append(optional)
+    usable = data[columns].copy()
+    usable[regime_col] = usable[regime_col].astype(str).str.strip()
+    usable = usable[usable[regime_col] != ""]
+    usable[probability_col] = pd.to_numeric(usable[probability_col], errors="coerce").clip(0.0, 1.0)
+    usable[label_col] = pd.to_numeric(usable[label_col], errors="coerce")
+    usable = usable.dropna(subset=[regime_col, probability_col, label_col])
+    if usable.empty:
+        return _empty_drawdown_risk_regime_calibration()
+
+    rows: list[dict[str, object]] = []
+    for regime, group in usable.groupby(regime_col, sort=True):
+        sample_count = int(len(group))
+        event_prevalence = float(group[label_col].mean()) if sample_count else pd.NA
+        mean_predicted = float(group[probability_col].mean()) if sample_count else pd.NA
+        calibration_gap = float(event_prevalence - mean_predicted) if sample_count else pd.NA
+        brier = float(((group[probability_col] - group[label_col]) ** 2).mean()) if sample_count else pd.NA
+        pr_auc = (
+            float(average_precision_score(group[label_col].astype(int), group[probability_col]))
+            if group[label_col].nunique() >= 2
+            else pd.NA
+        )
+        rates, bucket_counts = _risk_bucket_event_rates(
+            group,
+            probability_col=probability_col,
+            label_col=label_col,
+        )
+        bucket_values = [rates["low"], rates["mid"], rates["high"]]
+        monotonicity = (
+            _monotonicity_result([float(value) for value in bucket_values])
+            if all(pd.notna(value) for value in bucket_values)
+            else "insufficient"
+        )
+        bucket_spread = (
+            float(rates["high"] - rates["low"])
+            if pd.notna(rates["low"]) and pd.notna(rates["high"])
+            else pd.NA
+        )
+        event_count = int((group[label_col] == 1).sum())
+        classification = _drawdown_regime_classification(
+            sample_count=sample_count,
+            event_count=event_count,
+            non_event_count=sample_count - event_count,
+            prevalence=event_prevalence,
+            calibration_gap=calibration_gap,
+            brier=brier,
+            pr_auc=pr_auc,
+            bucket_spread=bucket_spread,
+            monotonicity=monotonicity,
+            low_bucket_count=bucket_counts["low"],
+            high_bucket_count=bucket_counts["high"],
+            min_samples=min_samples,
+            min_class_count=min_class_count,
+            min_bucket_size=min_bucket_size,
+        )
+        rows.append(
+            {
+                "regime": regime,
+                "sample_count": sample_count,
+                "ticker_count": int(group["Ticker"].nunique()) if "Ticker" in group else 0,
+                "fold_count": int(group["fold"].nunique()) if "fold" in group else 0,
+                "event_prevalence": event_prevalence,
+                "mean_predicted_risk": mean_predicted,
+                "observed_risk_rate": event_prevalence,
+                "calibration_gap": calibration_gap,
+                "brier_score": brier,
+                "pr_auc": pr_auc,
+                "low_bucket_event_rate": rates["low"],
+                "mid_bucket_event_rate": rates["mid"],
+                "high_bucket_event_rate": rates["high"],
+                "bucket_spread": bucket_spread,
+                "monotonicity": monotonicity,
+                "worst_ticker": _worst_risk_ticker(
+                    group,
+                    probability_col=probability_col,
+                    label_col=label_col,
+                    min_samples=min_bucket_size,
+                ),
+                "classification": classification,
+            }
+        )
+
+    if not rows:
+        return _empty_drawdown_risk_regime_calibration()
+    return pd.DataFrame(rows, columns=DRAWDOWN_RISK_REGIME_CALIBRATION_COLUMNS)
 
 
 def _comparison_direction(spread: object) -> str:
@@ -6652,6 +6877,7 @@ def build_ml_diagnostics(
             _empty_momentum_quality_diagnostics(),
             _empty_momentum_quality_by_regime(),
             _empty_momentum_quality_feature_summary(),
+            _empty_drawdown_risk_regime_calibration(),
         )
 
     keys = prediction_merge_keys(out, risk)
@@ -6711,6 +6937,10 @@ def build_ml_diagnostics(
         risk_calibration,
         drawdown_risk_predictions,
     )
+    risk_regime_calibration = build_drawdown_risk_regime_calibration(
+        score_panel,
+        baseline_panel=baseline_panel,
+    )
     summary = pd.DataFrame(
         [
             _overall_summary(outperformance_predictions, outperformance_metrics, "outperformance"),
@@ -6743,4 +6973,5 @@ def build_ml_diagnostics(
         momentum_quality_diagnostics,
         momentum_quality_by_regime,
         momentum_quality_feature_summary,
+        risk_regime_calibration,
     )
