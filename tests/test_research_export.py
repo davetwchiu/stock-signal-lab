@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.research.export import (
+    build_research_evidence_summary,
     build_research_lab_export_payload,
     export_research_lab_diagnostics,
     export_research_lab_payload,
@@ -159,6 +160,88 @@ def test_codex_handoff_contains_required_sections(tmp_path: Path) -> None:
     assert "## How Codex should use this bundle" in handoff
     assert "no production target switch is supported" in handoff
     assert "## Codex instructions for next iteration" in handoff
+
+
+def test_research_evidence_summary_plainly_surfaces_negative_and_missing_evidence() -> None:
+    summary = build_research_evidence_summary(
+        {
+            "ml_reliability_by_regime": pd.DataFrame({"classification": ["mixed", "inverted"]}),
+            "ml_reliability_gate_diagnostics": pd.DataFrame({"classification": ["harmful"]}),
+            "momentum_quality_diagnostics": pd.DataFrame({"classification": ["useful", "harmful"]}),
+            "earnings_pead_summary": pd.DataFrame(
+                {
+                    "classification": ["unavailable"],
+                    "pead_signal_direction": ["unavailable"],
+                    "ml_near_earnings_effect": ["unavailable"],
+                }
+            ),
+            "validation_leakage_diagnostics": pd.DataFrame({"classification": ["watch"]}),
+            "validation_fold_stability": pd.DataFrame({"classification": ["mixed"]}),
+            "validation_overfit_warnings": pd.DataFrame({"classification": ["low_risk"]}),
+            "portfolio_crowding_summary": pd.DataFrame(
+                {"classification": ["moderate_crowding"], "high_overlap_pair_count": [2], "largest_cluster_size": [3]}
+            ),
+            "portfolio_factor_crowding_summary": pd.DataFrame({"classification": ["crowded"]}),
+            "feature_importance_production_readiness": pd.DataFrame(
+                {"classification": ["watch"], "reason": ["Some stable features exist."]}
+            ),
+        }
+    )
+
+    indexed = summary.set_index("area")
+    assert list(summary.columns) == [
+        "area",
+        "latest_classification",
+        "evidence_strength",
+        "production_readiness",
+        "key_reason",
+        "recommended_next_action",
+    ]
+    assert indexed.loc["ML reliability by regime", "latest_classification"] == "inverted"
+    assert indexed.loc["Momentum quality", "evidence_strength"] == "harmful"
+    assert indexed.loc["Earnings / PEAD", "production_readiness"] == "unavailable"
+    assert indexed.loc["Portfolio crowding", "latest_classification"] == "crowded"
+    assert indexed.loc["Overall production readiness", "production_readiness"] == "not_ready"
+    assert "No current diagnostic gives stable enough evidence" in indexed.loc[
+        "Overall production readiness", "key_reason"
+    ]
+
+
+def test_research_evidence_summary_handles_missing_diagnostics() -> None:
+    summary = build_research_evidence_summary({})
+
+    indexed = summary.set_index("area")
+    assert indexed.loc["ML reliability gate", "latest_classification"] == "unavailable"
+    assert indexed.loc["Feature importance stability", "production_readiness"] == "unavailable"
+    assert indexed.loc["Overall production readiness", "production_readiness"] == "not_ready"
+
+
+def test_export_includes_research_evidence_summary_csv(tmp_path: Path) -> None:
+    result = export_research_lab_diagnostics(
+        run_metadata=metadata(),
+        tables={"ml_reliability_gate_diagnostics": pd.DataFrame({"classification": ["harmful"]})},
+        output_root=tmp_path,
+        run_id="run",
+    )
+
+    exported = pd.read_csv(result.run_dir / "research_evidence_summary.csv")
+    assert "research_evidence_summary.csv" in result.manifest["files_written"]
+    assert result.manifest["row_counts"]["research_evidence_summary.csv"] == len(exported)
+    assert exported.loc[exported["area"].eq("ML reliability gate"), "evidence_strength"].iloc[0] == "harmful"
+
+
+def test_app_facing_payload_adds_research_only_summary_without_production_inputs() -> None:
+    payload = build_research_lab_export_payload(
+        run_metadata=metadata(),
+        tables={"ml_reliability_gate_diagnostics": pd.DataFrame({"classification": ["mixed"]})},
+    )
+
+    summary = payload["tables"]["research_evidence_summary"]
+    assert isinstance(summary, pd.DataFrame)
+    assert summary.loc[summary["area"].eq("Overall production readiness"), "production_readiness"].iloc[0] == "not_ready"
+    assert "scoring, action, sizing, ranking, or allocation changes" in summary.loc[
+        summary["area"].eq("Overall production readiness"), "key_reason"
+    ].iloc[0]
 
 
 def test_export_does_not_mutate_input_dataframes(tmp_path: Path) -> None:

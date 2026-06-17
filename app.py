@@ -85,6 +85,7 @@ from src.portfolio.allocation import AllocationConfig
 from src.portfolio.risk import RiskControlConfig
 from src.portfolio.simulator import simulate_portfolio
 from src.research.export import (
+    build_research_evidence_summary,
     build_research_lab_export_payload,
     export_research_lab_payload,
     zip_research_bundle,
@@ -800,6 +801,39 @@ with explain_tab:
 with research_tab:
     st.subheader("Research Lab")
     st.caption("Advanced diagnostics and parameter-heavy testing live here.")
+
+    with st.expander("Research evidence summary", expanded=True):
+        st.caption(
+            "Plain-language research-only synthesis. It does not change production scoring, "
+            "actions, sizing, ranking, allocation, saved portfolios, benchmark, or cache."
+        )
+        research_summary = pd.DataFrame()
+        research_export_payload = st.session_state.get("research_lab_export_payload")
+        if isinstance(research_export_payload, dict) and isinstance(research_export_payload.get("tables"), dict):
+            summary_table = research_export_payload["tables"].get("research_evidence_summary")
+            research_summary = (
+                summary_table
+                if isinstance(summary_table, pd.DataFrame)
+                else build_research_evidence_summary(research_export_payload["tables"])
+            )
+        else:
+            latest_summary_path = RESEARCH_RUNS_DIR / "latest" / "research_evidence_summary.csv"
+            if latest_summary_path.exists():
+                try:
+                    research_summary = pd.read_csv(latest_summary_path)
+                except Exception:
+                    research_summary = pd.DataFrame()
+        if research_summary.empty:
+            st.info("No research evidence summary is available yet. Run ML diagnostics or export a Research Lab bundle.")
+        else:
+            st.dataframe(research_summary, width="stretch", hide_index=True)
+            st.download_button(
+                "Download evidence summary CSV",
+                dataframe_to_csv(research_summary),
+                file_name="research_evidence_summary.csv",
+                mime="text/csv",
+                key="download_research_evidence_summary_csv",
+            )
 
     with st.expander("Market overview and rule-based baseline", expanded=False):
         st.dataframe(overview_table(feature_frames), width="stretch")
