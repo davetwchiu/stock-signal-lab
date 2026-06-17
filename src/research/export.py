@@ -233,6 +233,7 @@ def build_codex_handoff(
     drawdown_quality = _frame(tables.get("drawdown_risk_calibration_quality"))
     feature_audit = _frame(tables.get("feature_audit_summary"))
     redundancy = _frame(tables.get("feature_redundancy_selection"))
+    importance_stability = _frame(tables.get("feature_importance_stability"))
 
     lines = [
         "# Stock Signal Lab Research Run Handoff",
@@ -291,7 +292,7 @@ def build_codex_handoff(
         _drawdown_evidence(drawdown_quality, _frame(tables.get("drawdown_risk_calibration"))),
         "",
         "## Feature diagnostics",
-        _feature_diagnostics(feature_audit, redundancy),
+        _feature_diagnostics(feature_audit, redundancy, importance_stability),
         "",
         "## Suggested next engineering direction",
         _suggested_next_direction(target_quality, notes),
@@ -618,15 +619,23 @@ def _drawdown_evidence(drawdown_quality: pd.DataFrame, drawdown_calibration: pd.
     return f"Drawdown-risk calibration buckets were exported with {len(drawdown_calibration)} rows for review."
 
 
-def _feature_diagnostics(feature_audit: pd.DataFrame, redundancy: pd.DataFrame) -> str:
+def _feature_diagnostics(
+    feature_audit: pd.DataFrame,
+    redundancy: pd.DataFrame,
+    importance_stability: pd.DataFrame,
+) -> str:
     parts: list[str] = []
     if not feature_audit.empty:
         parts.append(f"feature audit summary rows={len(feature_audit)}")
     if not redundancy.empty:
         parts.append(f"redundancy selection rows={len(redundancy)}")
+    if not importance_stability.empty:
+        counts = importance_stability["classification"].value_counts().to_dict()
+        count_text = ", ".join(f"{key}={value}" for key, value in counts.items())
+        parts.append(f"importance stability rows={len(importance_stability)} ({count_text})")
     if parts:
         return "Exported feature diagnostics include " + ", ".join(parts) + "."
-    return "No feature audit or redundancy diagnostics were exported."
+    return "No feature audit, redundancy, or importance-stability diagnostics were exported."
 
 
 def _suggested_next_direction(target_quality: pd.DataFrame, notes: Mapping[str, str]) -> str:

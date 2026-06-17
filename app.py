@@ -37,6 +37,9 @@ from src.ml.diagnostics import (
     MLFeatureAudit,
     MLFeatureSignalDiagnostics,
     MLLabelAudit,
+    build_feature_family_importance_stability,
+    build_feature_importance_production_readiness,
+    build_feature_importance_stability,
     build_ml_diagnostics,
     build_ml_feature_audit,
     build_ml_feature_signal_diagnostics,
@@ -1120,6 +1123,19 @@ with research_tab:
                             validation_fold_stability = build_validation_fold_stability(
                                 validation_fold_details
                             )
+                            fold_importance = fold_details_for_export(
+                                outperformance=result.fold_feature_importance,
+                                drawdown_risk=risk_result.fold_feature_importance,
+                                risk_adjusted_outperform=risk_adjusted_result.fold_feature_importance,
+                                tail_risk_adjusted_outperform=tail_risk_result.fold_feature_importance,
+                            )
+                            feature_importance_stability = build_feature_importance_stability(fold_importance)
+                            feature_family_importance_stability = build_feature_family_importance_stability(
+                                fold_importance
+                            )
+                            feature_importance_production_readiness = (
+                                build_feature_importance_production_readiness(feature_importance_stability)
+                            )
                             validation_overfit_warnings = build_validation_overfit_warnings(
                                 result.predictions,
                                 baseline_panel=supervised,
@@ -1471,6 +1487,14 @@ with research_tab:
                                     width="stretch",
                                     hide_index=True,
                                 )
+                            st.write("**Feature importance stability diagnostics**")
+                            st.caption(
+                                "Research-only check of whether model-native feature importance repeats across folds. "
+                                "This does not change production scoring, labels, ranking, or sizing."
+                            )
+                            st.dataframe(feature_importance_stability, width="stretch", hide_index=True)
+                            st.dataframe(feature_family_importance_stability, width="stretch", hide_index=True)
+                            st.dataframe(feature_importance_production_readiness, width="stretch", hide_index=True)
                             st.write("**Earnings / PEAD diagnostics**")
                             st.caption(
                                 "This table checks whether earnings windows or post-earnings drift explain "
@@ -1558,6 +1582,9 @@ with research_tab:
                                 "feature_redundancy_selection": feature_audit.redundancy_selection_summary,
                                 "feature_redundancy_dropped_features": feature_audit.redundancy_selection_report,
                                 "feature_signal_summary": feature_signal_diagnostics.signal_table,
+                                "feature_importance_stability": feature_importance_stability,
+                                "feature_family_importance_stability": feature_family_importance_stability,
+                                "feature_importance_production_readiness": feature_importance_production_readiness,
                                 "regime_segmented_ml_diagnostics": diagnostics.regime_segmented,
                                 "target_candidate_definitions": target_definitions,
                                 "target_balance": target_balance,
