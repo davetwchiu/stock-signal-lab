@@ -16,6 +16,9 @@ from src.features.technical import build_technical_features
 from src.features.wavelet import rolling_wavelet_features
 from src.ml.datasets import build_supervised_panel, feature_group_columns
 from src.ml.diagnostics import (
+    build_feature_family_importance_stability,
+    build_feature_importance_production_readiness,
+    build_feature_importance_stability,
     build_ml_diagnostics,
     build_ml_feature_audit,
     build_ml_feature_signal_diagnostics,
@@ -239,6 +242,17 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         risk_adjusted_outperform=risk_adjusted.fold_metrics,
         tail_risk_adjusted_outperform=tail_risk.fold_metrics,
     )
+    fold_importance = fold_details_for_export(
+        outperformance=outperformance.fold_feature_importance,
+        drawdown_risk=risk.fold_feature_importance,
+        risk_adjusted_outperform=risk_adjusted.fold_feature_importance,
+        tail_risk_adjusted_outperform=tail_risk.fold_feature_importance,
+    )
+    feature_importance_stability = build_feature_importance_stability(fold_importance)
+    feature_family_importance_stability = build_feature_family_importance_stability(fold_importance)
+    feature_importance_production_readiness = build_feature_importance_production_readiness(
+        feature_importance_stability
+    )
     validation_leakage = build_validation_leakage_diagnostics(
         fold_details,
         label_horizon_days=label_horizon,
@@ -303,6 +317,9 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "feature_redundancy_selection": feature_audit.redundancy_selection_summary,
         "feature_redundancy_dropped_features": feature_audit.redundancy_selection_report,
         "feature_signal_summary": feature_signal.signal_table,
+        "feature_importance_stability": feature_importance_stability,
+        "feature_family_importance_stability": feature_family_importance_stability,
+        "feature_importance_production_readiness": feature_importance_production_readiness,
         "label_prevalence_summary": label_audit.prevalence_summary,
         "label_overlap": label_audit.label_overlap,
         "regime_segmented_ml_diagnostics": diagnostics.regime_segmented,

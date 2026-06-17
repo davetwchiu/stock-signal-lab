@@ -14,6 +14,7 @@ from src.ml.models import (
     build_model_pipeline,
     predict_positive_probability,
 )
+from src.ml.explain import feature_importance_frame
 
 
 MODEL_SELECTION_MODES = ("current_default", "auto_select")
@@ -26,6 +27,7 @@ class MLValidationResult:
     predictions: pd.DataFrame
     fold_metrics: pd.DataFrame
     overall_metrics: pd.DataFrame
+    fold_feature_importance: pd.DataFrame
 
 
 def infer_horizon(label_column: str, default: int = 20) -> int:
@@ -241,7 +243,7 @@ def walk_forward_validate_classifier(
     if model_selection_mode not in MODEL_SELECTION_MODES:
         raise ValueError(f"Unknown model_selection_mode: {model_selection_mode}")
     if dataset.empty:
-        return MLValidationResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        return MLValidationResult(pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
     horizon = infer_horizon(label_column)
     effective_embargo = max(int(embargo), int(horizon))
 
@@ -254,6 +256,7 @@ def walk_forward_validate_classifier(
     )
     prediction_frames: list[pd.DataFrame] = []
     metric_rows: list[dict[str, object]] = []
+    importance_frames: list[pd.DataFrame] = []
 
     for fold, (train_dates, test_dates) in enumerate(splits, start=1):
         train = dataset[dataset["Date"].isin(train_dates)].dropna(subset=[label_column])
@@ -295,6 +298,11 @@ def walk_forward_validate_classifier(
             )
             model.fit(train[feature_columns], y_train)
             probability = pd.Series(predict_positive_probability(model, test[feature_columns]), index=test.index)
+            importance = feature_importance_frame(model, feature_columns, top_n=len(feature_columns))
+            if not importance.empty:
+                importance.insert(0, "fold", fold)
+                importance.insert(1, "selected_model", selection["selected_model"])
+                importance_frames.append(importance)
 
         fold_predictions = pd.DataFrame(
             {
@@ -339,12 +347,20 @@ def walk_forward_validate_classifier(
 
     predictions = pd.concat(prediction_frames, ignore_index=True) if prediction_frames else pd.DataFrame()
     fold_metrics = pd.DataFrame(metric_rows)
+    fold_feature_importance = (
+        pd.concat(importance_frames, ignore_index=True) if importance_frames else pd.DataFrame()
+    )
     overall = (
         pd.DataFrame([classification_metrics(predictions["actual"], predictions["probability"], probability_threshold)])
         if not predictions.empty
         else pd.DataFrame()
     )
-    return MLValidationResult(predictions=predictions, fold_metrics=fold_metrics, overall_metrics=overall)
+    return MLValidationResult(
+        predictions=predictions,
+        fold_metrics=fold_metrics,
+        overall_metrics=overall,
+        fold_feature_importance=fold_feature_importance,
+    )
 
 
 def compare_feature_groups(

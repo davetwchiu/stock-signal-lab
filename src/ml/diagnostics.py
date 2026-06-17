@@ -461,6 +461,10 @@ FEATURE_SIGNAL_TOP_N = 15
 FEATURE_SIGNAL_QUANTILE_COUNT = 5
 NEAR_ZERO_FEATURE_SIGNAL = 0.05
 COMPLEX_TOP_SIGNAL_SHARE = 0.50
+FEATURE_IMPORTANCE_MIN_FOLDS = 3
+FEATURE_IMPORTANCE_STABLE_SHARE = 0.60
+FEATURE_IMPORTANCE_STABLE_CV = 1.0
+FEATURE_IMPORTANCE_UNSTABLE_CV = 2.0
 
 FEATURE_INVENTORY_COLUMNS = [
     "feature_count",
@@ -557,6 +561,45 @@ FEATURE_QUANTILE_SIGNAL_COLUMNS = [
     "quantile_spread",
     "abs_quantile_spread",
     "interpretation",
+]
+
+FEATURE_IMPORTANCE_STABILITY_COLUMNS = [
+    "target",
+    "model",
+    "feature",
+    "feature_family",
+    "fold_count",
+    "mean_importance",
+    "std_importance",
+    "importance_cv",
+    "positive_fold_count",
+    "top_decile_fold_count",
+    "classification",
+    "reason",
+]
+
+FEATURE_FAMILY_IMPORTANCE_STABILITY_COLUMNS = [
+    "target",
+    "model",
+    "feature_family",
+    "feature_count",
+    "fold_count",
+    "mean_family_importance",
+    "std_family_importance",
+    "top_family_fold_count",
+    "classification",
+    "reason",
+]
+
+FEATURE_IMPORTANCE_PRODUCTION_READINESS_COLUMNS = [
+    "target",
+    "model",
+    "stable_feature_count",
+    "mixed_feature_count",
+    "unstable_feature_count",
+    "top_stable_features",
+    "classification",
+    "reason",
 ]
 
 FEATURE_FAMILY_KEYWORDS = (
@@ -1310,6 +1353,318 @@ def build_feature_importance_summary(
         )
     ]
     return pd.DataFrame(rows[:max_features], columns=FEATURE_IMPORTANCE_COLUMNS)
+
+
+def _feature_importance_unavailable(reason: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "target": "unavailable",
+                "model": "unavailable",
+                "feature": "unavailable",
+                "feature_family": "unavailable",
+                "fold_count": 0,
+                "mean_importance": pd.NA,
+                "std_importance": pd.NA,
+                "importance_cv": pd.NA,
+                "positive_fold_count": 0,
+                "top_decile_fold_count": 0,
+                "classification": "unavailable",
+                "reason": reason,
+            }
+        ],
+        columns=FEATURE_IMPORTANCE_STABILITY_COLUMNS,
+    )
+
+
+def _prepared_fold_importance(fold_importance: pd.DataFrame) -> pd.DataFrame:
+    if fold_importance.empty or not {"fold", "feature"}.issubset(fold_importance.columns):
+        return pd.DataFrame()
+    data = fold_importance.copy()
+    if "target" not in data:
+        data["target"] = "unknown"
+    if "selected_model" in data:
+        data["model"] = data["selected_model"]
+    elif "model" not in data:
+        data["model"] = "unknown"
+    if "abs_importance" in data:
+        data["abs_importance"] = pd.to_numeric(data["abs_importance"], errors="coerce")
+    elif "importance" in data:
+        data["abs_importance"] = pd.to_numeric(data["importance"], errors="coerce").abs()
+    else:
+        return pd.DataFrame()
+    data = data.dropna(subset=["abs_importance", "feature"])
+    if data.empty:
+        return pd.DataFrame()
+    data["feature"] = data["feature"].astype(str)
+    data["feature_family"] = data["feature"].map(_feature_family)
+    data["target"] = data["target"].fillna("unknown").astype(str)
+    data["model"] = data["model"].fillna("unknown").astype(str)
+    data["fold"] = data["fold"].astype(str)
+    fold_total = data.groupby(["target", "model", "fold"], dropna=False)["abs_importance"].transform("sum")
+    data["abs_importance"] = data["abs_importance"].where(fold_total <= 0, data["abs_importance"] / fold_total)
+    return data
+
+
+def _with_all_selected_models(data: pd.DataFrame) -> pd.DataFrame:
+    frames = [data]
+    for _, group in data.groupby("target", dropna=False):
+        if group["model"].nunique(dropna=False) <= 1:
+            continue
+        combined = group.copy()
+        combined["model"] = "all_selected_models"
+        frames.append(combined)
+    return pd.concat(frames, ignore_index=True) if len(frames) > 1 else data
+
+
+def _mark_top_decile_importance(data: pd.DataFrame) -> pd.DataFrame:
+    output = data.copy()
+    output["is_top_decile"] = False
+    for _, index in output.groupby(["target", "model", "fold"], dropna=False).groups.items():
+        fold_importance = output.loc[index, "abs_importance"]
+        positive = fold_importance[fold_importance > 0]
+        if positive.empty:
+            continue
+        threshold = positive.quantile(0.90)
+        output.loc[index, "is_top_decile"] = output.loc[index, "abs_importance"].ge(threshold) & output.loc[
+            index, "abs_importance"
+        ].gt(0)
+    return output
+
+
+def _importance_cv(mean: float, std: float) -> object:
+    if mean == 0:
+        return 0.0 if std == 0 else pd.NA
+    return float(std / mean)
+
+
+def _feature_importance_classification(
+    *,
+    fold_count: int,
+    positive_fold_count: int,
+    top_decile_fold_count: int,
+    importance_cv: object,
+) -> tuple[str, str]:
+    if fold_count < FEATURE_IMPORTANCE_MIN_FOLDS:
+        return "insufficient_data", "Fewer than three folds exposed model-native importance data."
+    top_share = top_decile_fold_count / fold_count if fold_count else 0.0
+    positive_share = positive_fold_count / fold_count if fold_count else 0.0
+    cv_value = float(importance_cv) if pd.notna(importance_cv) else float("inf")
+    if (
+        positive_share >= FEATURE_IMPORTANCE_STABLE_SHARE
+        and top_share >= FEATURE_IMPORTANCE_STABLE_SHARE
+        and cv_value <= FEATURE_IMPORTANCE_STABLE_CV
+    ):
+        return "stable", "Feature was repeatedly top-ranked and importance variance was controlled."
+    if top_decile_fold_count <= 1 or cv_value > FEATURE_IMPORTANCE_UNSTABLE_CV:
+        return "unstable", "Importance is one-fold dominated or varies sharply across folds."
+    return "mixed", "Feature appears in some fold-level importance reads, but not consistently enough."
+
+
+def build_feature_importance_stability(fold_importance: pd.DataFrame) -> pd.DataFrame:
+    """Classify whether fold-level model-native feature importance is repeatable."""
+
+    data = _prepared_fold_importance(fold_importance)
+    if data.empty:
+        return _feature_importance_unavailable("No fold-level model-native importance data was available.")
+    data = _with_all_selected_models(data)
+    data = _mark_top_decile_importance(data)
+    rows: list[dict[str, object]] = []
+    for (target, model, feature, family), group in data.groupby(
+        ["target", "model", "feature", "feature_family"],
+        dropna=False,
+        sort=True,
+    ):
+        importance = pd.to_numeric(group["abs_importance"], errors="coerce").dropna()
+        fold_count = int(group["fold"].nunique())
+        mean = float(importance.mean()) if not importance.empty else 0.0
+        std = float(importance.std(ddof=0)) if len(importance) > 1 else 0.0
+        cv = _importance_cv(mean, std)
+        positive_fold_count = int(group.loc[group["abs_importance"] > 0, "fold"].nunique())
+        top_decile_fold_count = int(group.loc[group["is_top_decile"], "fold"].nunique())
+        classification, reason = _feature_importance_classification(
+            fold_count=fold_count,
+            positive_fold_count=positive_fold_count,
+            top_decile_fold_count=top_decile_fold_count,
+            importance_cv=cv,
+        )
+        rows.append(
+            {
+                "target": target,
+                "model": model,
+                "feature": feature,
+                "feature_family": family,
+                "fold_count": fold_count,
+                "mean_importance": mean,
+                "std_importance": std,
+                "importance_cv": cv,
+                "positive_fold_count": positive_fold_count,
+                "top_decile_fold_count": top_decile_fold_count,
+                "classification": classification,
+                "reason": reason,
+            }
+        )
+    return (
+        pd.DataFrame(rows, columns=FEATURE_IMPORTANCE_STABILITY_COLUMNS)
+        .sort_values(["target", "model", "classification", "mean_importance"], ascending=[True, True, True, False])
+        .reset_index(drop=True)
+    )
+
+
+def _family_importance_classification(
+    *,
+    fold_count: int,
+    top_family_fold_count: int,
+    importance_cv: object,
+) -> tuple[str, str]:
+    if fold_count < FEATURE_IMPORTANCE_MIN_FOLDS:
+        return "insufficient_data", "Fewer than three folds exposed family-level importance data."
+    top_share = top_family_fold_count / fold_count if fold_count else 0.0
+    cv_value = float(importance_cv) if pd.notna(importance_cv) else float("inf")
+    if top_share >= FEATURE_IMPORTANCE_STABLE_SHARE and cv_value <= FEATURE_IMPORTANCE_STABLE_CV:
+        return "stable", "Feature family was repeatedly among the strongest fold-level families."
+    if top_family_fold_count <= 1 or cv_value > FEATURE_IMPORTANCE_UNSTABLE_CV:
+        return "unstable", "Family importance is one-fold dominated or varies sharply across folds."
+    return "mixed", "Feature family has some support, but stability is mixed."
+
+
+def build_feature_family_importance_stability(fold_importance: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate fold-level importance stability by diagnostic feature family."""
+
+    data = _prepared_fold_importance(fold_importance)
+    if data.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "target": "unavailable",
+                    "model": "unavailable",
+                    "feature_family": "unavailable",
+                    "feature_count": 0,
+                    "fold_count": 0,
+                    "mean_family_importance": pd.NA,
+                    "std_family_importance": pd.NA,
+                    "top_family_fold_count": 0,
+                    "classification": "unavailable",
+                    "reason": "No fold-level model-native importance data was available.",
+                }
+            ],
+            columns=FEATURE_FAMILY_IMPORTANCE_STABILITY_COLUMNS,
+        )
+    data = _with_all_selected_models(data)
+    family_fold = (
+        data.groupby(["target", "model", "fold", "feature_family"], dropna=False)
+        .agg(
+            family_importance=("abs_importance", "sum"),
+            feature_count=("feature", "nunique"),
+        )
+        .reset_index()
+    )
+    family_fold["is_top_family"] = False
+    for _, index in family_fold.groupby(["target", "model", "fold"], dropna=False).groups.items():
+        fold_values = family_fold.loc[index, "family_importance"]
+        positive = fold_values[fold_values > 0]
+        if positive.empty:
+            continue
+        family_fold.loc[index, "is_top_family"] = family_fold.loc[index, "family_importance"].eq(positive.max())
+
+    rows: list[dict[str, object]] = []
+    for (target, model, family), group in family_fold.groupby(
+        ["target", "model", "feature_family"],
+        dropna=False,
+        sort=True,
+    ):
+        values = pd.to_numeric(group["family_importance"], errors="coerce").dropna()
+        fold_count = int(group["fold"].nunique())
+        mean = float(values.mean()) if not values.empty else 0.0
+        std = float(values.std(ddof=0)) if len(values) > 1 else 0.0
+        cv = _importance_cv(mean, std)
+        top_family_fold_count = int(group.loc[group["is_top_family"], "fold"].nunique())
+        classification, reason = _family_importance_classification(
+            fold_count=fold_count,
+            top_family_fold_count=top_family_fold_count,
+            importance_cv=cv,
+        )
+        rows.append(
+            {
+                "target": target,
+                "model": model,
+                "feature_family": family,
+                "feature_count": int(group["feature_count"].max()),
+                "fold_count": fold_count,
+                "mean_family_importance": mean,
+                "std_family_importance": std,
+                "top_family_fold_count": top_family_fold_count,
+                "classification": classification,
+                "reason": reason,
+            }
+        )
+    return (
+        pd.DataFrame(rows, columns=FEATURE_FAMILY_IMPORTANCE_STABILITY_COLUMNS)
+        .sort_values(["target", "model", "classification", "mean_family_importance"], ascending=[True, True, True, False])
+        .reset_index(drop=True)
+    )
+
+
+def build_feature_importance_production_readiness(feature_stability: pd.DataFrame) -> pd.DataFrame:
+    """Conservative readout for whether importance evidence is production-ready."""
+
+    if feature_stability.empty or "classification" not in feature_stability:
+        return pd.DataFrame(
+            [
+                {
+                    "target": "unavailable",
+                    "model": "unavailable",
+                    "stable_feature_count": 0,
+                    "mixed_feature_count": 0,
+                    "unstable_feature_count": 0,
+                    "top_stable_features": "",
+                    "classification": "unavailable",
+                    "reason": "Feature importance stability data was unavailable.",
+                }
+            ],
+            columns=FEATURE_IMPORTANCE_PRODUCTION_READINESS_COLUMNS,
+        )
+    rows: list[dict[str, object]] = []
+    for (target, model), group in feature_stability.groupby(["target", "model"], dropna=False, sort=True):
+        stable = group[group["classification"].eq("stable")]
+        mixed_count = int(group["classification"].eq("mixed").sum())
+        unstable_count = int(group["classification"].eq("unstable").sum())
+        stable_count = int(len(stable))
+        unavailable_only = set(group["classification"].dropna()) <= {"unavailable"}
+        insufficient_only = set(group["classification"].dropna()) <= {"insufficient_data"}
+        if unavailable_only:
+            classification = "unavailable"
+            reason = "Model-native importance data was unavailable for this target/model."
+        elif insufficient_only:
+            classification = "insufficient_data"
+            reason = "Fewer than three folds were available for a production-readiness read."
+        elif stable_count >= 3 and unstable_count <= stable_count:
+            classification = "promising"
+            reason = "Several features were stable without obvious one-fold dominance."
+        elif stable_count > 0:
+            classification = "watch"
+            reason = "Some stable features exist, but the evidence is not broad enough."
+        else:
+            classification = "not_ready"
+            reason = "No feature group has enough stable fold-level importance evidence."
+        top_stable = (
+            stable.sort_values("mean_importance", ascending=False)["feature"].head(5).astype(str).tolist()
+            if not stable.empty
+            else []
+        )
+        rows.append(
+            {
+                "target": target,
+                "model": model,
+                "stable_feature_count": stable_count,
+                "mixed_feature_count": mixed_count,
+                "unstable_feature_count": unstable_count,
+                "top_stable_features": ", ".join(top_stable),
+                "classification": classification,
+                "reason": reason,
+            }
+        )
+    return pd.DataFrame(rows, columns=FEATURE_IMPORTANCE_PRODUCTION_READINESS_COLUMNS)
 
 
 def build_ml_feature_audit(

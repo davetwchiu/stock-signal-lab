@@ -99,6 +99,7 @@ def test_walk_forward_classifier_outputs_future_fold_predictions() -> None:
         fold_predictions = result.predictions[result.predictions["fold"] == fold]
         metric_row = result.fold_metrics[result.fold_metrics["fold"] == fold].iloc[0]
         assert fold_predictions["Date"].min() == metric_row["test_start"]
+    assert set(result.fold_feature_importance["feature"]) == {"return_20d", "volatility_20d"}
 
 
 def test_walk_forward_classifier_uses_label_horizon_as_minimum_embargo() -> None:
