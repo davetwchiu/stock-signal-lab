@@ -70,6 +70,7 @@ from src.ml.target_diagnostics import (
     build_target_quality_summary,
     build_target_regime_comparison,
     build_target_stability_summary,
+    build_target_stop_rule_comparison,
     build_target_walk_forward_comparison,
     target_candidate_registry,
     target_definition_table,
@@ -1085,6 +1086,11 @@ with research_tab:
                             target_feature_group_comparison,
                             target_regime_comparison,
                         )
+                        target_stop_rule_comparison = build_target_stop_rule_comparison(
+                            target_quality_summary,
+                            target_regime_comparison,
+                            target_feature_group_comparison,
+                        )
                         risk_result = walk_forward_validate_classifier(
                             supervised,
                             columns,
@@ -1325,6 +1331,19 @@ with research_tab:
                                         width="stretch",
                                         hide_index=True,
                                     )
+                            st.write("Target stop-rule comparison")
+                            st.caption(
+                                "Research-only before/after comparison against the current target. "
+                                "This does not change production labels or ML Score."
+                            )
+                            if target_stop_rule_comparison.empty:
+                                st.info("No target stop-rule comparison was available.")
+                            else:
+                                st.dataframe(
+                                    target_stop_rule_comparison,
+                                    width="stretch",
+                                    hide_index=True,
+                                )
                             st.caption(
                                 "These diagnostics compare target candidates under different feature sets and "
                                 "regimes. They do not change Decision Cockpit scoring or today's ML Score."
@@ -1626,6 +1645,7 @@ with research_tab:
                                 "target_feature_group_comparison": target_feature_group_comparison,
                                 "target_regime_comparison": target_regime_comparison,
                                 "target_quality_summary": target_quality_summary,
+                                "target_stop_rule_comparison": target_stop_rule_comparison,
                                 "opportunity_risk_joint_validation": diagnostics.opportunity_risk_joint_validation,
                             }
                             research_export_metadata = {

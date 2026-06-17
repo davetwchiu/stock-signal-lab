@@ -55,6 +55,10 @@ TARGET_WALK_FORWARD_COLUMNS = [
     "top_bucket_positive_rate",
     "bottom_bucket_positive_rate",
     "bucket_spread",
+    "worst_fold",
+    "worst_fold_roc_auc",
+    "worst_ticker",
+    "worst_ticker_bucket_spread",
     "quality_summary",
     "interpretation",
 ]
@@ -110,6 +114,8 @@ TARGET_QUALITY_SUMMARY_COLUMNS = [
     "candidate_rank",
     "display_name",
     "sample_count",
+    "fold_count",
+    "prediction_count",
     "positive_rate",
     "class_balance_status",
     "overall_auc",
@@ -123,6 +129,10 @@ TARGET_QUALITY_SUMMARY_COLUMNS = [
     "regime_stability",
     "regime_inversion_count",
     "worst_regime_bucket_spread",
+    "worst_fold",
+    "worst_fold_roc_auc",
+    "worst_ticker",
+    "worst_ticker_bucket_spread",
     "calibration_quality",
     "bucket_separation_quality",
     "overall_target_quality",
@@ -156,6 +166,41 @@ TARGET_ARENA_COLUMNS = [
     "rejection_reason",
     "future_production_experiment",
     "suggested_next_research",
+]
+
+TARGET_STOP_RULE_COLUMNS = [
+    "target_id",
+    "baseline_target_id",
+    "sample_count",
+    "fold_count",
+    "prediction_count",
+    "positive_count",
+    "negative_count",
+    "roc_auc",
+    "roc_auc_delta",
+    "pr_auc",
+    "pr_auc_delta",
+    "brier_score",
+    "brier_score_delta",
+    "bucket_spread",
+    "bucket_spread_delta",
+    "calibration_gap",
+    "absolute_calibration_gap_delta",
+    "regime_inversion_count",
+    "regime_inversion_delta",
+    "worst_regime",
+    "worst_regime_bucket_spread",
+    "worst_feature_group",
+    "worst_feature_group_bucket_spread",
+    "worst_fold",
+    "worst_fold_roc_auc",
+    "worst_ticker",
+    "worst_ticker_bucket_spread",
+    "likely_failure_cause",
+    "recommended_decision",
+    "stop_rule_result",
+    "failure_diagnosis",
+    "production_change_justified",
 ]
 
 DEFAULT_TARGET_FEATURE_GROUPS = ("technical", "technical_fourier", "technical_wavelet", "all")
@@ -475,6 +520,37 @@ def _bucket_positive_rates(predictions: pd.DataFrame, min_bucket_count: int) -> 
     return top_rate, bottom_rate, top_rate - bottom_rate
 
 
+def _worst_fold_roc_auc(fold_metrics: pd.DataFrame) -> tuple[object, object]:
+    if fold_metrics.empty or "fold" not in fold_metrics or "roc_auc" not in fold_metrics:
+        return pd.NA, pd.NA
+    rows = fold_metrics[["fold", "roc_auc"]].copy()
+    rows["roc_auc"] = pd.to_numeric(rows["roc_auc"], errors="coerce")
+    rows = rows.dropna(subset=["roc_auc"])
+    if rows.empty:
+        return pd.NA, pd.NA
+    worst = rows.sort_values("roc_auc", kind="mergesort").iloc[0]
+    return worst.get("fold", pd.NA), float(worst["roc_auc"])
+
+
+def _worst_prediction_bucket_group(
+    predictions: pd.DataFrame,
+    group_column: str,
+    min_bucket_count: int,
+) -> tuple[object, object]:
+    if predictions.empty or group_column not in predictions:
+        return pd.NA, pd.NA
+    rows: list[dict[str, object]] = []
+    for group, group_predictions in predictions.groupby(group_column, dropna=True):
+        _, _, spread = _bucket_positive_rates(group_predictions, min_bucket_count)
+        spread = pd.to_numeric(pd.Series([spread]), errors="coerce").iloc[0]
+        if pd.notna(spread):
+            rows.append({group_column: group, "bucket_spread": float(spread)})
+    if not rows:
+        return pd.NA, pd.NA
+    worst = pd.DataFrame(rows).sort_values("bucket_spread", kind="mergesort").iloc[0]
+    return worst.get(group_column, pd.NA), float(worst["bucket_spread"])
+
+
 def _target_quality_summary(balance_row: pd.Series, wf_row: dict[str, object]) -> tuple[str, str]:
     if (
         bool(balance_row.get("too_few_samples"))
@@ -533,6 +609,10 @@ def _target_walk_forward_row_and_predictions(
         "top_bucket_positive_rate": pd.NA,
         "bottom_bucket_positive_rate": pd.NA,
         "bucket_spread": pd.NA,
+        "worst_fold": pd.NA,
+        "worst_fold_roc_auc": pd.NA,
+        "worst_ticker": pd.NA,
+        "worst_ticker_bucket_spread": pd.NA,
     }
     predictions = pd.DataFrame()
     if (
@@ -569,6 +649,16 @@ def _target_walk_forward_row_and_predictions(
             row["top_bucket_positive_rate"] = top_rate
             row["bottom_bucket_positive_rate"] = bottom_rate
             row["bucket_spread"] = spread
+            worst_fold, worst_fold_auc = _worst_fold_roc_auc(result.fold_metrics)
+            row["worst_fold"] = worst_fold
+            row["worst_fold_roc_auc"] = worst_fold_auc
+            worst_ticker, worst_ticker_spread = _worst_prediction_bucket_group(
+                result.predictions,
+                "Ticker",
+                min_bucket_count,
+            )
+            row["worst_ticker"] = worst_ticker
+            row["worst_ticker_bucket_spread"] = worst_ticker_spread
 
     summary, interpretation = _target_quality_summary(balance_row, row)
     row["quality_summary"] = summary
@@ -1243,6 +1333,8 @@ def build_target_quality_summary(
                 "candidate_rank": pd.NA,
                 "display_name": balance.get("display_name", walk_forward.get("display_name", pd.NA)),
                 "sample_count": sample_count,
+                "fold_count": walk_forward.get("folds", pd.NA),
+                "prediction_count": walk_forward.get("prediction_count", pd.NA),
                 "positive_rate": positive_rate,
                 "class_balance_status": class_balance_status,
                 "overall_auc": walk_forward.get("roc_auc", pd.NA),
@@ -1256,6 +1348,10 @@ def build_target_quality_summary(
                 "regime_stability": regime_stability,
                 "regime_inversion_count": inverted_regime_count,
                 "worst_regime_bucket_spread": worst_regime_bucket_spread,
+                "worst_fold": walk_forward.get("worst_fold", pd.NA),
+                "worst_fold_roc_auc": walk_forward.get("worst_fold_roc_auc", pd.NA),
+                "worst_ticker": walk_forward.get("worst_ticker", pd.NA),
+                "worst_ticker_bucket_spread": walk_forward.get("worst_ticker_bucket_spread", pd.NA),
                 "calibration_quality": calibration_quality,
                 "bucket_separation_quality": bucket_quality,
                 "overall_target_quality": overall_quality,
@@ -1360,6 +1456,187 @@ def _arena_rejection_reason(row: pd.Series, classification: str) -> str:
     if str(row.get("feature_group_consistency", "")) == "Weak across feature groups":
         reasons.append("feature-group stability is weak")
     return "; ".join(reasons) or "evidence is not clearly better than the current production target"
+
+
+def _worst_bucket_row(frame: pd.DataFrame, target_id: object, group_column: str) -> tuple[object, object]:
+    if frame is None or frame.empty or "target_id" not in frame or "bucket_spread" not in frame:
+        return pd.NA, pd.NA
+    rows = frame[frame["target_id"] == target_id].copy()
+    if rows.empty or group_column not in rows:
+        return pd.NA, pd.NA
+    rows["_bucket_spread_numeric"] = pd.to_numeric(rows["bucket_spread"], errors="coerce")
+    rows = rows.dropna(subset=["_bucket_spread_numeric"])
+    if rows.empty:
+        return pd.NA, pd.NA
+    worst = rows.sort_values("_bucket_spread_numeric", kind="mergesort").iloc[0]
+    return worst.get(group_column, pd.NA), float(worst["_bucket_spread_numeric"])
+
+
+def _target_stop_rule_diagnosis(row: pd.Series, baseline: pd.Series) -> tuple[str, str]:
+    if str(row.get("target_id")) == str(baseline.get("target_id")):
+        return "baseline", "Current production target baseline for comparison."
+    reasons: list[str] = []
+    spread = _arena_numeric(row, "overall_bucket_spread")
+    baseline_spread = _arena_numeric(baseline, "overall_bucket_spread")
+    brier = _arena_numeric(row, "overall_brier_score")
+    baseline_brier = _arena_numeric(baseline, "overall_brier_score")
+    calibration_gap = abs(_arena_numeric(row, "overall_calibration_gap"))
+    baseline_gap = abs(_arena_numeric(baseline, "overall_calibration_gap"))
+    inversions = _arena_numeric(row, "regime_inversion_count")
+    baseline_inversions = _arena_numeric(baseline, "regime_inversion_count")
+    if np.isnan(spread) or spread <= 0.0:
+        reasons.append("bucket spread is unavailable or non-positive")
+    elif not np.isnan(baseline_spread) and spread < baseline_spread - 0.005:
+        reasons.append("bucket spread is worse than baseline tolerance")
+    if not np.isnan(brier) and not np.isnan(baseline_brier) and brier > baseline_brier + 0.02:
+        reasons.append("Brier score is worse than baseline tolerance")
+    if not np.isnan(calibration_gap) and not np.isnan(baseline_gap) and calibration_gap > baseline_gap + 0.03:
+        reasons.append("calibration gap is worse than baseline tolerance")
+    if not np.isnan(inversions) and not np.isnan(baseline_inversions) and inversions > baseline_inversions:
+        reasons.append("regime inversion count is worse than baseline")
+    if str(row.get("feature_group_consistency")) == "Weak across feature groups":
+        reasons.append("feature-group stability is weak")
+    if str(row.get("overall_target_quality")) in {"Weak", "Unusable"}:
+        reasons.append(f"overall target quality is {str(row.get('overall_target_quality')).lower()}")
+    if reasons:
+        return "fail", "; ".join(reasons)
+    return "pass", "Candidate clears the research stop rule versus the current baseline."
+
+
+def _target_stop_rule_review(row: pd.Series, baseline: pd.Series, result: str, diagnosis: str) -> tuple[str, str]:
+    target_id = str(row.get("target_id"))
+    if target_id == str(baseline.get("target_id")):
+        return "current baseline", "Continue"
+
+    missing_keys = ("overall_auc", "overall_bucket_spread", "fold_count", "prediction_count")
+    if any(pd.isna(row.get(key, pd.NA)) for key in missing_keys):
+        return "missing evidence fields", "Needs more data"
+
+    causes: list[str] = []
+    positive_rate = _arena_numeric(row, "positive_rate")
+    fold_count = _arena_numeric(row, "fold_count")
+    baseline_fold_count = _arena_numeric(baseline, "fold_count")
+    calibration_gap = abs(_arena_numeric(row, "overall_calibration_gap"))
+    baseline_gap = abs(_arena_numeric(baseline, "overall_calibration_gap"))
+    worst_regime_spread = _arena_numeric(row, "worst_regime_bucket_spread")
+    roc_delta = _arena_numeric(row, "overall_auc") - _arena_numeric(baseline, "overall_auc")
+
+    if "60d" in target_id or (not np.isnan(fold_count) and not np.isnan(baseline_fold_count) and fold_count < baseline_fold_count):
+        causes.append("horizon mismatch / thin folds")
+    if str(row.get("class_balance_status")) in {"Skewed", "Unusable"} or (
+        not np.isnan(positive_rate) and (positive_rate < 0.20 or positive_rate > 0.80)
+    ):
+        causes.append("target design / class imbalance")
+    if not np.isnan(calibration_gap) and not np.isnan(baseline_gap) and calibration_gap > baseline_gap + 0.03:
+        causes.append("target noise / calibration")
+    if _arena_numeric(row, "regime_inversion_count") > 0 and not np.isnan(worst_regime_spread) and worst_regime_spread < 0:
+        causes.append("regime inversion")
+    if "bucket spread" in diagnosis:
+        causes.append("weak feature separation")
+    if not causes:
+        causes.append("mixed validation evidence" if result == "fail" else "evidence clears stop rule")
+
+    if result == "pass":
+        decision = "Continue"
+    elif str(row.get("class_balance_status")) == "Unusable":
+        decision = "Kill"
+    elif target_id == "pullback_recovery_20d":
+        decision = "Hold as audit-only"
+    elif "horizon mismatch / thin folds" in causes:
+        decision = "Needs more data"
+    elif not np.isnan(roc_delta) and roc_delta < -0.05:
+        decision = "Kill"
+    else:
+        decision = "Pivot"
+    return "; ".join(dict.fromkeys(causes)), decision
+
+
+def build_target_stop_rule_comparison(
+    target_quality: pd.DataFrame,
+    regime_comparison: pd.DataFrame | None = None,
+    feature_group_comparison: pd.DataFrame | None = None,
+    *,
+    baseline_target_id: str = "outperform_20d",
+) -> pd.DataFrame:
+    """Compare target candidates to the production baseline using research stop rules."""
+
+    if target_quality.empty or "target_id" not in target_quality:
+        return pd.DataFrame(columns=TARGET_STOP_RULE_COLUMNS)
+    indexed = target_quality.set_index("target_id", drop=False)
+    if baseline_target_id not in indexed.index:
+        return pd.DataFrame(columns=TARGET_STOP_RULE_COLUMNS)
+    baseline = indexed.loc[baseline_target_id]
+    if isinstance(baseline, pd.DataFrame):
+        baseline = baseline.iloc[0]
+
+    rows: list[dict[str, object]] = []
+    for _, row in target_quality.iterrows():
+        target_id = row.get("target_id")
+        result, diagnosis = _target_stop_rule_diagnosis(row, baseline)
+        likely_cause, recommended_decision = _target_stop_rule_review(row, baseline, result, diagnosis)
+        sample_count = _arena_numeric(row, "sample_count")
+        positive_rate = _arena_numeric(row, "positive_rate")
+        positives = (
+            int(round(sample_count * positive_rate))
+            if not np.isnan(sample_count) and not np.isnan(positive_rate)
+            else pd.NA
+        )
+        worst_regime, worst_regime_spread = _worst_bucket_row(regime_comparison, target_id, "regime")
+        worst_feature_group, worst_feature_spread = _worst_bucket_row(
+            feature_group_comparison,
+            target_id,
+            "feature_group",
+        )
+        production_change = (
+            result == "pass"
+            and str(row.get("production_candidate_status")) == "Candidate for production trial"
+            and str(row.get("regime_stability")) == "Stable across regimes"
+        )
+        rows.append(
+            {
+                "target_id": target_id,
+                "baseline_target_id": baseline_target_id,
+                "sample_count": int(sample_count) if not np.isnan(sample_count) else pd.NA,
+                "fold_count": row.get("fold_count", pd.NA),
+                "prediction_count": row.get("prediction_count", pd.NA),
+                "positive_count": positives,
+                "negative_count": (
+                    int(sample_count - positives)
+                    if not np.isnan(sample_count) and pd.notna(positives)
+                    else pd.NA
+                ),
+                "roc_auc": row.get("overall_auc", pd.NA),
+                "roc_auc_delta": _arena_numeric(row, "overall_auc") - _arena_numeric(baseline, "overall_auc"),
+                "pr_auc": row.get("overall_pr_auc", pd.NA),
+                "pr_auc_delta": _arena_numeric(row, "overall_pr_auc") - _arena_numeric(baseline, "overall_pr_auc"),
+                "brier_score": row.get("overall_brier_score", pd.NA),
+                "brier_score_delta": _arena_numeric(row, "overall_brier_score")
+                - _arena_numeric(baseline, "overall_brier_score"),
+                "bucket_spread": row.get("overall_bucket_spread", pd.NA),
+                "bucket_spread_delta": _arena_numeric(row, "overall_bucket_spread")
+                - _arena_numeric(baseline, "overall_bucket_spread"),
+                "calibration_gap": row.get("overall_calibration_gap", pd.NA),
+                "absolute_calibration_gap_delta": abs(_arena_numeric(row, "overall_calibration_gap"))
+                - abs(_arena_numeric(baseline, "overall_calibration_gap")),
+                "regime_inversion_count": row.get("regime_inversion_count", pd.NA),
+                "regime_inversion_delta": _arena_numeric(row, "regime_inversion_count")
+                - _arena_numeric(baseline, "regime_inversion_count"),
+                "worst_regime": worst_regime,
+                "worst_regime_bucket_spread": worst_regime_spread,
+                "worst_feature_group": worst_feature_group,
+                "worst_feature_group_bucket_spread": worst_feature_spread,
+                "worst_fold": row.get("worst_fold", pd.NA),
+                "worst_fold_roc_auc": row.get("worst_fold_roc_auc", pd.NA),
+                "worst_ticker": row.get("worst_ticker", pd.NA),
+                "worst_ticker_bucket_spread": row.get("worst_ticker_bucket_spread", pd.NA),
+                "likely_failure_cause": likely_cause,
+                "recommended_decision": recommended_decision,
+                "stop_rule_result": result,
+                "failure_diagnosis": diagnosis,
+                "production_change_justified": production_change,
+            }
+        )
+    return pd.DataFrame(rows, columns=TARGET_STOP_RULE_COLUMNS)
 
 
 def build_target_arena_comparison(
