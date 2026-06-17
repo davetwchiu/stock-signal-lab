@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from src.ml.diagnostics import (
+    build_drawdown_risk_prevalence_baseline_comparison,
     build_drawdown_risk_regime_calibration,
     build_ml_reliability_by_regime,
     build_ml_score_regime_bucket_audit,
@@ -127,6 +128,113 @@ def test_drawdown_risk_regime_calibration_export_writes_csv(tmp_path) -> None:
     exported = pd.read_csv(result.run_dir / "drawdown_risk_regime_calibration.csv")
     assert "classification" in exported.columns
     assert result.manifest["row_counts"]["drawdown_risk_regime_calibration.csv"] == len(table)
+
+
+def test_drawdown_risk_prevalence_baseline_uses_fold_training_rates() -> None:
+    predictions = pd.DataFrame(
+        {
+            "fold": [1, 1, 1, 1, 2, 2, 2, 2],
+            "Date": pd.to_datetime(
+                [
+                    "2024-03-01",
+                    "2024-03-04",
+                    "2024-03-05",
+                    "2024-03-06",
+                    "2024-06-03",
+                    "2024-06-04",
+                    "2024-06-05",
+                    "2024-06-06",
+                ]
+            ),
+            "Ticker": ["AAA", "BBB", "CCC", "DDD", "AAA", "BBB", "CCC", "DDD"],
+            "actual": [0, 0, 1, 1, 1, 1, 1, 0],
+            "probability": [0.90, 0.90, 0.10, 0.10, 0.10, 0.10, 0.10, 0.90],
+        }
+    )
+    baseline = pd.DataFrame(
+        {
+            "Date": pd.to_datetime(
+                [
+                    "2024-01-02",
+                    "2024-01-03",
+                    "2024-01-04",
+                    "2024-01-05",
+                    "2024-04-01",
+                    "2024-04-02",
+                    "2024-04-03",
+                    "2024-04-04",
+                    "2024-03-01",
+                    "2024-03-04",
+                    "2024-03-05",
+                    "2024-03-06",
+                    "2024-06-03",
+                    "2024-06-04",
+                    "2024-06-05",
+                    "2024-06-06",
+                ]
+            ),
+            "Ticker": [
+                "AAA",
+                "BBB",
+                "CCC",
+                "DDD",
+                "AAA",
+                "BBB",
+                "CCC",
+                "DDD",
+                "AAA",
+                "BBB",
+                "CCC",
+                "DDD",
+                "AAA",
+                "BBB",
+                "CCC",
+                "DDD",
+            ],
+            "label_drawdown_risk_20d": [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0],
+            "regime": [
+                "calm",
+                "calm",
+                "thin",
+                "thin",
+                "calm",
+                "calm",
+                "thin",
+                "thin",
+                "calm",
+                "calm",
+                "thin",
+                "thin",
+                "calm",
+                "calm",
+                "thin",
+                "thin",
+            ],
+        }
+    )
+    fold_details = pd.DataFrame(
+        {
+            "fold": [1, 2],
+            "train_start": ["2024-01-01", "2024-04-01"],
+            "train_end": ["2024-01-31", "2024-04-30"],
+        }
+    )
+
+    table = build_drawdown_risk_prevalence_baseline_comparison(
+        predictions,
+        baseline,
+        fold_details,
+        min_regime_train_samples=3,
+        min_regime_train_events=2,
+        min_bucket_size=1,
+    ).set_index("comparator")
+
+    assert table.loc["model_predicted_risk", "sample_count"] == 8
+    assert table.loc["global_fold_prevalence_baseline", "mean_predicted_risk"] == pytest.approx(0.5)
+    assert table.loc["regime_fold_prevalence_baseline", "fallback_count"] == 8
+    assert table.loc["model_predicted_risk", "classification"] == "baseline_beats_model"
+    assert table.loc["global_fold_prevalence_baseline", "classification"] == "baseline_beats_model"
+    assert table.loc["global_fold_prevalence_baseline", "fold_train_prevalence_details"] == "1:4:0.000000;2:4:1.000000"
 
 
 def test_ml_reliability_by_regime_classifies_reliable_regime() -> None:
