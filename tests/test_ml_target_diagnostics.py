@@ -409,6 +409,7 @@ def target_quality_inputs(
             {
                 "target_id": target_id,
                 "display_name": display_name,
+                "folds": 3,
                 "prediction_count": sample_count // 2,
                 "positive_rate": positive_rate,
                 "roc_auc": roc_auc,
@@ -416,6 +417,10 @@ def target_quality_inputs(
                 "brier_score": brier_score,
                 "calibration_gap": calibration_gap,
                 "bucket_spread": bucket_spread,
+                "worst_fold": 2,
+                "worst_fold_roc_auc": 0.51,
+                "worst_ticker": "MSFT",
+                "worst_ticker_bucket_spread": -0.04,
             }
         ]
     )
@@ -742,6 +747,10 @@ def test_target_stop_rule_comparison_passes_candidate_that_clears_baseline_toler
     assert comparison.loc["top_tercile_excess_20d", "stop_rule_result"] == "pass"
     assert comparison.loc["top_tercile_excess_20d", "bucket_spread_delta"] == pytest.approx(0.02)
     assert comparison.loc["top_tercile_excess_20d", "worst_regime"] == "Stable regime"
+    assert comparison.loc["top_tercile_excess_20d", "fold_count"] == 3
+    assert comparison.loc["top_tercile_excess_20d", "worst_fold"] == 2
+    assert comparison.loc["top_tercile_excess_20d", "worst_ticker"] == "MSFT"
+    assert comparison.loc["top_tercile_excess_20d", "recommended_decision"] == "Continue"
 
 
 def test_target_stop_rule_comparison_reports_failure_diagnosis() -> None:
@@ -756,7 +765,7 @@ def test_target_stop_rule_comparison_reports_failure_diagnosis() -> None:
     candidate = target_quality_inputs(
         target_id="risk_adjusted_excess_20d",
         display_name="Recent-vol adjusted excess",
-        roc_auc=0.49,
+        roc_auc=0.58,
         bucket_spread=-0.03,
         regime_rows=[
             {
@@ -790,6 +799,8 @@ def test_target_stop_rule_comparison_reports_failure_diagnosis() -> None:
     assert "bucket spread" in row["failure_diagnosis"]
     assert "regime inversion" in row["failure_diagnosis"]
     assert row["worst_regime"] == "Worst regime"
+    assert row["likely_failure_cause"] == "regime inversion; weak feature separation"
+    assert row["recommended_decision"] == "Pivot"
 
 
 def test_production_ml_score_formula_remains_outperformance_probability_scaled() -> None:
