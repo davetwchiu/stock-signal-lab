@@ -87,6 +87,7 @@ from src.research.export import (
     zip_research_bundle,
 )
 from src.research.earnings_events import load_earnings_events
+from src.research.portfolio_crowding import build_portfolio_crowding_diagnostics
 from src.robustness.ablation import run_feature_ablation
 from src.robustness.runner import run_robustness_tests
 from src.ui.charts import drawdown_chart, equity_curve_chart, feature_chart, price_chart
@@ -678,6 +679,9 @@ report_markdown = generate_markdown_report(
     suggested_cash_level=suggested_cash,
     summary_text=summary_text,
 )
+portfolio_correlation, portfolio_crowding, factor_exposure, factor_crowding = (
+    build_portfolio_crowding_diagnostics(frames, tickers)
+)
 
 with today_tab:
     if load_errors:
@@ -800,6 +804,26 @@ with research_tab:
         st.dataframe(regime_table, width="stretch")
         ranking = relative_strength_ranking(regime_table, benchmark=benchmark)
         st.dataframe(ranking, width="stretch")
+
+    with st.expander("Portfolio overlap, correlation, and factor crowding", expanded=False):
+        st.caption(
+            "This section checks whether the selected portfolio is truly diversified or concentrated "
+            "in highly correlated holdings. It is research-only and does not change suggested actions "
+            "or position sizes."
+        )
+        st.write("**Portfolio crowding summary**")
+        st.dataframe(portfolio_crowding, width="stretch", hide_index=True)
+        st.write("**High-correlation overlap pairs**")
+        if portfolio_correlation.empty:
+            st.info("No portfolio correlation diagnostics were available.")
+        else:
+            st.dataframe(portfolio_correlation, width="stretch", hide_index=True)
+        st.write("**Factor proxy exposure**")
+        st.caption("Static proxy tags only. ETF rows do not use holdings lookthrough data.")
+        st.dataframe(factor_exposure, width="stretch", hide_index=True)
+        if not factor_crowding.empty:
+            st.write("**Factor crowding summary**")
+            st.dataframe(factor_crowding, width="stretch", hide_index=True)
 
     research_ticker = st.selectbox(
         "Research ticker",
@@ -1517,6 +1541,10 @@ with research_tab:
                                 "validation_leakage_diagnostics": validation_leakage,
                                 "validation_fold_stability": validation_fold_stability,
                                 "validation_overfit_warnings": validation_overfit_warnings,
+                                "portfolio_correlation_diagnostics": portfolio_correlation,
+                                "portfolio_crowding_summary": portfolio_crowding,
+                                "portfolio_factor_proxy_exposure": factor_exposure,
+                                "portfolio_factor_crowding_summary": factor_crowding,
                                 "earnings_event_diagnostics": diagnostics.earnings_event_diagnostics,
                                 "ml_score_by_earnings_window": diagnostics.ml_score_by_earnings_window,
                                 "earnings_pead_summary": diagnostics.earnings_pead_summary,

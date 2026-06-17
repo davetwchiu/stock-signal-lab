@@ -40,6 +40,7 @@ from src.ml.target_diagnostics import (
 from src.ml.validation import compare_feature_groups, summarize_model_selection, walk_forward_validate_classifier
 from src.research.earnings_events import load_earnings_events
 from src.research.export import build_research_lab_export_payload
+from src.research.portfolio_crowding import build_portfolio_crowding_diagnostics
 from src.utils.config import FeatureConfig
 
 
@@ -248,6 +249,9 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         baseline_panel=supervised,
         universe=",".join(tickers),
     )
+    portfolio_correlation, portfolio_crowding, factor_exposure, factor_crowding = (
+        build_portfolio_crowding_diagnostics(frames, tickers)
+    )
     comparison = compare_feature_groups(
         supervised,
         group_options,
@@ -276,6 +280,10 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "validation_leakage_diagnostics": validation_leakage,
         "validation_fold_stability": validation_fold_stability,
         "validation_overfit_warnings": validation_overfit_warnings,
+        "portfolio_correlation_diagnostics": portfolio_correlation,
+        "portfolio_crowding_summary": portfolio_crowding,
+        "portfolio_factor_proxy_exposure": factor_exposure,
+        "portfolio_factor_crowding_summary": factor_crowding,
         "earnings_event_diagnostics": diagnostics.earnings_event_diagnostics,
         "ml_score_by_earnings_window": diagnostics.ml_score_by_earnings_window,
         "earnings_pead_summary": diagnostics.earnings_pead_summary,

@@ -227,6 +227,8 @@ def build_codex_handoff(
     validation_leakage = _frame(tables.get("validation_leakage_diagnostics"))
     validation_fold_stability = _frame(tables.get("validation_fold_stability"))
     validation_overfit = _frame(tables.get("validation_overfit_warnings"))
+    portfolio_crowding = _frame(tables.get("portfolio_crowding_summary"))
+    factor_crowding = _frame(tables.get("portfolio_factor_crowding_summary"))
     earnings_pead = _frame(tables.get("earnings_pead_summary"))
     drawdown_quality = _frame(tables.get("drawdown_risk_calibration_quality"))
     feature_audit = _frame(tables.get("feature_audit_summary"))
@@ -272,6 +274,9 @@ def build_codex_handoff(
         "",
         "## Validation leakage / overfit diagnostics",
         _validation_evidence(validation_leakage, validation_fold_stability, validation_overfit),
+        "",
+        "## Portfolio crowding diagnostics",
+        _portfolio_crowding_evidence(portfolio_crowding, factor_crowding),
         "",
         "## Earnings / PEAD diagnostics",
         _earnings_pead_evidence(earnings_pead),
@@ -555,6 +560,27 @@ def _earnings_pead_evidence(earnings_pead: pd.DataFrame) -> str:
         f"PEAD direction: {direction}; ML near earnings effect: {ml_effect}"
         + (f"; classifications: {count_text}." if count_text else ".")
     )
+
+
+def _portfolio_crowding_evidence(portfolio_crowding: pd.DataFrame, factor_crowding: pd.DataFrame) -> str:
+    if portfolio_crowding.empty and factor_crowding.empty:
+        return "No portfolio crowding diagnostics table was exported."
+    parts = [
+        "Research-only portfolio crowding diagnostics checked correlation overlap and factor proxy concentration without changing actions or sizing."
+    ]
+    if not portfolio_crowding.empty:
+        row = portfolio_crowding.iloc[0]
+        parts.append(
+            "Correlation crowding: "
+            f"{_display(row.get('classification'))}; "
+            f"high-overlap pairs={_display(row.get('high_overlap_pair_count'))}; "
+            f"largest cluster={_display(row.get('largest_cluster_size'))}."
+        )
+    if not factor_crowding.empty and "classification" in factor_crowding:
+        counts = factor_crowding["classification"].astype(str).value_counts().sort_index()
+        count_text = ", ".join(f"{classification}={count}" for classification, count in counts.items())
+        parts.append(f"Factor proxy rows={len(factor_crowding)}" + (f": {count_text}." if count_text else "."))
+    return " ".join(parts)
 
 
 def _feature_group_findings(feature_group: pd.DataFrame, target_quality: pd.DataFrame) -> str:
