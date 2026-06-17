@@ -36,6 +36,7 @@ from src.ml.target_diagnostics import (
     build_target_quality_summary,
     build_target_regime_comparison,
     build_target_stability_summary,
+    build_target_stop_rule_comparison,
     build_target_walk_forward_comparison,
     target_candidate_registry,
     target_definition_table,
@@ -225,6 +226,11 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         target_feature_group,
         target_regime,
     )
+    target_stop_rule = build_target_stop_rule_comparison(
+        target_quality,
+        target_regime,
+        target_feature_group,
+    )
     target_arena = build_target_arena_comparison(target_quality)
     diagnostics = build_ml_diagnostics(
         outperformance.predictions,
@@ -330,6 +336,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "target_regime_comparison": target_regime,
         "target_stability_summary": target_stability,
         "target_quality_summary": target_quality,
+        "target_stop_rule_comparison": target_stop_rule,
         "target_arena_comparison": target_arena,
         "opportunity_risk_joint_validation": diagnostics.opportunity_risk_joint_validation,
     }

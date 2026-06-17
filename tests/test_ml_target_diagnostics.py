@@ -15,6 +15,7 @@ from src.ml.target_diagnostics import (
     build_target_quality_summary,
     build_target_regime_comparison,
     build_target_stability_summary,
+    build_target_stop_rule_comparison,
     build_target_walk_forward_comparison,
     target_candidate_registry,
 )
@@ -693,6 +694,102 @@ def test_target_arena_keeps_promising_production_baseline_as_current_baseline() 
 
     assert arena.loc["outperform_20d", "evidence_classification"] == "promising"
     assert arena.loc["outperform_20d", "arena_decision"] == "current_baseline"
+
+
+def test_target_stop_rule_comparison_passes_candidate_that_clears_baseline_tolerances() -> None:
+    baseline = target_quality_inputs(
+        target_id="outperform_20d",
+        display_name="Current 20d outperformance",
+        roc_auc=0.58,
+        pr_auc=0.40,
+        brier_score=0.22,
+        calibration_gap=0.06,
+        bucket_spread=0.10,
+        regime_rows=[
+            {"target_id": "outperform_20d", "regime": "Baseline regime", "direction": "positive", "bucket_spread": 0.07}
+        ],
+    )
+    candidate = target_quality_inputs(
+        target_id="top_tercile_excess_20d",
+        display_name="Top-third relative performer",
+        roc_auc=0.61,
+        pr_auc=0.44,
+        brier_score=0.21,
+        calibration_gap=0.04,
+        bucket_spread=0.12,
+        regime_rows=[
+            {
+                "target_id": "top_tercile_excess_20d",
+                "regime": "Stable regime",
+                "direction": "positive",
+                "bucket_spread": 0.08,
+            }
+        ],
+    )
+    summary = build_target_quality_summary(
+        pd.concat([baseline[0], candidate[0]], ignore_index=True),
+        pd.concat([baseline[1], candidate[1]], ignore_index=True),
+        pd.concat([baseline[2], candidate[2]], ignore_index=True),
+        pd.concat([baseline[3], candidate[3]], ignore_index=True),
+    )
+    comparison = build_target_stop_rule_comparison(
+        summary,
+        pd.concat([baseline[3], candidate[3]], ignore_index=True),
+        pd.concat([baseline[2], candidate[2]], ignore_index=True),
+    ).set_index("target_id")
+
+    assert comparison.loc["outperform_20d", "stop_rule_result"] == "baseline"
+    assert comparison.loc["top_tercile_excess_20d", "stop_rule_result"] == "pass"
+    assert comparison.loc["top_tercile_excess_20d", "bucket_spread_delta"] == pytest.approx(0.02)
+    assert comparison.loc["top_tercile_excess_20d", "worst_regime"] == "Stable regime"
+
+
+def test_target_stop_rule_comparison_reports_failure_diagnosis() -> None:
+    baseline = target_quality_inputs(
+        target_id="outperform_20d",
+        display_name="Current 20d outperformance",
+        bucket_spread=0.12,
+        regime_rows=[
+            {"target_id": "outperform_20d", "regime": "Baseline regime", "direction": "positive", "bucket_spread": 0.08}
+        ],
+    )
+    candidate = target_quality_inputs(
+        target_id="risk_adjusted_excess_20d",
+        display_name="Recent-vol adjusted excess",
+        roc_auc=0.49,
+        bucket_spread=-0.03,
+        regime_rows=[
+            {
+                "target_id": "risk_adjusted_excess_20d",
+                "regime": "Worst regime",
+                "direction": "inverted",
+                "bucket_spread": -0.08,
+            },
+            {
+                "target_id": "risk_adjusted_excess_20d",
+                "regime": "Second regime",
+                "direction": "inverted",
+                "bucket_spread": -0.06,
+            },
+        ],
+    )
+    summary = build_target_quality_summary(
+        pd.concat([baseline[0], candidate[0]], ignore_index=True),
+        pd.concat([baseline[1], candidate[1]], ignore_index=True),
+        pd.concat([baseline[2], candidate[2]], ignore_index=True),
+        pd.concat([baseline[3], candidate[3]], ignore_index=True),
+    )
+    comparison = build_target_stop_rule_comparison(
+        summary,
+        pd.concat([baseline[3], candidate[3]], ignore_index=True),
+        pd.concat([baseline[2], candidate[2]], ignore_index=True),
+    ).set_index("target_id")
+
+    row = comparison.loc["risk_adjusted_excess_20d"]
+    assert row["stop_rule_result"] == "fail"
+    assert "bucket spread" in row["failure_diagnosis"]
+    assert "regime inversion" in row["failure_diagnosis"]
+    assert row["worst_regime"] == "Worst regime"
 
 
 def test_production_ml_score_formula_remains_outperformance_probability_scaled() -> None:
