@@ -18,6 +18,14 @@ import pandas as pd
 
 
 SAFE_NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
+RESEARCH_EVIDENCE_SUMMARY_COLUMNS = [
+    "area",
+    "latest_classification",
+    "evidence_strength",
+    "production_readiness",
+    "key_reason",
+    "recommended_next_action",
+]
 
 
 @dataclass(frozen=True)
@@ -37,10 +45,93 @@ def build_research_lab_export_payload(
 ) -> dict[str, object]:
     """Build the app-facing payload exported after Streamlit reruns."""
 
+    export_tables = _tables_with_research_evidence_summary(tables)
     return {
         "run_metadata": dict(run_metadata),
-        "tables": dict(tables),
+        "tables": export_tables,
     }
+
+
+def build_research_evidence_summary(tables: Mapping[str, object]) -> pd.DataFrame:
+    """Build a plain-language production-readiness readout from existing tables."""
+
+    frames = {name: _frame(table) for name, table in tables.items()}
+    rows = [
+        _evidence_row(
+            "ML reliability by regime",
+            frames.get("ml_reliability_by_regime", pd.DataFrame()),
+            reason=_ml_reliability_evidence(frames.get("ml_reliability_by_regime", pd.DataFrame())),
+            next_action="Do not change production scoring. Study regimes marked inverted or mixed.",
+        ),
+        _evidence_row(
+            "ML reliability gate",
+            frames.get("ml_reliability_gate_diagnostics", pd.DataFrame()),
+            reason=_ml_reliability_gate_evidence(frames.get("ml_reliability_gate_diagnostics", pd.DataFrame())),
+            next_action="Keep gates research-only until they help consistently out of sample.",
+        ),
+        _evidence_row(
+            "Momentum quality",
+            frames.get("momentum_quality_diagnostics", pd.DataFrame()),
+            reason=_momentum_quality_evidence(frames.get("momentum_quality_diagnostics", pd.DataFrame())),
+            next_action="Review why broad momentum is not separating stronger forward returns.",
+        ),
+        _evidence_row(
+            "Earnings / PEAD",
+            frames.get("earnings_pead_summary", pd.DataFrame()),
+            reason=_earnings_pead_evidence(frames.get("earnings_pead_summary", pd.DataFrame())),
+            next_action="Add verified local earnings dates before using PEAD evidence.",
+        ),
+        _validation_summary_row(
+            frames.get("validation_leakage_diagnostics", pd.DataFrame()),
+            frames.get("validation_fold_stability", pd.DataFrame()),
+            frames.get("validation_overfit_warnings", pd.DataFrame()),
+        ),
+        _evidence_row(
+            "Portfolio crowding",
+            pd.concat(
+                [
+                    _classification_only(frames.get("portfolio_crowding_summary", pd.DataFrame())),
+                    _classification_only(frames.get("portfolio_factor_crowding_summary", pd.DataFrame())),
+                ],
+                ignore_index=True,
+            ),
+            reason=_portfolio_crowding_evidence(
+                frames.get("portfolio_crowding_summary", pd.DataFrame()),
+                frames.get("portfolio_factor_crowding_summary", pd.DataFrame()),
+            ),
+            next_action="Use crowding as a research warning, not an automatic allocation change.",
+        ),
+        _evidence_row(
+            "Feature importance stability",
+            _first_non_empty(
+                frames.get("feature_importance_production_readiness", pd.DataFrame()),
+                frames.get("feature_importance_stability", pd.DataFrame()),
+            ),
+            reason=_feature_diagnostics(
+                pd.DataFrame(),
+                pd.DataFrame(),
+                _first_non_empty(
+                    frames.get("feature_importance_production_readiness", pd.DataFrame()),
+                    frames.get("feature_importance_stability", pd.DataFrame()),
+                ),
+            ),
+            next_action="Keep feature-importance evidence diagnostic until stable drivers repeat across folds.",
+        ),
+    ]
+    rows.append(
+        {
+            "area": "Overall production readiness",
+            "latest_classification": "not_ready",
+            "evidence_strength": "blocking",
+            "production_readiness": "not_ready",
+            "key_reason": (
+                "No current diagnostic gives stable enough evidence to justify production ML scoring, "
+                "action, sizing, ranking, or allocation changes."
+            ),
+            "recommended_next_action": "Keep production unchanged and investigate harmful, mixed, or unavailable evidence first.",
+        }
+    )
+    return pd.DataFrame(rows, columns=RESEARCH_EVIDENCE_SUMMARY_COLUMNS)
 
 
 def export_research_lab_payload(
@@ -120,7 +211,8 @@ def export_research_lab_diagnostics(
     metadata_path.write_text(_json_dumps(metadata), encoding="utf-8")
     files_written.append(metadata_path.name)
 
-    for table_name, table in tables.items():
+    export_tables = _tables_with_research_evidence_summary(tables)
+    for table_name, table in export_tables.items():
         safe_name = safe_filename_stem(table_name)
         if table is None:
             skipped_tables.append({"table": safe_name, "reason": "missing"})
@@ -152,7 +244,7 @@ def export_research_lab_diagnostics(
 
     handoff = build_codex_handoff(
         run_metadata=metadata,
-        tables=tables,
+        tables=export_tables,
         manifest=manifest,
         notes=notes or {},
     )
@@ -383,6 +475,122 @@ def _first_non_empty(*values: object) -> pd.DataFrame:
         if not frame.empty:
             return frame
     return pd.DataFrame()
+
+
+def _tables_with_research_evidence_summary(tables: Mapping[str, object]) -> dict[str, object]:
+    export_tables = dict(tables)
+    if "research_evidence_summary" not in export_tables:
+        export_tables["research_evidence_summary"] = build_research_evidence_summary(export_tables)
+    return export_tables
+
+
+def _evidence_row(area: str, frame: pd.DataFrame, *, reason: str, next_action: str) -> dict[str, str]:
+    classification = _latest_classification(frame)
+    strength = _evidence_strength(classification)
+    return {
+        "area": area,
+        "latest_classification": classification,
+        "evidence_strength": strength,
+        "production_readiness": _production_readiness(strength),
+        "key_reason": reason,
+        "recommended_next_action": next_action,
+    }
+
+
+def _validation_summary_row(
+    leakage: pd.DataFrame,
+    fold_stability: pd.DataFrame,
+    overfit: pd.DataFrame,
+) -> dict[str, str]:
+    combined = pd.concat(
+        [
+            _classification_only(leakage),
+            _classification_only(fold_stability),
+            _classification_only(overfit),
+        ],
+        ignore_index=True,
+    )
+    return _evidence_row(
+        "Validation leakage / overfit",
+        combined,
+        reason=_validation_evidence(leakage, fold_stability, overfit),
+        next_action="Keep validation warnings blocking until leakage, fold stability, and overfit checks are clean.",
+    )
+
+
+def _classification_only(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "classification" not in frame:
+        return pd.DataFrame(columns=["classification"])
+    return frame[["classification"]].copy()
+
+
+def _latest_classification(frame: pd.DataFrame) -> str:
+    if frame.empty or "classification" not in frame:
+        return "unavailable"
+    values = frame["classification"].dropna().astype(str).str.lower()
+    if values.empty:
+        return "unavailable"
+    counts = values.value_counts()
+    # ponytail: count-based synthesis only; add metric thresholds if diagnostics prove a stable rule.
+    for label in (
+        "harmful",
+        "inverted",
+        "not_ready",
+        "risky",
+        "likely_overfit",
+        "unstable",
+        "high_crowding",
+        "high_overlap",
+        "crowded",
+        "watch",
+        "mixed",
+        "moderate_crowding",
+        "insufficient_data",
+        "insufficient_sample",
+        "insufficient_event_data",
+        "unavailable",
+        "promising",
+        "useful",
+        "reliable",
+        "stable",
+        "clean",
+        "low_risk",
+        "low",
+        "low_crowding",
+    ):
+        if label in counts:
+            return label
+    return str(counts.index[0])
+
+
+def _evidence_strength(classification: str) -> str:
+    if classification in {
+        "harmful",
+        "inverted",
+        "not_ready",
+        "risky",
+        "likely_overfit",
+        "unstable",
+        "high_crowding",
+        "high_overlap",
+        "crowded",
+    }:
+        return "harmful"
+    if classification in {"watch", "mixed", "moderate_crowding", "promising"}:
+        return "mixed"
+    if classification in {"unavailable", "insufficient_data", "insufficient_sample", "insufficient_event_data"}:
+        return "unavailable"
+    if classification in {"useful", "reliable", "stable", "clean", "low_risk", "low", "low_crowding"}:
+        return "useful"
+    return "watch"
+
+
+def _production_readiness(strength: str) -> str:
+    if strength == "useful":
+        return "research_only"
+    if strength == "unavailable":
+        return "unavailable"
+    return "not_ready"
 
 
 def _display(value: object) -> str:
