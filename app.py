@@ -845,12 +845,16 @@ with research_tab:
 
     with st.expander("Portfolio overlap, correlation, and factor crowding", expanded=False):
         st.caption(
-            "This section checks whether the selected portfolio is truly diversified or concentrated "
-            "in highly correlated holdings. It is research-only and does not change suggested actions "
-            "or position sizes."
+            "Risk visibility only, not alpha: high crowding means several holdings may behave like one large bet. "
+            "Use this to avoid accidental overconcentration; it does not change ML Score, suggested action, "
+            "sizing, ranking, or allocation."
         )
         st.write("**Portfolio crowding summary**")
         st.dataframe(portfolio_crowding, width="stretch", hide_index=True)
+        st.caption(
+            "Read the classification as a concentration flag: low is broad, moderate means some overlap, "
+            "and high means many holdings may move together."
+        )
         st.write("**High-correlation overlap pairs**")
         if portfolio_correlation.empty:
             st.info("No portfolio correlation diagnostics were available.")
@@ -862,6 +866,10 @@ with research_tab:
         if not factor_crowding.empty:
             st.write("**Factor crowding summary**")
             st.dataframe(factor_crowding, width="stretch", hide_index=True)
+            st.caption(
+                "Factor classifications flag repeated AI, semiconductor, or tech-style exposure; "
+                "they are not return forecasts."
+            )
 
     research_ticker = st.selectbox(
         "Research ticker",

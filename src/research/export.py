@@ -99,7 +99,10 @@ def build_research_evidence_summary(tables: Mapping[str, object]) -> pd.DataFram
                 frames.get("portfolio_crowding_summary", pd.DataFrame()),
                 frames.get("portfolio_factor_crowding_summary", pd.DataFrame()),
             ),
-            next_action="Use crowding as a research warning, not an automatic allocation change.",
+            next_action=(
+                "Use crowding to review accidental overconcentration; do not treat it as a return forecast "
+                "or automatic allocation change."
+            ),
         ),
         _evidence_row(
             "Feature importance stability",
@@ -775,7 +778,9 @@ def _portfolio_crowding_evidence(portfolio_crowding: pd.DataFrame, factor_crowdi
     if portfolio_crowding.empty and factor_crowding.empty:
         return "No portfolio crowding diagnostics table was exported."
     parts = [
-        "Research-only portfolio crowding diagnostics checked correlation overlap and factor proxy concentration without changing actions or sizing."
+        "Risk-visibility only, not alpha: high crowding means several holdings may behave like one large bet. "
+        "Use it to avoid accidental overconcentration, not to predict return; diagnostics do not change "
+        "ML Score, suggested action, sizing, ranking, or allocation."
     ]
     if not portfolio_crowding.empty:
         row = portfolio_crowding.iloc[0]
