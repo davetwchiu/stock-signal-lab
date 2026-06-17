@@ -224,6 +224,9 @@ def build_codex_handoff(
     ml_reliability = _frame(tables.get("ml_reliability_by_regime"))
     ml_reliability_gate = _frame(tables.get("ml_reliability_gate_diagnostics"))
     momentum_quality = _frame(tables.get("momentum_quality_diagnostics"))
+    validation_leakage = _frame(tables.get("validation_leakage_diagnostics"))
+    validation_fold_stability = _frame(tables.get("validation_fold_stability"))
+    validation_overfit = _frame(tables.get("validation_overfit_warnings"))
     earnings_pead = _frame(tables.get("earnings_pead_summary"))
     drawdown_quality = _frame(tables.get("drawdown_risk_calibration_quality"))
     feature_audit = _frame(tables.get("feature_audit_summary"))
@@ -266,6 +269,9 @@ def build_codex_handoff(
         "",
         "## Momentum quality diagnostics",
         _momentum_quality_evidence(momentum_quality),
+        "",
+        "## Validation leakage / overfit diagnostics",
+        _validation_evidence(validation_leakage, validation_fold_stability, validation_overfit),
         "",
         "## Earnings / PEAD diagnostics",
         _earnings_pead_evidence(earnings_pead),
@@ -499,6 +505,36 @@ def _momentum_quality_evidence(momentum_quality: pd.DataFrame) -> str:
         f"Overall bucket spread: {bucket_spread}"
         + (f"; classifications: {count_text}." if count_text else ".")
     )
+
+
+def _classification_counts(frame: pd.DataFrame) -> str:
+    if frame.empty or "classification" not in frame:
+        return ""
+    counts = frame["classification"].astype(str).value_counts().sort_index()
+    return ", ".join(f"{classification}={count}" for classification, count in counts.items())
+
+
+def _validation_evidence(
+    leakage: pd.DataFrame,
+    fold_stability: pd.DataFrame,
+    overfit: pd.DataFrame,
+) -> str:
+    if leakage.empty and fold_stability.empty and overfit.empty:
+        return "No validation leakage or overfit diagnostics table was exported."
+
+    parts = [
+        "Research-only validation diagnostics checked fold gaps, fold instability, and thin or concentrated evidence without changing production scoring."
+    ]
+    leakage_counts = _classification_counts(leakage)
+    if leakage_counts:
+        parts.append(f"Leakage rows={len(leakage)}: {leakage_counts}.")
+    stability_counts = _classification_counts(fold_stability)
+    if stability_counts:
+        parts.append(f"Fold-stability rows={len(fold_stability)}: {stability_counts}.")
+    overfit_counts = _classification_counts(overfit)
+    if overfit_counts:
+        parts.append(f"Overfit-warning rows={len(overfit)}: {overfit_counts}.")
+    return " ".join(parts)
 
 
 def _earnings_pead_evidence(earnings_pead: pd.DataFrame) -> str:

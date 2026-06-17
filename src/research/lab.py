@@ -20,6 +20,9 @@ from src.ml.diagnostics import (
     build_ml_feature_audit,
     build_ml_feature_signal_diagnostics,
     build_ml_label_audit,
+    build_validation_fold_stability,
+    build_validation_leakage_diagnostics,
+    build_validation_overfit_warnings,
 )
 from src.ml.models import MODEL_OPTIONS
 from src.ml.target_diagnostics import (
@@ -229,6 +232,22 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         tail_risk_predictions=tail_risk.predictions,
         earnings_events=load_earnings_events(),
     )
+    fold_details = fold_details_for_export(
+        outperformance=outperformance.fold_metrics,
+        drawdown_risk=risk.fold_metrics,
+        risk_adjusted_outperform=risk_adjusted.fold_metrics,
+        tail_risk_adjusted_outperform=tail_risk.fold_metrics,
+    )
+    validation_leakage = build_validation_leakage_diagnostics(
+        fold_details,
+        label_horizon_days=label_horizon,
+    )
+    validation_fold_stability = build_validation_fold_stability(fold_details)
+    validation_overfit_warnings = build_validation_overfit_warnings(
+        outperformance.predictions,
+        baseline_panel=supervised,
+        universe=",".join(tickers),
+    )
     comparison = compare_feature_groups(
         supervised,
         group_options,
@@ -254,6 +273,9 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "momentum_quality_diagnostics": diagnostics.momentum_quality_diagnostics,
         "momentum_quality_by_regime": diagnostics.momentum_quality_by_regime,
         "momentum_quality_feature_summary": diagnostics.momentum_quality_feature_summary,
+        "validation_leakage_diagnostics": validation_leakage,
+        "validation_fold_stability": validation_fold_stability,
+        "validation_overfit_warnings": validation_overfit_warnings,
         "earnings_event_diagnostics": diagnostics.earnings_event_diagnostics,
         "ml_score_by_earnings_window": diagnostics.ml_score_by_earnings_window,
         "earnings_pead_summary": diagnostics.earnings_pead_summary,
@@ -266,12 +288,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
             ],
             ignore_index=True,
         ),
-        "model_selection_fold_details": fold_details_for_export(
-            outperformance=outperformance.fold_metrics,
-            drawdown_risk=risk.fold_metrics,
-            risk_adjusted_outperform=risk_adjusted.fold_metrics,
-            tail_risk_adjusted_outperform=tail_risk.fold_metrics,
-        ),
+        "model_selection_fold_details": fold_details,
         "feature_group_comparison": comparison,
         "feature_audit_summary": feature_audit.inventory_summary,
         "feature_family_summary": feature_audit.family_summary,

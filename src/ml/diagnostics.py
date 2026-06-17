@@ -303,6 +303,47 @@ MOMENTUM_QUALITY_FEATURE_SUMMARY_COLUMNS = [
     "interpretation",
 ]
 
+VALIDATION_LEAKAGE_COLUMNS = [
+    "diagnostic",
+    "label_horizon_days",
+    "fold_count",
+    "min_train_test_gap_days",
+    "required_embargo_days",
+    "overlap_risk",
+    "classification",
+    "reason",
+]
+
+VALIDATION_FOLD_STABILITY_COLUMNS = [
+    "target",
+    "model",
+    "feature_group",
+    "fold_count",
+    "mean_roc_auc",
+    "std_roc_auc",
+    "mean_pr_auc",
+    "std_pr_auc",
+    "mean_brier",
+    "std_brier",
+    "best_fold_metric",
+    "worst_fold_metric",
+    "fold_instability",
+    "classification",
+    "reason",
+]
+
+VALIDATION_OVERFIT_WARNING_COLUMNS = [
+    "diagnostic",
+    "universe",
+    "sample_count",
+    "ticker_count",
+    "regime_count",
+    "positive_rate",
+    "bucket_spread",
+    "classification",
+    "reason",
+]
+
 PEAD_MIN_USABLE_EVENTS = 3
 PEAD_MIN_WINDOW_SAMPLES = 12
 PEAD_RETURN_TOLERANCE = 0.002
@@ -316,6 +357,18 @@ MOMENTUM_QUALITY_RETURN_TOLERANCE = 0.0025
 MOMENTUM_QUALITY_POSITIVE_RATE_TOLERANCE = 0.03
 MOMENTUM_QUALITY_DRAWDOWN_TOLERANCE = 0.05
 MOMENTUM_QUALITY_CONCENTRATION_LIMIT = 0.70
+VALIDATION_MIN_FOLDS = 3
+VALIDATION_HIGH_ROC_STD = 0.08
+VALIDATION_HIGH_ROC_GAP = 0.15
+VALIDATION_HIGH_BRIER_STD = 0.04
+VALIDATION_WATCH_ROC_STD = 0.04
+VALIDATION_WATCH_ROC_GAP = 0.08
+VALIDATION_WATCH_BRIER_STD = 0.02
+VALIDATION_OVERFIT_MIN_SAMPLES = 100
+VALIDATION_OVERFIT_MIN_TICKERS = 3
+VALIDATION_OVERFIT_TICKER_CONCENTRATION = 0.50
+VALIDATION_OVERFIT_REGIME_CONCENTRATION = 0.70
+VALIDATION_OVERFIT_WEAK_BUCKET_SPREAD = 0.0025
 
 LABEL_PREVALENCE_COLUMNS = [
     "label",
@@ -666,6 +719,18 @@ def _empty_momentum_quality_by_regime() -> pd.DataFrame:
 
 def _empty_momentum_quality_feature_summary() -> pd.DataFrame:
     return pd.DataFrame(columns=MOMENTUM_QUALITY_FEATURE_SUMMARY_COLUMNS)
+
+
+def _empty_validation_leakage_diagnostics() -> pd.DataFrame:
+    return pd.DataFrame(columns=VALIDATION_LEAKAGE_COLUMNS)
+
+
+def _empty_validation_fold_stability() -> pd.DataFrame:
+    return pd.DataFrame(columns=VALIDATION_FOLD_STABILITY_COLUMNS)
+
+
+def _empty_validation_overfit_warnings() -> pd.DataFrame:
+    return pd.DataFrame(columns=VALIDATION_OVERFIT_WARNING_COLUMNS)
 
 
 def _empty_score_direction_summary() -> pd.DataFrame:
@@ -3818,6 +3883,440 @@ def build_momentum_quality_diagnostics(
         if feature_rows
         else _empty_momentum_quality_feature_summary(),
     )
+
+
+def build_validation_leakage_diagnostics(
+    fold_details: pd.DataFrame,
+    *,
+    label_horizon_days: int,
+) -> pd.DataFrame:
+    """Check whether exported walk-forward folds leave enough label-window gap."""
+
+    if fold_details.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "diagnostic": "train_test_gap",
+                    "label_horizon_days": int(label_horizon_days),
+                    "fold_count": 0,
+                    "min_train_test_gap_days": pd.NA,
+                    "required_embargo_days": int(label_horizon_days),
+                    "overlap_risk": "unavailable",
+                    "classification": "unavailable",
+                    "reason": "No fold metadata was available for validation leakage diagnostics.",
+                }
+            ],
+            columns=VALIDATION_LEAKAGE_COLUMNS,
+        )
+
+    required = ["fold", "train_end", "test_start"]
+    missing = [column for column in required if column not in fold_details]
+    fold_count = int(fold_details["fold"].nunique()) if "fold" in fold_details else 0
+    if missing:
+        return pd.DataFrame(
+            [
+                {
+                    "diagnostic": "train_test_gap",
+                    "label_horizon_days": int(label_horizon_days),
+                    "fold_count": fold_count,
+                    "min_train_test_gap_days": pd.NA,
+                    "required_embargo_days": int(label_horizon_days),
+                    "overlap_risk": "unavailable",
+                    "classification": "unavailable",
+                    "reason": "Fold date metadata is missing: " + ", ".join(missing) + ".",
+                }
+            ],
+            columns=VALIDATION_LEAKAGE_COLUMNS,
+        )
+
+    dates = fold_details[required + [column for column in ("effective_embargo", "requested_embargo") if column in fold_details]].copy()
+    dates["train_end"] = pd.to_datetime(dates["train_end"], errors="coerce")
+    dates["test_start"] = pd.to_datetime(dates["test_start"], errors="coerce")
+    usable = dates.dropna(subset=["train_end", "test_start"])
+    if usable.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "diagnostic": "train_test_gap",
+                    "label_horizon_days": int(label_horizon_days),
+                    "fold_count": fold_count,
+                    "min_train_test_gap_days": pd.NA,
+                    "required_embargo_days": int(label_horizon_days),
+                    "overlap_risk": "unavailable",
+                    "classification": "unavailable",
+                    "reason": "Fold dates could not be parsed for validation leakage diagnostics.",
+                }
+            ],
+            columns=VALIDATION_LEAKAGE_COLUMNS,
+        )
+
+    gap_days = (usable["test_start"] - usable["train_end"]).dt.days
+    min_gap = int(gap_days.min())
+    effective_embargo = (
+        pd.to_numeric(usable["effective_embargo"], errors="coerce").min()
+        if "effective_embargo" in usable
+        else pd.NA
+    )
+    required_gap = int(label_horizon_days)
+    if fold_count < 1:
+        overlap_risk = "insufficient"
+        classification = "insufficient_data"
+        reason = "No complete validation folds were available."
+    elif min_gap < required_gap or (pd.notna(effective_embargo) and float(effective_embargo) < required_gap):
+        overlap_risk = "high"
+        classification = "risky"
+        reason = "At least one train/test gap is shorter than the forward label horizon."
+    elif min_gap < required_gap * 1.5:
+        overlap_risk = "thin"
+        classification = "watch"
+        reason = "Train/test folds are separated, but the minimum date gap is thin versus the label horizon."
+    else:
+        overlap_risk = "low"
+        classification = "clean"
+        reason = "Train/test folds have a date gap at least as large as the forward label horizon."
+
+    return pd.DataFrame(
+        [
+            {
+                "diagnostic": "train_test_gap",
+                "label_horizon_days": required_gap,
+                "fold_count": fold_count,
+                "min_train_test_gap_days": min_gap,
+                "required_embargo_days": required_gap,
+                "overlap_risk": overlap_risk,
+                "classification": classification,
+                "reason": reason,
+            }
+        ],
+        columns=VALIDATION_LEAKAGE_COLUMNS,
+    )
+
+
+def _validation_fold_model_name(group: pd.DataFrame) -> str:
+    if "selected_model" not in group:
+        return "unavailable"
+    models = sorted(group["selected_model"].dropna().astype(str).unique())
+    if not models:
+        return "unavailable"
+    if len(models) == 1:
+        return models[0]
+    return "auto_select: " + ", ".join(models)
+
+
+def _validation_fold_classification(
+    *,
+    fold_count: int,
+    roc_std: object,
+    roc_gap: object,
+    brier_std: object,
+) -> tuple[str, str]:
+    if fold_count < VALIDATION_MIN_FOLDS:
+        return "insufficient_data", "Fewer than three folds were available for a stability read."
+
+    high_roc_std = pd.notna(roc_std) and float(roc_std) > VALIDATION_HIGH_ROC_STD
+    high_roc_gap = pd.notna(roc_gap) and float(roc_gap) > VALIDATION_HIGH_ROC_GAP
+    high_brier_std = pd.notna(brier_std) and float(brier_std) > VALIDATION_HIGH_BRIER_STD
+    if high_roc_std or high_roc_gap or high_brier_std:
+        return "unstable", "Fold metrics vary sharply; one validation period may be driving the result."
+
+    watch_roc_std = pd.notna(roc_std) and float(roc_std) > VALIDATION_WATCH_ROC_STD
+    watch_roc_gap = pd.notna(roc_gap) and float(roc_gap) > VALIDATION_WATCH_ROC_GAP
+    watch_brier_std = pd.notna(brier_std) and float(brier_std) > VALIDATION_WATCH_BRIER_STD
+    if watch_roc_std or watch_roc_gap or watch_brier_std:
+        return "mixed", "Fold metrics move enough to treat the validation evidence as mixed."
+
+    return "stable", "Fold metrics are broad-based under the conservative stability thresholds."
+
+
+def build_validation_fold_stability(fold_details: pd.DataFrame) -> pd.DataFrame:
+    """Summarize whether validation metrics are stable across exported folds."""
+
+    if fold_details.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "target": "unavailable",
+                    "model": "unavailable",
+                    "feature_group": "unavailable",
+                    "fold_count": 0,
+                    "mean_roc_auc": pd.NA,
+                    "std_roc_auc": pd.NA,
+                    "mean_pr_auc": pd.NA,
+                    "std_pr_auc": pd.NA,
+                    "mean_brier": pd.NA,
+                    "std_brier": pd.NA,
+                    "best_fold_metric": pd.NA,
+                    "worst_fold_metric": pd.NA,
+                    "fold_instability": pd.NA,
+                    "classification": "unavailable",
+                    "reason": "No fold metrics were available for validation stability diagnostics.",
+                }
+            ],
+            columns=VALIDATION_FOLD_STABILITY_COLUMNS,
+        )
+
+    if "target" not in fold_details:
+        return pd.DataFrame(
+            [
+                {
+                    "target": "unavailable",
+                    "model": "unavailable",
+                    "feature_group": "unavailable",
+                    "fold_count": 0,
+                    "mean_roc_auc": pd.NA,
+                    "std_roc_auc": pd.NA,
+                    "mean_pr_auc": pd.NA,
+                    "std_pr_auc": pd.NA,
+                    "mean_brier": pd.NA,
+                    "std_brier": pd.NA,
+                    "best_fold_metric": pd.NA,
+                    "worst_fold_metric": pd.NA,
+                    "fold_instability": pd.NA,
+                    "classification": "unavailable",
+                    "reason": "Fold metrics did not include a target column.",
+                }
+            ],
+            columns=VALIDATION_FOLD_STABILITY_COLUMNS,
+        )
+
+    rows: list[dict[str, object]] = []
+    group_columns = ["target"]
+    if "feature_group" in fold_details:
+        group_columns.append("feature_group")
+    for keys, group in fold_details.groupby(group_columns, dropna=False, sort=True):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        target = str(keys[0])
+        feature_group = str(keys[1]) if len(keys) > 1 and pd.notna(keys[1]) else "selected_feature_group"
+        fold_count = int(group["fold"].nunique()) if "fold" in group else int(len(group))
+        roc_source = group["roc_auc"] if "roc_auc" in group else pd.Series(dtype=float)
+        pr_source = group["pr_auc"] if "pr_auc" in group else pd.Series(dtype=float)
+        brier_source = group["brier_score"] if "brier_score" in group else pd.Series(dtype=float)
+        roc = pd.to_numeric(roc_source, errors="coerce").dropna()
+        pr = pd.to_numeric(pr_source, errors="coerce").dropna()
+        brier = pd.to_numeric(brier_source, errors="coerce").dropna()
+        best = float(roc.max()) if not roc.empty else pd.NA
+        worst = float(roc.min()) if not roc.empty else pd.NA
+        roc_gap = best - worst if pd.notna(best) and pd.notna(worst) else pd.NA
+        roc_std = float(roc.std(ddof=0)) if len(roc) > 1 else pd.NA
+        pr_std = float(pr.std(ddof=0)) if len(pr) > 1 else pd.NA
+        brier_std = float(brier.std(ddof=0)) if len(brier) > 1 else pd.NA
+
+        if roc.empty and pr.empty and brier.empty:
+            classification = "unavailable"
+            reason = "No fold-level ROC, PR, or Brier metrics were available."
+        else:
+            classification, reason = _validation_fold_classification(
+                fold_count=fold_count,
+                roc_std=roc_std,
+                roc_gap=roc_gap,
+                brier_std=brier_std,
+            )
+        rows.append(
+            {
+                "target": target,
+                "model": _validation_fold_model_name(group),
+                "feature_group": feature_group,
+                "fold_count": fold_count,
+                "mean_roc_auc": float(roc.mean()) if not roc.empty else pd.NA,
+                "std_roc_auc": roc_std,
+                "mean_pr_auc": float(pr.mean()) if not pr.empty else pd.NA,
+                "std_pr_auc": pr_std,
+                "mean_brier": float(brier.mean()) if not brier.empty else pd.NA,
+                "std_brier": brier_std,
+                "best_fold_metric": best,
+                "worst_fold_metric": worst,
+                "fold_instability": roc_gap,
+                "classification": classification,
+                "reason": reason,
+            }
+        )
+    return pd.DataFrame(rows, columns=VALIDATION_FOLD_STABILITY_COLUMNS)
+
+
+def _probability_bucket_spread(
+    data: pd.DataFrame,
+    *,
+    probability_col: str,
+    return_col: str,
+    min_bucket_size: int,
+) -> object:
+    if probability_col not in data or return_col not in data:
+        return pd.NA
+    usable = data[[probability_col, return_col]].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(usable) < min_bucket_size * 2 or usable[probability_col].nunique(dropna=True) < 2:
+        return pd.NA
+    try:
+        usable = usable.copy()
+        usable["_bucket"] = pd.qcut(usable[probability_col], q=3, labels=False, duplicates="drop")
+    except ValueError:
+        return pd.NA
+    grouped = usable.dropna(subset=["_bucket"]).groupby("_bucket", observed=True)[return_col]
+    if grouped.ngroups < 2:
+        return pd.NA
+    means = grouped.mean().sort_index()
+    counts = grouped.size().sort_index()
+    low_key = means.index.min()
+    high_key = means.index.max()
+    if int(counts.loc[low_key]) < min_bucket_size or int(counts.loc[high_key]) < min_bucket_size:
+        return pd.NA
+    return float(means.loc[high_key] - means.loc[low_key])
+
+
+def _concentration_share(data: pd.DataFrame, column: str) -> object:
+    if column not in data or data.empty:
+        return pd.NA
+    shares = data[column].dropna().astype(str).str.strip()
+    shares = shares[shares != ""].value_counts(normalize=True)
+    return float(shares.iloc[0]) if not shares.empty else pd.NA
+
+
+def build_validation_overfit_warnings(
+    predictions: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    universe: str = "selected",
+    probability_col: str = "probability",
+    label_col: str = "actual",
+    return_col: str = "forward_excess_return",
+    min_samples: int = VALIDATION_OVERFIT_MIN_SAMPLES,
+    min_tickers: int = VALIDATION_OVERFIT_MIN_TICKERS,
+    min_bucket_size: int = MIN_SCORE_DIRECTION_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Warn when validation evidence is too thin or concentrated to trust."""
+
+    if predictions.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "diagnostic": "sample_coverage",
+                    "universe": universe,
+                    "sample_count": 0,
+                    "ticker_count": 0,
+                    "regime_count": 0,
+                    "positive_rate": pd.NA,
+                    "bucket_spread": pd.NA,
+                    "classification": "unavailable",
+                    "reason": "No validation predictions were available for overfit diagnostics.",
+                }
+            ],
+            columns=VALIDATION_OVERFIT_WARNING_COLUMNS,
+        )
+
+    data = predictions.copy()
+    candidate_regime_cols = list(DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(data, baseline_panel, candidate_regime_cols)
+    sample_count = int(len(data))
+    ticker_count = int(data["Ticker"].nunique()) if "Ticker" in data else 0
+    regime_column = _first_available_regime_column(data, candidate_regime_cols)
+    regime_count = int(data[regime_column].nunique()) if regime_column is not None else 0
+    positive_rate = _mean_metric(data, label_col) if label_col in data else pd.NA
+    bucket_spread = _probability_bucket_spread(
+        data,
+        probability_col=probability_col,
+        return_col=return_col,
+        min_bucket_size=min_bucket_size,
+    )
+    ticker_share = _concentration_share(data, "Ticker")
+    regime_share = _concentration_share(data, regime_column) if regime_column is not None else pd.NA
+
+    rows: list[dict[str, object]] = []
+    if sample_count < min_samples or ticker_count < min_tickers:
+        sample_classification = "insufficient_data"
+        sample_reason = "Validation sample or ticker coverage is too small for a broad evidence read."
+    else:
+        sample_classification = "low_risk"
+        sample_reason = "Validation sample and ticker coverage clear the minimum evidence thresholds."
+    rows.append(
+        {
+            "diagnostic": "sample_coverage",
+            "universe": universe,
+            "sample_count": sample_count,
+            "ticker_count": ticker_count,
+            "regime_count": regime_count,
+            "positive_rate": positive_rate,
+            "bucket_spread": bucket_spread,
+            "classification": sample_classification,
+            "reason": sample_reason,
+        }
+    )
+
+    if pd.notna(ticker_share) and float(ticker_share) > VALIDATION_OVERFIT_TICKER_CONCENTRATION:
+        ticker_classification = "likely_overfit"
+        ticker_reason = "More than half of validation rows come from one ticker."
+    elif ticker_count < min_tickers:
+        ticker_classification = "insufficient_data"
+        ticker_reason = "Too few tickers were available to check ticker concentration."
+    else:
+        ticker_classification = "low_risk"
+        ticker_reason = "Validation rows are not dominated by one ticker."
+    rows.append(
+        {
+            "diagnostic": "ticker_concentration",
+            "universe": universe,
+            "sample_count": sample_count,
+            "ticker_count": ticker_count,
+            "regime_count": regime_count,
+            "positive_rate": positive_rate,
+            "bucket_spread": bucket_spread,
+            "classification": ticker_classification,
+            "reason": ticker_reason,
+        }
+    )
+
+    if regime_column is None:
+        regime_classification = "unavailable"
+        regime_reason = "No regime column was available for concentration diagnostics."
+    elif pd.notna(regime_share) and float(regime_share) > VALIDATION_OVERFIT_REGIME_CONCENTRATION:
+        regime_classification = "watch"
+        regime_reason = "Most validation rows come from one regime, so evidence may not generalize."
+    elif regime_count < 2:
+        regime_classification = "insufficient_data"
+        regime_reason = "Too few regimes were available to check regime concentration."
+    else:
+        regime_classification = "low_risk"
+        regime_reason = "Validation rows are not dominated by one regime."
+    rows.append(
+        {
+            "diagnostic": "regime_concentration",
+            "universe": universe,
+            "sample_count": sample_count,
+            "ticker_count": ticker_count,
+            "regime_count": regime_count,
+            "positive_rate": positive_rate,
+            "bucket_spread": bucket_spread,
+            "classification": regime_classification,
+            "reason": regime_reason,
+        }
+    )
+
+    if pd.isna(bucket_spread):
+        spread_classification = "unavailable"
+        spread_reason = "Probability buckets were unavailable or too small for a validation spread read."
+    elif abs(float(bucket_spread)) <= VALIDATION_OVERFIT_WEAK_BUCKET_SPREAD:
+        spread_classification = "watch"
+        spread_reason = "Probability buckets show little realised return separation."
+    elif float(bucket_spread) < -VALIDATION_OVERFIT_WEAK_BUCKET_SPREAD:
+        spread_classification = "likely_overfit"
+        spread_reason = "Higher-probability validation buckets had weaker realised forward excess returns."
+    else:
+        spread_classification = "low_risk"
+        spread_reason = "Probability buckets show positive realised return separation in this validation sample."
+    rows.append(
+        {
+            "diagnostic": "bucket_spread_support",
+            "universe": universe,
+            "sample_count": sample_count,
+            "ticker_count": ticker_count,
+            "regime_count": regime_count,
+            "positive_rate": positive_rate,
+            "bucket_spread": bucket_spread,
+            "classification": spread_classification,
+            "reason": spread_reason,
+        }
+    )
+
+    return pd.DataFrame(rows, columns=VALIDATION_OVERFIT_WARNING_COLUMNS)
 
 
 def _numeric_column(data: pd.DataFrame, column: str) -> pd.Series:
