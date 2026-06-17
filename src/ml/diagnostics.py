@@ -61,6 +61,29 @@ ML_RELIABILITY_BY_REGIME_COLUMNS = [
     "reason",
 ]
 
+ML_SCORE_REGIME_BUCKET_AUDIT_COLUMNS = [
+    "regime",
+    "sample_count",
+    "ticker_count",
+    "fold_count",
+    "high_score_sample_count",
+    "low_score_sample_count",
+    "high_score_bucket_outcome_rate",
+    "low_score_bucket_outcome_rate",
+    "high_score_avg_forward_excess_return",
+    "low_score_avg_forward_excess_return",
+    "opportunity_bucket_spread",
+    "high_score_drawdown_rate",
+    "low_score_drawdown_rate",
+    "drawdown_reversal_bucket_spread",
+    "inversion_flag",
+    "overextension_risk_flag",
+    "worst_ticker",
+    "classification",
+    "likely_interpretation",
+    "recommended_decision",
+]
+
 ML_RELIABILITY_GATE_COLUMNS = [
     "gate_name",
     "gate_description",
@@ -628,6 +651,7 @@ class MLDiagnostics:
     score_inversion: pd.DataFrame
     regime_score_direction: pd.DataFrame
     ml_reliability_by_regime: pd.DataFrame
+    ml_score_regime_bucket_audit: pd.DataFrame
     ml_reliability_gate_diagnostics: pd.DataFrame
     ml_reliability_gate_by_regime: pd.DataFrame
     drawdown_risk_calibration_quality: pd.DataFrame
@@ -742,6 +766,10 @@ def _empty_regime_segmented_diagnostics() -> pd.DataFrame:
 
 def _empty_ml_reliability_by_regime() -> pd.DataFrame:
     return pd.DataFrame(columns=ML_RELIABILITY_BY_REGIME_COLUMNS)
+
+
+def _empty_ml_score_regime_bucket_audit() -> pd.DataFrame:
+    return pd.DataFrame(columns=ML_SCORE_REGIME_BUCKET_AUDIT_COLUMNS)
 
 
 def _empty_ml_reliability_gate_diagnostics() -> pd.DataFrame:
@@ -3270,6 +3298,155 @@ def build_ml_reliability_by_regime(
     if not rows:
         return _empty_ml_reliability_by_regime()
     return pd.DataFrame(rows, columns=ML_RELIABILITY_BY_REGIME_COLUMNS)
+
+
+def _worst_high_score_ticker(data: pd.DataFrame, target_col: str) -> object:
+    if data.empty or "Ticker" not in data or target_col not in data:
+        return pd.NA
+    ticker_returns = pd.to_numeric(data[target_col], errors="coerce").groupby(data["Ticker"].astype(str)).mean()
+    ticker_returns = ticker_returns.dropna()
+    return pd.NA if ticker_returns.empty else str(ticker_returns.idxmin())
+
+
+def build_ml_score_regime_bucket_audit(
+    score_panel: pd.DataFrame,
+    *,
+    baseline_panel: pd.DataFrame | None = None,
+    regime_cols: list[str] | None = None,
+    score_col: str = "ML Score",
+    target_col: str = "forward_excess_return",
+    return_label_col: str = "actual_out",
+    drawdown_label_col: str = "actual_risk",
+    min_samples: int = MIN_REGIME_SAMPLE_COUNT,
+    min_bucket_size: int = MIN_REGIME_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Audit whether high ML score behaves as opportunity or overextension risk by regime."""
+
+    if score_panel.empty:
+        return _empty_ml_score_regime_bucket_audit()
+
+    candidate_regime_cols = list(regime_cols or DEFAULT_REGIME_COLUMNS)
+    data = _merge_regime_panel(score_panel, baseline_panel, candidate_regime_cols)
+    required = [score_col, target_col, return_label_col]
+    if any(column not in data for column in required):
+        return _empty_ml_score_regime_bucket_audit()
+
+    regime_column = _first_available_regime_column(data, candidate_regime_cols)
+    if regime_column is None:
+        return _empty_ml_score_regime_bucket_audit()
+
+    usable = data.dropna(subset=[regime_column, *required]).copy()
+    if usable.empty:
+        return _empty_ml_score_regime_bucket_audit()
+    usable[regime_column] = usable[regime_column].astype(str).str.strip()
+    usable = usable[usable[regime_column] != ""]
+    if usable.empty:
+        return _empty_ml_score_regime_bucket_audit()
+
+    has_drawdown = drawdown_label_col in usable
+    rows: list[dict[str, object]] = []
+    for regime, group in usable.groupby(regime_column, sort=True):
+        bucketed = _bucket_score_data(group, score_col)
+        high = bucketed[bucketed["score_bucket"] == "High"]
+        low = bucketed[bucketed["score_bucket"] == "Low"]
+        sample_count = int(len(group))
+        high_count = int(len(high))
+        low_count = int(len(low))
+        high_outcome = _mean_metric(high, return_label_col)
+        low_outcome = _mean_metric(low, return_label_col)
+        high_return = _mean_metric(high, target_col)
+        low_return = _mean_metric(low, target_col)
+        high_drawdown = _mean_metric(high, drawdown_label_col) if has_drawdown else pd.NA
+        low_drawdown = _mean_metric(low, drawdown_label_col) if has_drawdown else pd.NA
+        opportunity_spread = (
+            float(high_outcome) - float(low_outcome)
+            if pd.notna(high_outcome) and pd.notna(low_outcome)
+            else pd.NA
+        )
+        drawdown_spread = (
+            float(high_drawdown) - float(low_drawdown)
+            if pd.notna(high_drawdown) and pd.notna(low_drawdown)
+            else pd.NA
+        )
+        return_inverted = (
+            pd.notna(high_return)
+            and pd.notna(low_return)
+            and float(high_return) < float(low_return) - SPREAD_SIMILARITY_TOLERANCE
+        )
+        outcome_inverted = pd.notna(opportunity_spread) and float(opportunity_spread) < -SPREAD_SIMILARITY_TOLERANCE
+        inversion = outcome_inverted or return_inverted
+        overextension = (
+            inversion
+            and pd.notna(drawdown_spread)
+            and float(drawdown_spread) > SPREAD_SIMILARITY_TOLERANCE
+        )
+
+        if sample_count < min_samples or high_count < min_bucket_size or low_count < min_bucket_size:
+            classification = "insufficient_evidence"
+            interpretation = "High-vs-low score buckets are too thin for a regime read."
+            decision = "Needs more data"
+        elif overextension:
+            classification = "overextension_risk"
+            interpretation = (
+                "High-score bucket had weaker opportunity evidence and higher drawdown/reversal incidence; "
+                "research-only overextension-risk evidence."
+            )
+            decision = "Pivot"
+        elif inversion:
+            classification = "worse_opportunity_outcome"
+            interpretation = "High-score bucket had weaker opportunity evidence than the low-score bucket."
+            decision = "Pivot"
+        elif (
+            pd.notna(opportunity_spread)
+            and float(opportunity_spread) > SPREAD_SIMILARITY_TOLERANCE
+            and not (
+                pd.notna(drawdown_spread)
+                and float(drawdown_spread) > SPREAD_SIMILARITY_TOLERANCE
+            )
+        ):
+            classification = "better_opportunity_outcome"
+            interpretation = "High-score bucket had better opportunity evidence without higher drawdown incidence."
+            decision = "Continue"
+        elif pd.notna(drawdown_spread) and float(drawdown_spread) > SPREAD_SIMILARITY_TOLERANCE:
+            classification = "higher_drawdown_reversal_risk"
+            interpretation = "High-score bucket carried higher drawdown/reversal incidence without clear opportunity lift."
+            decision = "Pivot"
+        else:
+            classification = "mixed"
+            interpretation = "High-vs-low score buckets did not clearly separate opportunity or drawdown/reversal evidence."
+            decision = "Hold as audit-only"
+
+        if not has_drawdown and classification not in {"insufficient_evidence", "better_opportunity_outcome"}:
+            interpretation = f"Drawdown/reversal field {drawdown_label_col} is missing; only opportunity evidence is available."
+
+        rows.append(
+            {
+                "regime": regime,
+                "sample_count": sample_count,
+                "ticker_count": int(group["Ticker"].nunique()) if "Ticker" in group else pd.NA,
+                "fold_count": int(group["fold"].nunique()) if "fold" in group else pd.NA,
+                "high_score_sample_count": high_count,
+                "low_score_sample_count": low_count,
+                "high_score_bucket_outcome_rate": high_outcome,
+                "low_score_bucket_outcome_rate": low_outcome,
+                "high_score_avg_forward_excess_return": high_return,
+                "low_score_avg_forward_excess_return": low_return,
+                "opportunity_bucket_spread": opportunity_spread,
+                "high_score_drawdown_rate": high_drawdown,
+                "low_score_drawdown_rate": low_drawdown,
+                "drawdown_reversal_bucket_spread": drawdown_spread,
+                "inversion_flag": bool(inversion),
+                "overextension_risk_flag": bool(overextension),
+                "worst_ticker": _worst_high_score_ticker(high, target_col),
+                "classification": classification,
+                "likely_interpretation": interpretation,
+                "recommended_decision": decision,
+            }
+        )
+
+    if not rows:
+        return _empty_ml_score_regime_bucket_audit()
+    return pd.DataFrame(rows, columns=ML_SCORE_REGIME_BUCKET_AUDIT_COLUMNS)
 
 
 GATE_DEFINITIONS = (
@@ -6461,6 +6638,7 @@ def build_ml_diagnostics(
             _empty_score_inversion_diagnostics(),
             _empty_regime_score_direction_summary(),
             _empty_ml_reliability_by_regime(),
+            _empty_ml_score_regime_bucket_audit(),
             _empty_ml_reliability_gate_diagnostics(),
             _empty_ml_reliability_gate_by_regime(),
             _empty_drawdown_risk_calibration_quality(),
@@ -6497,6 +6675,7 @@ def build_ml_diagnostics(
     score_inversion = build_score_inversion_diagnostics(score_panel)
     regime_score_direction = build_regime_score_direction_summary(score_panel, baseline_panel=baseline_panel)
     ml_reliability_by_regime = build_ml_reliability_by_regime(score_panel, baseline_panel=baseline_panel)
+    ml_score_regime_bucket_audit = build_ml_score_regime_bucket_audit(score_panel, baseline_panel=baseline_panel)
     ml_reliability_gate_diagnostics = build_ml_reliability_gate_diagnostics(
         score_panel,
         baseline_panel=baseline_panel,
@@ -6550,6 +6729,7 @@ def build_ml_diagnostics(
         score_inversion,
         regime_score_direction,
         ml_reliability_by_regime,
+        ml_score_regime_bucket_audit,
         ml_reliability_gate_diagnostics,
         ml_reliability_gate_by_regime,
         risk_calibration_quality,

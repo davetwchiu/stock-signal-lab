@@ -292,6 +292,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "ml_probability_direction_check": diagnostics.probability_direction_check,
         "ml_score_direction_diagnostics": diagnostics.score_direction_summary,
         "ml_reliability_by_regime": diagnostics.ml_reliability_by_regime,
+        "ml_score_regime_bucket_audit": diagnostics.ml_score_regime_bucket_audit,
         "ml_reliability_gate_diagnostics": diagnostics.ml_reliability_gate_diagnostics,
         "ml_reliability_gate_by_regime": diagnostics.ml_reliability_gate_by_regime,
         "momentum_quality_diagnostics": diagnostics.momentum_quality_diagnostics,
