@@ -131,7 +131,7 @@ def test_opportunity_label_baseline_tables_include_local_breakdowns() -> None:
                 "label_outperform_20d": float(excess > 0.02),
                 "label_top_tercile_excess_20d": float(ticker == "AAA"),
                 "label_risk_adjusted_excess_20d": float(excess > 0.0),
-                "market_regime": "calm" if ticker != "BBB" else "risk_on",
+                "market_regime": "calm" if ticker != "BBB" else "Uptrend / high volatility",
                 "rs_qqq_60d": signal,
             }
             for date in dates
@@ -143,7 +143,7 @@ def test_opportunity_label_baseline_tables_include_local_breakdowns() -> None:
         ]
     )
 
-    _, breakdown = build_opportunity_label_baseline_tables(
+    _, breakdown, fragility = build_opportunity_label_baseline_tables(
         panel,
         ["signal"],
         horizon=20,
@@ -159,3 +159,16 @@ def test_opportunity_label_baseline_tables_include_local_breakdowns() -> None:
     risk_adjusted = breakdown[breakdown["target_id"] == "risk_adjusted_excess_20d"]
     assert set(risk_adjusted["breakdown"]) == {"fold", "ticker", "regime"}
     assert "global_fold_prevalence_baseline" in set(risk_adjusted["comparator"])
+
+    assert set(fragility["target_id"]) == {"risk_adjusted_excess_20d"}
+    assert {
+        "ticker",
+        "fold_ticker_mix",
+        "regime_ticker_mix",
+        "high_vol_uptrend_ticker",
+        "exclude_worst_ticker",
+        "exclude_worst_two_tickers",
+    }.issubset(set(fragility["view"]))
+    assert fragility[fragility["view"] == "ticker"]["baseline_loss_count"].notna().all()
+    assert fragility[fragility["view"] == "fold_ticker_mix"]["ticker_mix"].str.contains("AAA:").any()
+    assert (fragility["excluded_tickers"].astype(str).str.len() > 0).any()

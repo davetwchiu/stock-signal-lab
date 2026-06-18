@@ -115,6 +115,31 @@ OPPORTUNITY_LABEL_BASELINE_BREAKDOWN_COLUMNS = [
     "segment",
     *OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS,
 ]
+RISK_ADJUSTED_OPPORTUNITY_FRAGILITY_COLUMNS = [
+    "target_id",
+    "display_name",
+    "label_column",
+    "view",
+    "segment",
+    "excluded_tickers",
+    "sample_count",
+    "ticker_count",
+    "fold_count",
+    "event_prevalence",
+    "model_roc_auc",
+    "model_pr_auc",
+    "model_brier_score",
+    "model_calibration_gap",
+    "baseline_loss_count",
+    "baseline_match_count",
+    "model_win_count",
+    "unstable_count",
+    "worst_ticker",
+    "worst_fold",
+    "worst_regime",
+    "ticker_mix",
+    "classification",
+]
 MOMENTUM_BASELINE_CANDIDATES = (
     "momentum_60d",
     "rs_qqq_60d",
@@ -375,7 +400,11 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         outperformance.fold_metrics,
         label_col=f"label_outperform_{label_horizon}d",
     )
-    opportunity_label_baseline_challenge, opportunity_label_baseline_breakdown = build_opportunity_label_baseline_tables(
+    (
+        opportunity_label_baseline_challenge,
+        opportunity_label_baseline_breakdown,
+        risk_adjusted_opportunity_fragility,
+    ) = build_opportunity_label_baseline_tables(
         target_panel,
         columns,
         horizon=label_horizon,
@@ -463,6 +492,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "opportunity_baseline_challenge": opportunity_baseline_challenge,
         "opportunity_label_baseline_challenge": opportunity_label_baseline_challenge,
         "opportunity_label_baseline_breakdown": opportunity_label_baseline_breakdown,
+        "risk_adjusted_opportunity_fragility": risk_adjusted_opportunity_fragility,
         "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
         "adverse_outcome_label_comparison": adverse_outcome_label_comparison,
         "model_selection_summary": pd.concat(
@@ -674,7 +704,7 @@ def build_opportunity_label_baseline_challenge(
 ) -> pd.DataFrame:
     """Compare fixed opportunity labels with fold-aware simple baselines."""
 
-    challenge, _ = build_opportunity_label_baseline_tables(
+    challenge, _, _ = build_opportunity_label_baseline_tables(
         dataset,
         feature_columns,
         horizon=horizon,
@@ -707,18 +737,20 @@ def build_opportunity_label_baseline_tables(
     bucket_count: int = 4,
     min_train_samples: int = 20,
     min_train_events: int = 5,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Compare fixed labels with simple baselines, plus local failure breakdowns."""
 
     if dataset.empty or not feature_columns:
         return (
             pd.DataFrame(columns=OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS),
             pd.DataFrame(columns=OPPORTUNITY_LABEL_BASELINE_BREAKDOWN_COLUMNS),
+            pd.DataFrame(columns=RISK_ADJUSTED_OPPORTUNITY_FRAGILITY_COLUMNS),
         )
 
     panel, candidates = _with_opportunity_label_candidates(dataset, horizon)
     rows: list[dict[str, object]] = []
     breakdown_rows: list[dict[str, object]] = []
+    fragility_rows: list[dict[str, object]] = []
     for candidate in candidates:
         label_column = candidate["label_column"]
         if label_column not in panel:
@@ -757,10 +789,139 @@ def build_opportunity_label_baseline_tables(
         breakdown = _opportunity_baseline_breakdown(scored, "probability", regime_col, momentum_feature, bucket_count)
         for row in breakdown.to_dict("records"):
             breakdown_rows.append({**candidate, **row})
+        if candidate["target_id"] == f"risk_adjusted_excess_{horizon}d":
+            fragility = _risk_adjusted_opportunity_fragility(scored, candidate, regime_col, momentum_feature, bucket_count)
+            fragility_rows.extend(fragility.to_dict("records"))
     return (
         pd.DataFrame(rows, columns=OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS),
         pd.DataFrame(breakdown_rows, columns=OPPORTUNITY_LABEL_BASELINE_BREAKDOWN_COLUMNS),
+        pd.DataFrame(fragility_rows, columns=RISK_ADJUSTED_OPPORTUNITY_FRAGILITY_COLUMNS),
     )
+
+
+def _risk_adjusted_opportunity_fragility(
+    scored: pd.DataFrame,
+    candidate: dict[str, str],
+    regime_col: str | None,
+    momentum_feature: str | None,
+    bucket_count: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    ticker_rows: list[dict[str, object]] = []
+    for ticker, group in scored.groupby("Ticker", dropna=True, sort=True):
+        row = _risk_adjusted_fragility_row(
+            group, candidate, "ticker", str(ticker), "", regime_col, momentum_feature, bucket_count
+        )
+        ticker_rows.append(row)
+        rows.append(row)
+
+    for fold, group in scored.groupby("fold", dropna=True, sort=True):
+        rows.append(
+            _risk_adjusted_fragility_row(
+                group, candidate, "fold_ticker_mix", str(fold), "", regime_col, momentum_feature, bucket_count
+            )
+        )
+
+    if regime_col and regime_col in scored:
+        for regime, group in scored.groupby(regime_col, dropna=True, sort=True):
+            rows.append(
+                _risk_adjusted_fragility_row(
+                    group, candidate, "regime_ticker_mix", str(regime), "", regime_col, momentum_feature, bucket_count
+                )
+            )
+        high_vol = scored[scored[regime_col].astype(str).str.lower().eq("uptrend / high volatility")]
+        for ticker, group in high_vol.groupby("Ticker", dropna=True, sort=True):
+            rows.append(
+                _risk_adjusted_fragility_row(
+                    group,
+                    candidate,
+                    "high_vol_uptrend_ticker",
+                    str(ticker),
+                    "",
+                    regime_col,
+                    momentum_feature,
+                    bucket_count,
+                )
+            )
+
+    worst = [
+        str(row["segment"])
+        for row in sorted(
+            ticker_rows,
+            key=lambda row: (
+                -int(row["baseline_loss_count"]),
+                -float(pd.to_numeric(pd.Series([row["model_brier_score"]]), errors="coerce").fillna(-1).iloc[0]),
+                str(row["segment"]),
+            ),
+        )
+    ]
+    for count, view in ((1, "exclude_worst_ticker"), (2, "exclude_worst_two_tickers")):
+        excluded = worst[:count]
+        if not excluded:
+            continue
+        remaining = scored[~scored["Ticker"].astype(str).isin(excluded)]
+        rows.append(
+            _risk_adjusted_fragility_row(
+                remaining,
+                candidate,
+                view,
+                "all_remaining",
+                ",".join(excluded),
+                regime_col,
+                momentum_feature,
+                bucket_count,
+            )
+        )
+
+    return pd.DataFrame(rows, columns=RISK_ADJUSTED_OPPORTUNITY_FRAGILITY_COLUMNS)
+
+
+def _risk_adjusted_fragility_row(
+    group: pd.DataFrame,
+    candidate: dict[str, str],
+    view: str,
+    segment: str,
+    excluded_tickers: str,
+    regime_col: str | None,
+    momentum_feature: str | None,
+    bucket_count: int,
+) -> dict[str, object]:
+    comparison = _opportunity_baseline_summary(group, "probability", regime_col, momentum_feature, bucket_count)
+    model = comparison[comparison["comparator"] == "model_predicted_opportunity"].iloc[0].to_dict()
+    baselines = comparison[comparison["comparator"] != "model_predicted_opportunity"]
+    counts = baselines["classification"].value_counts()
+    row = {column: pd.NA for column in RISK_ADJUSTED_OPPORTUNITY_FRAGILITY_COLUMNS}
+    row.update(
+        {
+            **candidate,
+            "view": view,
+            "segment": segment,
+            "excluded_tickers": excluded_tickers,
+            "sample_count": model["sample_count"],
+            "ticker_count": model["ticker_count"],
+            "fold_count": model["fold_count"],
+            "event_prevalence": model["event_prevalence"],
+            "model_roc_auc": model["roc_auc"],
+            "model_pr_auc": model["pr_auc"],
+            "model_brier_score": model["brier_score"],
+            "model_calibration_gap": model["calibration_gap"],
+            "baseline_loss_count": int(counts.get("baseline_beats_model", 0)),
+            "baseline_match_count": int(counts.get("baseline_matches_model", 0)),
+            "model_win_count": int(counts.get("model_beats_baseline", 0)),
+            "unstable_count": int(counts.get("unstable_or_inconclusive", 0)),
+            "worst_ticker": model["worst_ticker"],
+            "worst_fold": model["worst_fold"],
+            "worst_regime": model["worst_regime"],
+            "ticker_mix": _ticker_mix(group),
+            "classification": model["classification"],
+        }
+    )
+    return row
+
+
+def _ticker_mix(data: pd.DataFrame) -> str:
+    counts = data["Ticker"].astype(str).value_counts().sort_index()
+    return ";".join(f"{ticker}:{int(count)}" for ticker, count in counts.items())
 
 
 def _with_opportunity_label_candidates(dataset: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, list[dict[str, str]]]:
