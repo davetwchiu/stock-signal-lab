@@ -40,6 +40,20 @@ OPPORTUNITY_LABEL_DECISION_SUMMARY_COLUMNS = [
     "recommended_decision",
     "short_reason",
 ]
+RISK_LABEL_DECISION_SUMMARY_COLUMNS = [
+    "risk_target",
+    "aggregate_classification",
+    "production_readiness",
+    "risk_visibility_usefulness",
+    "baseline_comparison_result",
+    "regime_fragility_flag",
+    "weakest_regime",
+    "feature_group_dependence",
+    "calibration_status",
+    "prevalence_baseline_status",
+    "recommended_decision",
+    "short_reason",
+]
 
 
 @dataclass(frozen=True)
@@ -224,6 +238,28 @@ def build_opportunity_label_decision_summary(tables: Mapping[str, object]) -> pd
             }
         )
     return pd.DataFrame(rows, columns=OPPORTUNITY_LABEL_DECISION_SUMMARY_COLUMNS)
+
+
+def build_risk_label_decision_summary(tables: Mapping[str, object]) -> pd.DataFrame:
+    """Consolidate drawdown/adverse-risk evidence from existing diagnostics."""
+
+    frames = {name: _frame(table) for name, table in tables.items()}
+    rows = []
+    drawdown = _drawdown_risk_decision_row(
+        frames.get("ml_diagnostics_summary", pd.DataFrame()),
+        frames.get("drawdown_risk_calibration_quality", pd.DataFrame()),
+        frames.get("drawdown_risk_prevalence_baseline_comparison", pd.DataFrame()),
+        frames.get("drawdown_risk_regime_calibration", pd.DataFrame()),
+        frames.get("drawdown_risk_feature_group_incremental_value", pd.DataFrame()),
+    )
+    if drawdown:
+        rows.append(drawdown)
+
+    adverse = frames.get("adverse_outcome_label_comparison", pd.DataFrame())
+    if not adverse.empty:
+        rows.extend(_adverse_risk_decision_row(row) for _, row in adverse.iterrows())
+
+    return pd.DataFrame(rows, columns=RISK_LABEL_DECISION_SUMMARY_COLUMNS)
 
 
 def export_research_lab_payload(
@@ -575,6 +611,10 @@ def _tables_with_research_summaries(tables: Mapping[str, object]) -> dict[str, o
         summary = build_opportunity_label_decision_summary(export_tables)
         if not summary.empty:
             export_tables["opportunity_label_decision_summary"] = summary
+    if "risk_label_decision_summary" not in export_tables:
+        summary = build_risk_label_decision_summary(export_tables)
+        if not summary.empty:
+            export_tables["risk_label_decision_summary"] = summary
     if "research_evidence_summary" not in export_tables:
         export_tables["research_evidence_summary"] = build_research_evidence_summary(export_tables)
     return export_tables
@@ -699,6 +739,147 @@ def _opportunity_decision_reason(
         parts.append(f"Weakest regime evidence: {_display(row.get('worst_regime'))}.")
     parts.append(f"Stop-rule decision: {_display(row.get('recommended_decision'))}.")
     return " ".join(parts)
+
+
+def _drawdown_risk_decision_row(
+    diagnostics: pd.DataFrame,
+    calibration: pd.DataFrame,
+    prevalence: pd.DataFrame,
+    regime: pd.DataFrame,
+    feature_groups: pd.DataFrame,
+) -> dict[str, object] | None:
+    if diagnostics.empty and calibration.empty and prevalence.empty and regime.empty and feature_groups.empty:
+        return None
+    summary = diagnostics[_column_equals(diagnostics, "target", "drawdown_risk")]
+    source = summary.iloc[0] if not summary.empty else pd.Series(dtype=object)
+    model = prevalence[_column_equals(prevalence, "comparator", "model_predicted_risk")]
+    model_row = model.iloc[0] if not model.empty else pd.Series(dtype=object)
+    quality = calibration.iloc[0] if not calibration.empty else pd.Series(dtype=object)
+    missing = _missing_values(
+        {
+            "ml_diagnostics_summary.target=drawdown_risk": source,
+            "drawdown_risk_calibration_quality": quality,
+            "drawdown_risk_prevalence_baseline_comparison.model_predicted_risk": model_row,
+        },
+        {
+            "ml_diagnostics_summary.target=drawdown_risk": ["roc_auc", "pr_auc", "brier_score"],
+            "drawdown_risk_calibration_quality": ["calibration_gap", "monotonicity"],
+            "drawdown_risk_prevalence_baseline_comparison.model_predicted_risk": ["classification"],
+        },
+    )
+    weakest = _weakest_risk_regime(regime, model_row)
+    feature_result = _risk_feature_group_dependence(feature_groups)
+    baseline = _display(model_row.get("classification"))
+    if missing:
+        decision = "Needs more data"
+        reason = "Missing source fields: " + ", ".join(missing) + "."
+        readiness = "unavailable"
+        usefulness = "needs_more_data"
+    else:
+        decision = "Hold as risk-visibility-only"
+        readiness = "not_ready"
+        usefulness = "risk_visibility_only"
+        reason = (
+            f"ROC-AUC={_display(source.get('roc_auc'))}, PR-AUC={_display(source.get('pr_auc'))}, "
+            f"but calibration is {_display(quality.get('monotonicity'))} and prevalence baseline result is {baseline}."
+        )
+    return {
+        "risk_target": "drawdown_risk_20d",
+        "aggregate_classification": baseline,
+        "production_readiness": readiness,
+        "risk_visibility_usefulness": usefulness,
+        "baseline_comparison_result": baseline,
+        "regime_fragility_flag": _risk_regime_fragility(regime),
+        "weakest_regime": weakest,
+        "feature_group_dependence": feature_result,
+        "calibration_status": _display(quality.get("monotonicity")),
+        "prevalence_baseline_status": baseline,
+        "recommended_decision": decision,
+        "short_reason": reason,
+    }
+
+
+def _adverse_risk_decision_row(row: pd.Series) -> dict[str, object]:
+    missing = _missing_row_values(row, ["label", "classification", "model_vs_regime_fold_baseline", "worst_regime"])
+    baseline = _display(row.get("model_vs_regime_fold_baseline", row.get("model_vs_global_fold_baseline")))
+    classification = _display(row.get("classification"))
+    if missing:
+        decision = "Needs more data"
+        reason = "Missing source fields: " + ", ".join(missing) + "."
+        readiness = "unavailable"
+        usefulness = "needs_more_data"
+    else:
+        decision = "Hold as audit-only"
+        readiness = "not_ready"
+        usefulness = "audit_only"
+        reason = (
+            f"{classification}; regime-fold baseline result is {baseline}. "
+            f"Weakest regime={_display(row.get('worst_regime'))}, ticker={_display(row.get('worst_ticker'))}."
+        )
+    return {
+        "risk_target": _display(row.get("label")),
+        "aggregate_classification": classification,
+        "production_readiness": readiness,
+        "risk_visibility_usefulness": usefulness,
+        "baseline_comparison_result": baseline,
+        "regime_fragility_flag": True,
+        "weakest_regime": _display(row.get("worst_regime")),
+        "feature_group_dependence": "not_tested",
+        "calibration_status": _risk_calibration_status(row),
+        "prevalence_baseline_status": baseline,
+        "recommended_decision": decision,
+        "short_reason": reason,
+    }
+
+
+def _missing_values(rows: Mapping[str, pd.Series], required: Mapping[str, list[str]]) -> list[str]:
+    missing: list[str] = []
+    for name, columns in required.items():
+        row = rows.get(name, pd.Series(dtype=object))
+        missing.extend(f"{name}.{column}" for column in columns if row.empty or pd.isna(row.get(column, pd.NA)))
+    return missing
+
+
+def _missing_row_values(row: pd.Series, columns: list[str]) -> list[str]:
+    return [column for column in columns if pd.isna(row.get(column, pd.NA))]
+
+
+def _column_equals(frame: pd.DataFrame, column: str, value: str) -> pd.Series:
+    if frame.empty or column not in frame:
+        return pd.Series(False, index=frame.index)
+    return frame[column].astype(str).eq(value)
+
+
+def _risk_regime_fragility(regime: pd.DataFrame) -> bool:
+    if regime.empty or "classification" not in regime:
+        return False
+    values = regime["classification"].astype(str).str.lower()
+    return values.str.contains("miscalibrated|insufficient|mixed|inverted").any()
+
+
+def _weakest_risk_regime(regime: pd.DataFrame, fallback: pd.Series) -> str:
+    if not regime.empty and {"regime", "calibration_gap"}.issubset(regime.columns):
+        ranked = regime.assign(_abs_gap=pd.to_numeric(regime["calibration_gap"], errors="coerce").abs())
+        ranked = ranked.sort_values("_abs_gap", ascending=False, kind="mergesort")
+        if ranked["_abs_gap"].notna().any():
+            return _display(ranked.iloc[0].get("regime"))
+    return _display(fallback.get("worst_regime"))
+
+
+def _risk_feature_group_dependence(feature_groups: pd.DataFrame) -> str:
+    if feature_groups.empty or "classification" not in feature_groups:
+        return "unavailable"
+    values = set(feature_groups["classification"].dropna().astype(str))
+    if values == {"baseline_beats_feature_group"}:
+        return "baseline_beats_all_feature_groups"
+    return ", ".join(sorted(values)) or "unavailable"
+
+
+def _risk_calibration_status(row: pd.Series) -> str:
+    gap = row.get("model_calibration_gap", row.get("calibration_gap", pd.NA))
+    if pd.isna(gap):
+        return "Unavailable"
+    return f"calibration_gap={gap}"
 
 
 def _evidence_row(area: str, frame: pd.DataFrame, *, reason: str, next_action: str) -> dict[str, str]:
