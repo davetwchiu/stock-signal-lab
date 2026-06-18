@@ -131,7 +131,7 @@ def test_opportunity_label_baseline_tables_include_local_breakdowns() -> None:
                 "label_outperform_20d": float(excess > 0.02),
                 "label_top_tercile_excess_20d": float(ticker == "AAA"),
                 "label_risk_adjusted_excess_20d": float(excess > 0.0),
-                "market_regime": "calm" if ticker != "BBB" else "Uptrend / high volatility",
+                "market_regime": "calm" if ticker == "AAA" else "Uptrend / high volatility",
                 "rs_qqq_60d": signal,
             }
             for date in dates
@@ -166,9 +166,19 @@ def test_opportunity_label_baseline_tables_include_local_breakdowns() -> None:
         "fold_ticker_mix",
         "regime_ticker_mix",
         "high_vol_uptrend_ticker",
+        "high_vol_uptrend_exclude_pltr",
+        "high_vol_uptrend_exclude_pltr_tsla",
         "exclude_worst_ticker",
         "exclude_worst_two_tickers",
     }.issubset(set(fragility["view"]))
     assert fragility[fragility["view"] == "ticker"]["baseline_loss_count"].notna().all()
     assert fragility[fragility["view"] == "fold_ticker_mix"]["ticker_mix"].str.contains("AAA:").any()
     assert (fragility["excluded_tickers"].astype(str).str.len() > 0).any()
+
+    high_vol = fragility[
+        (fragility["view"] == "regime_ticker_mix")
+        & (fragility["segment"] == "Uptrend / high volatility")
+    ].iloc[0]
+    assert high_vol["outcome_column"] == "forward_20d_excess_return"
+    assert high_vol["model_bucket_spread"] == -high_vol["inverted_bucket_spread"]
+    assert high_vol["normal_forward_outcome_spread"] == -high_vol["inverted_forward_outcome_spread"]

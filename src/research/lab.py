@@ -130,6 +130,19 @@ RISK_ADJUSTED_OPPORTUNITY_FRAGILITY_COLUMNS = [
     "model_pr_auc",
     "model_brier_score",
     "model_calibration_gap",
+    "model_bucket_spread",
+    "inverted_roc_auc",
+    "inverted_pr_auc",
+    "inverted_brier_score",
+    "inverted_calibration_gap",
+    "inverted_bucket_spread",
+    "outcome_column",
+    "normal_top_bucket_forward_outcome",
+    "normal_bottom_bucket_forward_outcome",
+    "normal_forward_outcome_spread",
+    "inverted_top_bucket_forward_outcome",
+    "inverted_bottom_bucket_forward_outcome",
+    "inverted_forward_outcome_spread",
     "baseline_loss_count",
     "baseline_match_count",
     "model_win_count",
@@ -843,6 +856,24 @@ def _risk_adjusted_opportunity_fragility(
                     bucket_count,
                 )
             )
+        for excluded, view in (
+            (["PLTR"], "high_vol_uptrend_exclude_pltr"),
+            (["PLTR", "TSLA"], "high_vol_uptrend_exclude_pltr_tsla"),
+        ):
+            remaining = high_vol[~high_vol["Ticker"].astype(str).isin(excluded)]
+            if not remaining.empty:
+                rows.append(
+                    _risk_adjusted_fragility_row(
+                        remaining,
+                        candidate,
+                        view,
+                        "all_remaining",
+                        ",".join(excluded),
+                        regime_col,
+                        momentum_feature,
+                        bucket_count,
+                    )
+                )
 
     worst = [
         str(row["segment"])
@@ -890,6 +921,13 @@ def _risk_adjusted_fragility_row(
     model = comparison[comparison["comparator"] == "model_predicted_opportunity"].iloc[0].to_dict()
     baselines = comparison[comparison["comparator"] != "model_predicted_opportunity"]
     counts = baselines["classification"].value_counts()
+    inverted = classification_metrics(group["actual"], 1.0 - group["probability"])
+    model_bucket_spread = _edge_bucket_spread(group, "probability", "actual", bucket_count)
+    inverted_group = group.assign(_inverted_probability=1.0 - group["probability"])
+    inverted_bucket_spread = _edge_bucket_spread(inverted_group, "_inverted_probability", "actual", bucket_count)
+    outcome_col = _risk_adjusted_outcome_column(candidate, group)
+    normal_outcome = _edge_bucket_outcome(group, "probability", outcome_col, bucket_count)
+    inverted_outcome = _edge_bucket_outcome(inverted_group, "_inverted_probability", outcome_col, bucket_count)
     row = {column: pd.NA for column in RISK_ADJUSTED_OPPORTUNITY_FRAGILITY_COLUMNS}
     row.update(
         {
@@ -905,6 +943,21 @@ def _risk_adjusted_fragility_row(
             "model_pr_auc": model["pr_auc"],
             "model_brier_score": model["brier_score"],
             "model_calibration_gap": model["calibration_gap"],
+            "model_bucket_spread": model_bucket_spread,
+            "inverted_roc_auc": inverted.get("roc_auc", pd.NA),
+            "inverted_pr_auc": inverted.get("pr_auc", pd.NA),
+            "inverted_brier_score": inverted.get("brier_score", pd.NA),
+            "inverted_calibration_gap": float(group["actual"].mean() - (1.0 - group["probability"]).mean())
+            if not group.empty
+            else pd.NA,
+            "inverted_bucket_spread": inverted_bucket_spread,
+            "outcome_column": outcome_col or pd.NA,
+            "normal_top_bucket_forward_outcome": normal_outcome["top"],
+            "normal_bottom_bucket_forward_outcome": normal_outcome["bottom"],
+            "normal_forward_outcome_spread": normal_outcome["spread"],
+            "inverted_top_bucket_forward_outcome": inverted_outcome["top"],
+            "inverted_bottom_bucket_forward_outcome": inverted_outcome["bottom"],
+            "inverted_forward_outcome_spread": inverted_outcome["spread"],
             "baseline_loss_count": int(counts.get("baseline_beats_model", 0)),
             "baseline_match_count": int(counts.get("baseline_matches_model", 0)),
             "model_win_count": int(counts.get("model_beats_baseline", 0)),
@@ -917,6 +970,48 @@ def _risk_adjusted_fragility_row(
         }
     )
     return row
+
+
+def _edge_bucket_spread(data: pd.DataFrame, score_col: str, value_col: str, bucket_count: int) -> object:
+    outcome = _edge_bucket_outcome(data, score_col, value_col, bucket_count)
+    return outcome["spread"]
+
+
+def _edge_bucket_outcome(
+    data: pd.DataFrame,
+    score_col: str,
+    value_col: str | None,
+    bucket_count: int,
+) -> dict[str, object]:
+    empty = {"bottom": pd.NA, "top": pd.NA, "spread": pd.NA}
+    if not value_col or score_col not in data or value_col not in data:
+        return empty
+    clean = data[[score_col, value_col]].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(clean) < 2 or clean[score_col].nunique() < 2:
+        return empty
+    buckets = min(max(2, bucket_count), len(clean))
+    clean = clean.assign(_bucket=pd.qcut(clean[score_col].rank(method="first"), q=buckets, labels=False))
+    grouped = clean.groupby("_bucket", observed=True)[value_col].mean()
+    if len(grouped) < 2:
+        return empty
+    bottom = float(grouped.iloc[0])
+    top = float(grouped.iloc[-1])
+    return {"bottom": bottom, "top": top, "spread": top - bottom}
+
+
+def _risk_adjusted_outcome_column(candidate: dict[str, str], data: pd.DataFrame) -> str | None:
+    label_column = str(candidate.get("label_column", ""))
+    suffix = label_column.rsplit("_", 1)[-1]
+    horizon = suffix if suffix.endswith("d") else "20d"
+    for column in (
+        f"forward_{horizon}_recent_vol_adjusted_excess_return",
+        f"forward_{horizon}_excess_return",
+        "forward_risk_adjusted_excess_return",
+        "forward_excess_return",
+    ):
+        if column in data and pd.to_numeric(data[column], errors="coerce").notna().any():
+            return column
+    return None
 
 
 def _ticker_mix(data: pd.DataFrame) -> str:
@@ -996,7 +1091,12 @@ def _opportunity_baseline_scored_rows(
     min_train_events: int,
 ) -> pd.DataFrame:
     merge_cols = ["Date", "Ticker"]
-    extra_cols = [column for column in [label_col, regime_col, momentum_feature] if column]
+    extra_cols = [
+        column
+        for column in [label_col, regime_col, momentum_feature, *_risk_adjusted_forward_columns(label_col)]
+        if column and column in baseline_panel
+    ]
+    extra_cols = list(dict.fromkeys(extra_cols))
     panel = baseline_panel[[*merge_cols, *extra_cols]].copy()
     panel["Date"] = pd.to_datetime(panel["Date"])
     panel[label_col] = pd.to_numeric(panel[label_col], errors="coerce")
@@ -1084,6 +1184,15 @@ def _opportunity_baseline_scored_rows(
             out["regime_momentum_fallback"] = True
         frames.append(out)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _risk_adjusted_forward_columns(label_col: str) -> list[str]:
+    suffix = label_col.rsplit("_", 1)[-1]
+    horizon = suffix if suffix.endswith("d") else "20d"
+    return [
+        f"forward_{horizon}_recent_vol_adjusted_excess_return",
+        f"forward_{horizon}_excess_return",
+    ]
 
 
 def _training_quantile_edges(values: pd.Series, bucket_count: int) -> list[float] | None:
