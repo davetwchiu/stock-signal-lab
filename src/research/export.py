@@ -26,6 +26,20 @@ RESEARCH_EVIDENCE_SUMMARY_COLUMNS = [
     "key_reason",
     "recommended_next_action",
 ]
+OPPORTUNITY_LABEL_DECISION_SUMMARY_COLUMNS = [
+    "target_name",
+    "aggregate_classification",
+    "production_readiness",
+    "broad_failure_flag",
+    "ticker_fragility_flag",
+    "weakest_tickers",
+    "regime_fragility_flag",
+    "weakest_regime",
+    "inversion_hypothesis_result",
+    "audit_only_flag",
+    "recommended_decision",
+    "short_reason",
+]
 
 
 @dataclass(frozen=True)
@@ -45,7 +59,7 @@ def build_research_lab_export_payload(
 ) -> dict[str, object]:
     """Build the app-facing payload exported after Streamlit reruns."""
 
-    export_tables = _tables_with_research_evidence_summary(tables)
+    export_tables = _tables_with_research_summaries(tables)
     return {
         "run_metadata": dict(run_metadata),
         "tables": export_tables,
@@ -137,6 +151,81 @@ def build_research_evidence_summary(tables: Mapping[str, object]) -> pd.DataFram
     return pd.DataFrame(rows, columns=RESEARCH_EVIDENCE_SUMMARY_COLUMNS)
 
 
+def build_opportunity_label_decision_summary(tables: Mapping[str, object]) -> pd.DataFrame:
+    """Consolidate opportunity-label redesign evidence from existing diagnostics."""
+
+    frames = {name: _frame(table) for name, table in tables.items()}
+    stop_rule = frames.get("target_stop_rule_comparison", pd.DataFrame())
+    quality = frames.get("target_quality_summary", pd.DataFrame())
+    arena = frames.get("target_arena_comparison", pd.DataFrame())
+    fragility = frames.get("risk_adjusted_opportunity_fragility", pd.DataFrame())
+
+    if stop_rule.empty or "target_id" not in stop_rule:
+        return pd.DataFrame(columns=OPPORTUNITY_LABEL_DECISION_SUMMARY_COLUMNS)
+
+    quality_by_target = _indexed_by_target(quality)
+    arena_by_target = _indexed_by_target(arena)
+    rows: list[dict[str, object]] = []
+    for _, row in stop_rule.iterrows():
+        target_id = str(row.get("target_id", ""))
+        quality_row = quality_by_target.get(target_id, pd.Series(dtype=object))
+        arena_row = arena_by_target.get(_arena_target_id(target_id), pd.Series(dtype=object))
+        source = _first_series(quality_row, arena_row, row)
+        missing = _missing_opportunity_decision_fields(row, quality_row)
+
+        aggregate = _aggregate_opportunity_classification(row, quality_row, arena_row)
+        broad_failure = _broad_opportunity_failure(row, quality_row)
+        ticker_fragility = _ticker_fragility_flag(row)
+        weakest_tickers = _display(row.get("worst_ticker"))
+        regime_fragility = _regime_fragility_flag(row, quality_row)
+        weakest_regime = _display(row.get("worst_regime"))
+        inversion_result = _default_inversion_result(row, quality_row)
+        decision = row.get("recommended_decision", "Needs more data")
+        risk_adjusted_override = False
+
+        if target_id == "risk_adjusted_excess_20d":
+            fragility_view = _risk_adjusted_fragility_view(fragility)
+            if not fragility_view.empty:
+                risk_adjusted_override = True
+                ticker_fragility = True
+                excluded = _first_value(fragility_view, "excluded_tickers")
+                weakest_tickers = _display(excluded) if pd.notna(excluded) and str(excluded) else weakest_tickers
+                weakest_regime = "Uptrend / high volatility"
+                regime_fragility = True
+                inversion_result = "ticker-driven; do not invert regime-wide"
+                decision = "Hold as audit-only"
+
+        if missing:
+            decision = "Needs more data"
+            reason = "Missing source fields: " + ", ".join(missing) + "."
+        elif risk_adjusted_override:
+            reason = (
+                f"Aggregate evidence is {aggregate}. No broad target collapse. "
+                f"Weakness is concentrated in {weakest_tickers} and {weakest_regime}; "
+                "do not invert scores regime-wide."
+            )
+        else:
+            reason = _opportunity_decision_reason(row, aggregate, broad_failure, ticker_fragility, regime_fragility)
+
+        rows.append(
+            {
+                "target_name": _display(source.get("display_name", target_id)),
+                "aggregate_classification": aggregate,
+                "production_readiness": _opportunity_production_readiness(row, quality_row),
+                "broad_failure_flag": bool(broad_failure),
+                "ticker_fragility_flag": bool(ticker_fragility),
+                "weakest_tickers": weakest_tickers,
+                "regime_fragility_flag": bool(regime_fragility),
+                "weakest_regime": weakest_regime,
+                "inversion_hypothesis_result": inversion_result,
+                "audit_only_flag": True,
+                "recommended_decision": _display(decision),
+                "short_reason": reason,
+            }
+        )
+    return pd.DataFrame(rows, columns=OPPORTUNITY_LABEL_DECISION_SUMMARY_COLUMNS)
+
+
 def export_research_lab_payload(
     payload: Mapping[str, object],
     *,
@@ -214,7 +303,7 @@ def export_research_lab_diagnostics(
     metadata_path.write_text(_json_dumps(metadata), encoding="utf-8")
     files_written.append(metadata_path.name)
 
-    export_tables = _tables_with_research_evidence_summary(tables)
+    export_tables = _tables_with_research_summaries(tables)
     for table_name, table in export_tables.items():
         safe_name = safe_filename_stem(table_name)
         if table is None:
@@ -480,11 +569,136 @@ def _first_non_empty(*values: object) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _tables_with_research_evidence_summary(tables: Mapping[str, object]) -> dict[str, object]:
+def _tables_with_research_summaries(tables: Mapping[str, object]) -> dict[str, object]:
     export_tables = dict(tables)
+    if "opportunity_label_decision_summary" not in export_tables:
+        summary = build_opportunity_label_decision_summary(export_tables)
+        if not summary.empty:
+            export_tables["opportunity_label_decision_summary"] = summary
     if "research_evidence_summary" not in export_tables:
         export_tables["research_evidence_summary"] = build_research_evidence_summary(export_tables)
     return export_tables
+
+
+def _indexed_by_target(frame: pd.DataFrame) -> dict[str, pd.Series]:
+    if frame.empty or "target_id" not in frame:
+        return {}
+    rows: dict[str, pd.Series] = {}
+    for _, row in frame.iterrows():
+        rows.setdefault(str(row.get("target_id")), row)
+    return rows
+
+
+def _arena_target_id(target_id: str) -> str:
+    if target_id == "tail_adjusted_outperform_20d":
+        return "drawdown_adjusted_opportunity_20d"
+    return target_id
+
+
+def _first_series(*rows: pd.Series) -> pd.Series:
+    for row in rows:
+        if not row.empty:
+            return row
+    return pd.Series(dtype=object)
+
+
+def _first_value(frame: pd.DataFrame, column: str) -> object:
+    if frame.empty or column not in frame:
+        return pd.NA
+    values = frame[column].dropna()
+    return values.iloc[0] if not values.empty else pd.NA
+
+
+def _missing_opportunity_decision_fields(row: pd.Series, quality_row: pd.Series) -> list[str]:
+    required = {
+        "target_stop_rule_comparison": ["recommended_decision", "stop_rule_result", "bucket_spread", "worst_ticker"],
+        "target_quality_summary": ["overall_target_quality", "production_candidate_status", "regime_stability"],
+    }
+    missing: list[str] = []
+    for column in required["target_stop_rule_comparison"]:
+        if pd.isna(row.get(column, pd.NA)):
+            missing.append(column)
+    for column in required["target_quality_summary"]:
+        if quality_row.empty or pd.isna(quality_row.get(column, pd.NA)):
+            missing.append(column)
+    return missing
+
+
+def _aggregate_opportunity_classification(row: pd.Series, quality_row: pd.Series, arena_row: pd.Series) -> str:
+    if not arena_row.empty and pd.notna(arena_row.get("evidence_classification", pd.NA)):
+        return _display(arena_row.get("evidence_classification"))
+    if not quality_row.empty and pd.notna(quality_row.get("overall_target_quality", pd.NA)):
+        return _display(quality_row.get("overall_target_quality"))
+    if pd.notna(row.get("stop_rule_result", pd.NA)):
+        return _display(row.get("stop_rule_result"))
+    return "Unavailable"
+
+
+def _broad_opportunity_failure(row: pd.Series, quality_row: pd.Series) -> bool:
+    quality = str(quality_row.get("overall_target_quality", "")).lower() if not quality_row.empty else ""
+    spread = pd.to_numeric(pd.Series([row.get("bucket_spread", pd.NA)]), errors="coerce").iloc[0]
+    diagnosis = str(row.get("failure_diagnosis", "")).lower()
+    return quality in {"weak", "unusable"} or (pd.notna(spread) and float(spread) <= 0.0) or "unavailable" in diagnosis
+
+
+def _ticker_fragility_flag(row: pd.Series) -> bool:
+    spread = pd.to_numeric(pd.Series([row.get("worst_ticker_bucket_spread", pd.NA)]), errors="coerce").iloc[0]
+    return pd.notna(spread) and float(spread) < 0.0
+
+
+def _regime_fragility_flag(row: pd.Series, quality_row: pd.Series) -> bool:
+    stability = str(quality_row.get("regime_stability", "")).lower() if not quality_row.empty else ""
+    spread = pd.to_numeric(pd.Series([row.get("worst_regime_bucket_spread", pd.NA)]), errors="coerce").iloc[0]
+    inversions = pd.to_numeric(pd.Series([row.get("regime_inversion_count", pd.NA)]), errors="coerce").iloc[0]
+    return "sensitive" in stability or "inverted" in stability or (pd.notna(spread) and float(spread) < 0.0) or (
+        pd.notna(inversions) and float(inversions) > 0.0
+    )
+
+
+def _default_inversion_result(row: pd.Series, quality_row: pd.Series) -> str:
+    inversions = pd.to_numeric(pd.Series([row.get("regime_inversion_count", pd.NA)]), errors="coerce").iloc[0]
+    if pd.isna(inversions):
+        return "unavailable"
+    if float(inversions) > 0.0 or _regime_fragility_flag(row, quality_row):
+        return "fragile in some regimes; do not invert regime-wide"
+    return "no regime-wide inversion supported"
+
+
+def _risk_adjusted_fragility_view(fragility: pd.DataFrame) -> pd.DataFrame:
+    if fragility.empty or "view" not in fragility:
+        return pd.DataFrame()
+    return fragility[
+        fragility["view"].astype(str).eq("high_vol_uptrend_exclude_pltr_tsla")
+        & (pd.to_numeric(fragility.get("model_bucket_spread"), errors="coerce") > 0.0)
+    ]
+
+
+def _opportunity_production_readiness(row: pd.Series, quality_row: pd.Series) -> str:
+    if bool(row.get("production_change_justified", False)):
+        return "production_trial_candidate"
+    status = str(quality_row.get("production_candidate_status", "")).lower() if not quality_row.empty else ""
+    if "keep baseline" in status:
+        return "baseline_only"
+    if "research" in status or "candidate" in status or "special" in status:
+        return "not_ready"
+    return "unavailable"
+
+
+def _opportunity_decision_reason(
+    row: pd.Series,
+    aggregate: str,
+    broad_failure: bool,
+    ticker_fragility: bool,
+    regime_fragility: bool,
+) -> str:
+    parts = [f"Aggregate evidence is {aggregate}."]
+    parts.append("Broad failure is present." if broad_failure else "No broad target collapse.")
+    if ticker_fragility:
+        parts.append(f"Weakest ticker evidence: {_display(row.get('worst_ticker'))}.")
+    if regime_fragility:
+        parts.append(f"Weakest regime evidence: {_display(row.get('worst_regime'))}.")
+    parts.append(f"Stop-rule decision: {_display(row.get('recommended_decision'))}.")
+    return " ".join(parts)
 
 
 def _evidence_row(area: str, frame: pd.DataFrame, *, reason: str, next_action: str) -> dict[str, str]:

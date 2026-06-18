@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.research.export import (
+    build_opportunity_label_decision_summary,
     build_research_evidence_summary,
     build_research_lab_export_payload,
     export_research_lab_diagnostics,
@@ -214,6 +215,117 @@ def test_research_evidence_summary_handles_missing_diagnostics() -> None:
     assert indexed.loc["ML reliability gate", "latest_classification"] == "unavailable"
     assert indexed.loc["Feature importance stability", "production_readiness"] == "unavailable"
     assert indexed.loc["Overall production readiness", "production_readiness"] == "not_ready"
+
+
+def test_opportunity_label_decision_summary_keeps_fragile_risk_adjusted_audit_only() -> None:
+    summary = build_opportunity_label_decision_summary(
+        {
+            "target_stop_rule_comparison": pd.DataFrame(
+                {
+                    "target_id": ["outperform_20d", "risk_adjusted_excess_20d"],
+                    "bucket_spread": [0.23, 0.24],
+                    "worst_ticker": ["AVGO", "NVDA"],
+                    "worst_ticker_bucket_spread": [-0.26, -0.38],
+                    "worst_regime": ["Uptrend / high volatility", "Downtrend / high risk"],
+                    "worst_regime_bucket_spread": [-0.07, -0.03],
+                    "regime_inversion_count": [1, 0],
+                    "recommended_decision": ["Continue", "Continue"],
+                    "stop_rule_result": ["baseline", "pass"],
+                    "failure_diagnosis": [
+                        "Current production target baseline for comparison.",
+                        "Candidate clears the research stop rule versus the current baseline.",
+                    ],
+                    "production_change_justified": [False, False],
+                }
+            ),
+            "target_quality_summary": pd.DataFrame(
+                {
+                    "target_id": ["outperform_20d", "risk_adjusted_excess_20d"],
+                    "display_name": ["Current 20d outperformance", "Recent-vol adjusted excess"],
+                    "overall_target_quality": ["Mixed", "Mixed"],
+                    "production_candidate_status": ["Keep baseline", "Research-only candidate"],
+                    "regime_stability": ["Inverted in some regimes", "Regime-sensitive"],
+                }
+            ),
+            "target_arena_comparison": pd.DataFrame(
+                {
+                    "target_id": ["outperform_20d", "risk_adjusted_excess_20d"],
+                    "evidence_classification": ["mixed", "promising"],
+                }
+            ),
+            "risk_adjusted_opportunity_fragility": pd.DataFrame(
+                {
+                    "view": ["high_vol_uptrend_exclude_pltr_tsla"],
+                    "excluded_tickers": ["PLTR,TSLA"],
+                    "model_bucket_spread": [0.19],
+                }
+            ),
+        }
+    )
+
+    indexed = summary.set_index("target_name")
+    risk_adjusted = indexed.loc["Recent-vol adjusted excess"]
+    assert risk_adjusted["recommended_decision"] == "Hold as audit-only"
+    assert risk_adjusted["weakest_tickers"] == "PLTR,TSLA"
+    assert risk_adjusted["weakest_regime"] == "Uptrend / high volatility"
+    assert risk_adjusted["inversion_hypothesis_result"] == "ticker-driven; do not invert regime-wide"
+    assert bool(risk_adjusted["audit_only_flag"]) is True
+
+
+def test_opportunity_label_decision_summary_missing_fields_needs_more_data() -> None:
+    summary = build_opportunity_label_decision_summary(
+        {
+            "target_stop_rule_comparison": pd.DataFrame(
+                {
+                    "target_id": ["risk_adjusted_excess_20d"],
+                    "recommended_decision": ["Continue"],
+                }
+            )
+        }
+    )
+
+    row = summary.iloc[0]
+    assert row["recommended_decision"] == "Needs more data"
+    assert "Missing source fields" in row["short_reason"]
+
+
+def test_export_includes_opportunity_label_decision_summary_csv(tmp_path: Path) -> None:
+    result = export_research_lab_diagnostics(
+        run_metadata=metadata(),
+        tables={
+            "target_stop_rule_comparison": pd.DataFrame(
+                {
+                    "target_id": ["risk_adjusted_excess_20d"],
+                    "bucket_spread": [0.24],
+                    "worst_ticker": ["NVDA"],
+                    "worst_ticker_bucket_spread": [-0.38],
+                    "worst_regime": ["Downtrend / high risk"],
+                    "worst_regime_bucket_spread": [-0.03],
+                    "regime_inversion_count": [0],
+                    "recommended_decision": ["Continue"],
+                    "stop_rule_result": ["pass"],
+                    "failure_diagnosis": ["Candidate clears the research stop rule versus the current baseline."],
+                    "production_change_justified": [False],
+                }
+            ),
+            "target_quality_summary": pd.DataFrame(
+                {
+                    "target_id": ["risk_adjusted_excess_20d"],
+                    "display_name": ["Recent-vol adjusted excess"],
+                    "overall_target_quality": ["Mixed"],
+                    "production_candidate_status": ["Research-only candidate"],
+                    "regime_stability": ["Regime-sensitive"],
+                }
+            ),
+        },
+        output_root=tmp_path,
+        run_id="run",
+    )
+
+    exported = pd.read_csv(result.run_dir / "opportunity_label_decision_summary.csv")
+    assert "opportunity_label_decision_summary.csv" in result.manifest["files_written"]
+    assert result.manifest["row_counts"]["opportunity_label_decision_summary.csv"] == 1
+    assert exported.loc[0, "recommended_decision"] == "Continue"
 
 
 def test_export_includes_research_evidence_summary_csv(tmp_path: Path) -> None:
