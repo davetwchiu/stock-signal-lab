@@ -50,6 +50,34 @@ from src.utils.config import FeatureConfig
 
 
 RESEARCH_FEATURE_GROUPS = ("technical", "technical_fourier", "technical_wavelet", "all")
+RISK_INCREMENTAL_VALUE_COLUMNS = [
+    "feature_group",
+    "features",
+    "sample_count",
+    "ticker_count",
+    "fold_count",
+    "event_prevalence",
+    "model_roc_auc",
+    "model_pr_auc",
+    "model_brier_score",
+    "model_calibration_gap",
+    "global_fold_baseline_roc_auc",
+    "global_fold_baseline_pr_auc",
+    "global_fold_baseline_brier_score",
+    "global_fold_baseline_calibration_gap",
+    "regime_fold_baseline_roc_auc",
+    "regime_fold_baseline_pr_auc",
+    "regime_fold_baseline_brier_score",
+    "regime_fold_baseline_calibration_gap",
+    "model_vs_global_fold_baseline",
+    "model_vs_regime_fold_baseline",
+    "worst_regime",
+    "worst_fold",
+    "worst_ticker",
+    "fallback_count",
+    "fold_train_prevalence_details",
+    "classification",
+]
 
 
 @dataclass(frozen=True)
@@ -270,6 +298,18 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         supervised,
         risk.fold_metrics,
     )
+    drawdown_risk_feature_group_incremental_value = build_drawdown_risk_feature_group_incremental_value(
+        supervised,
+        group_options,
+        label_column=f"label_drawdown_risk_{label_horizon}d",
+        model_name=model_name,
+        train_window=config.train_window,
+        test_window=config.test_window,
+        step=config.step,
+        embargo=config.embargo,
+        probability_threshold=config.classification_threshold,
+        model_selection_mode=config.model_mode,
+    )
     validation_overfit_warnings = build_validation_overfit_warnings(
         outperformance.predictions,
         baseline_panel=supervised,
@@ -318,6 +358,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
         "drawdown_risk_regime_calibration": diagnostics.drawdown_risk_regime_calibration,
         "drawdown_risk_prevalence_baseline_comparison": drawdown_risk_prevalence_baseline,
+        "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
         "model_selection_summary": pd.concat(
             [
                 summarize_model_selection(outperformance.fold_metrics, "outperformance"),
@@ -373,6 +414,121 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "quick": config.quick,
     }
     return build_research_lab_export_payload(run_metadata=metadata, tables=tables)
+
+
+def build_drawdown_risk_feature_group_incremental_value(
+    dataset: pd.DataFrame,
+    feature_groups: dict[str, list[str]],
+    *,
+    label_column: str,
+    model_name: str,
+    train_window: int,
+    test_window: int,
+    step: int | None,
+    embargo: int,
+    probability_threshold: float = 0.5,
+    model_selection_mode: str = "current_default",
+) -> pd.DataFrame:
+    """Compare drawdown-risk feature groups with fold-aware prevalence baselines."""
+
+    rows: list[dict[str, object]] = []
+    for feature_group, columns in feature_groups.items():
+        if not columns:
+            continue
+        result = walk_forward_validate_classifier(
+            dataset,
+            columns,
+            label_column=label_column,
+            model_name=model_name,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
+            embargo=embargo,
+            probability_threshold=probability_threshold,
+            model_selection_mode=model_selection_mode,
+        )
+        comparison = build_drawdown_risk_prevalence_baseline_comparison(
+            result.predictions,
+            dataset,
+            result.fold_metrics,
+            label_col=label_column,
+        )
+        if comparison.empty:
+            rows.append(_insufficient_risk_incremental_row(feature_group, len(columns)))
+            continue
+        rows.append(_risk_incremental_row(feature_group, len(columns), comparison))
+    return pd.DataFrame(rows, columns=RISK_INCREMENTAL_VALUE_COLUMNS)
+
+
+def _insufficient_risk_incremental_row(feature_group: str, features: int) -> dict[str, object]:
+    row = {column: pd.NA for column in RISK_INCREMENTAL_VALUE_COLUMNS}
+    row.update({"feature_group": feature_group, "features": features, "classification": "insufficient_evidence"})
+    return row
+
+
+def _risk_incremental_row(feature_group: str, features: int, comparison: pd.DataFrame) -> dict[str, object]:
+    by_name = {str(row["comparator"]): row for _, row in comparison.iterrows()}
+    model = by_name.get("model_predicted_risk")
+    global_base = by_name.get("global_fold_prevalence_baseline")
+    regime_base = by_name.get("regime_fold_prevalence_baseline")
+    if model is None or global_base is None or regime_base is None:
+        return _insufficient_risk_incremental_row(feature_group, features)
+
+    global_result = _risk_baseline_result(model, global_base)
+    regime_result = _risk_baseline_result(model, regime_base)
+    return {
+        "feature_group": feature_group,
+        "features": features,
+        "sample_count": model["sample_count"],
+        "ticker_count": model["ticker_count"],
+        "fold_count": model["fold_count"],
+        "event_prevalence": model["event_prevalence"],
+        "model_roc_auc": model["roc_auc"],
+        "model_pr_auc": model["pr_auc"],
+        "model_brier_score": model["brier_score"],
+        "model_calibration_gap": model["calibration_gap"],
+        "global_fold_baseline_roc_auc": global_base["roc_auc"],
+        "global_fold_baseline_pr_auc": global_base["pr_auc"],
+        "global_fold_baseline_brier_score": global_base["brier_score"],
+        "global_fold_baseline_calibration_gap": global_base["calibration_gap"],
+        "regime_fold_baseline_roc_auc": regime_base["roc_auc"],
+        "regime_fold_baseline_pr_auc": regime_base["pr_auc"],
+        "regime_fold_baseline_brier_score": regime_base["brier_score"],
+        "regime_fold_baseline_calibration_gap": regime_base["calibration_gap"],
+        "model_vs_global_fold_baseline": global_result,
+        "model_vs_regime_fold_baseline": regime_result,
+        "worst_regime": model["worst_regime"],
+        "worst_fold": model["worst_fold"],
+        "worst_ticker": model["worst_ticker"],
+        "fallback_count": regime_base["fallback_count"],
+        "fold_train_prevalence_details": model["fold_train_prevalence_details"],
+        "classification": _risk_incremental_classification(global_result, regime_result),
+    }
+
+
+def _risk_baseline_result(model: pd.Series, baseline: pd.Series) -> str:
+    model_status = str(model.get("classification", "insufficient_evidence"))
+    baseline_status = str(baseline.get("classification", "insufficient_evidence"))
+    if "insufficient_evidence" in {model_status, baseline_status}:
+        return "insufficient_evidence"
+    if baseline_status == "baseline_beats_model":
+        return "baseline_beats_feature_group"
+    if baseline_status == "model_beats_baseline":
+        return "adds_incremental_risk_signal"
+    return "baseline_matches_feature_group"
+
+
+def _risk_incremental_classification(global_result: str, regime_result: str) -> str:
+    results = {global_result, regime_result}
+    if "insufficient_evidence" in results:
+        return "insufficient_evidence"
+    if "baseline_beats_feature_group" in results:
+        return "baseline_beats_feature_group"
+    if results == {"adds_incremental_risk_signal"}:
+        return "adds_incremental_risk_signal"
+    if results == {"baseline_matches_feature_group"}:
+        return "baseline_matches_feature_group"
+    return "unstable_or_inconclusive"
 
 
 def build_features_for_universe(
