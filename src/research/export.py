@@ -454,6 +454,8 @@ def build_codex_handoff(
     feature_audit = _frame(tables.get("feature_audit_summary"))
     redundancy = _frame(tables.get("feature_redundancy_selection"))
     importance_stability = _frame(tables.get("feature_importance_stability"))
+    opportunity_decision = _frame(tables.get("opportunity_label_decision_summary"))
+    risk_decision = _frame(tables.get("risk_label_decision_summary"))
 
     lines = [
         "# Stock Signal Lab Research Run Handoff",
@@ -477,6 +479,9 @@ def build_codex_handoff(
         "",
         "## Production target status",
         _production_target_status(target_quality),
+        "",
+        "## ML decision handoff",
+        _ml_decision_handoff(opportunity_decision, risk_decision),
         "",
         "## Alternative target candidates",
         _alternative_target_candidates(target_quality),
@@ -1025,6 +1030,123 @@ def _production_target_status(target_quality: pd.DataFrame) -> str:
     step = row.get("recommended_next_step", "review exported target quality evidence")
     target = row.get("target_id", "production baseline")
     return f"This run suggests {target} remains a research-reviewed target with status {status}. Recommended next step: {step}."
+
+
+def _ml_decision_handoff(opportunity: pd.DataFrame, risk: pd.DataFrame) -> str:
+    if opportunity.empty and risk.empty:
+        return "\n".join(
+            [
+                "- Current production recommendation: Needs more data; decision summary unavailable.",
+                "- Opportunity posture: decision summary unavailable.",
+                "- Risk posture: decision summary unavailable.",
+                "- Recommended next research action: export decision summaries before any production ML change.",
+            ]
+        )
+
+    audit_items = []
+    risk_visibility_items = []
+    blocked_items = []
+    repeat_items = []
+    if not opportunity.empty:
+        audit_items.extend(_decision_items(opportunity, "target_name", "audit_only_flag", True))
+        blocked_items.extend(_not_ready_items(opportunity, "target_name"))
+        repeat_items.extend(_opportunity_do_not_repeat(opportunity))
+    if not risk.empty:
+        audit_items.extend(_decision_items(risk, "risk_target", "risk_visibility_usefulness", "audit_only"))
+        risk_visibility_items.extend(_decision_items(risk, "risk_target", "risk_visibility_usefulness", "risk_visibility_only"))
+        blocked_items.extend(_not_ready_items(risk, "risk_target"))
+        repeat_items.extend(_risk_do_not_repeat(risk))
+
+    return "\n".join(
+        [
+            f"- Current production recommendation: {_production_decision(opportunity, risk)}",
+            f"- Opportunity posture: {_posture(opportunity, 'target_name')}",
+            f"- Risk posture: {_posture(risk, 'risk_target')}",
+            f"- Audit-only items: {_join_items(audit_items)}",
+            f"- Risk-visibility-only items: {_join_items(risk_visibility_items)}",
+            f"- Blocked / not-ready production changes: {_join_items(blocked_items)}",
+            f"- Recommended next research action: {_next_decision_action(opportunity, risk)}",
+            f"- Tasks not to repeat without fresh evidence: {_join_items(repeat_items)}",
+        ]
+    )
+
+
+def _decision_items(frame: pd.DataFrame, label_column: str, flag_column: str, value: object) -> list[str]:
+    if frame.empty or label_column not in frame or flag_column not in frame:
+        return []
+    if isinstance(value, bool):
+        selected = frame[frame[flag_column].fillna(False).astype(bool) == value]
+    else:
+        selected = frame[frame[flag_column].astype(str).str.lower().eq(str(value).lower())]
+    return selected[label_column].dropna().astype(str).tolist()
+
+
+def _not_ready_items(frame: pd.DataFrame, label_column: str) -> list[str]:
+    if frame.empty or label_column not in frame or "production_readiness" not in frame:
+        return []
+    readiness = frame["production_readiness"].astype(str).str.lower()
+    selected = frame[~readiness.str.contains("production_ready|production_trial", na=False)]
+    return selected[label_column].dropna().astype(str).tolist()
+
+
+def _production_decision(opportunity: pd.DataFrame, risk: pd.DataFrame) -> str:
+    rows = pd.concat([opportunity, risk], ignore_index=True)
+    if rows.empty:
+        return "Needs more data; decision summary unavailable."
+    readiness = rows.get("production_readiness", pd.Series(dtype=object)).astype(str).str.lower()
+    if readiness.str.contains("production_ready|production_trial", na=False).any():
+        return "Review production-candidate rows before changing production ML."
+    if rows.get("recommended_decision", pd.Series(dtype=object)).astype(str).str.contains("Needs more data", na=False).any():
+        return "Needs more data before any production ML change."
+    return "No production ML change supported by decision summaries."
+
+
+def _posture(frame: pd.DataFrame, label_column: str) -> str:
+    if frame.empty:
+        return "decision summary unavailable."
+    parts = []
+    for _, row in frame.head(3).iterrows():
+        label = _display(row.get(label_column))
+        decision = _display(row.get("recommended_decision"))
+        aggregate = _display(row.get("aggregate_classification"))
+        readiness = _display(row.get("production_readiness"))
+        detail = f"{decision} ({readiness})" if aggregate == "Unavailable" else f"{decision}; {aggregate} ({readiness})"
+        parts.append(f"{label}: {detail}")
+    return "; ".join(parts) + "."
+
+
+def _next_decision_action(opportunity: pd.DataFrame, risk: pd.DataFrame) -> str:
+    rows = pd.concat([opportunity, risk], ignore_index=True)
+    if rows.empty or rows.get("recommended_decision", pd.Series(dtype=object)).astype(str).str.contains(
+        "Needs more data", na=False
+    ).any():
+        return "Needs more data from decision summaries before any production ML change."
+    return "Use decision summaries to decide whether more robustness evidence or data is needed before any production ML change."
+
+
+def _opportunity_do_not_repeat(opportunity: pd.DataFrame) -> list[str]:
+    items = []
+    if "inversion_hypothesis_result" in opportunity and opportunity["inversion_hypothesis_result"].astype(
+        str
+    ).str.contains("do not invert regime-wide", case=False, na=False).any():
+        items.append("broad high-vol/uptrend inversion test")
+    if "weakest_tickers" in opportunity and opportunity["weakest_tickers"].astype(str).str.contains(
+        "PLTR|TSLA", case=False, na=False
+    ).any():
+        items.append("PLTR/TSLA ticker-exclusion proof")
+    return items
+
+
+def _risk_do_not_repeat(risk: pd.DataFrame) -> list[str]:
+    if risk.empty or "risk_visibility_usefulness" not in risk:
+        return []
+    audit_rows = risk[risk["risk_visibility_usefulness"].astype(str).str.lower().eq("audit_only")]
+    return ["adverse-risk production switch"] if not audit_rows.empty else []
+
+
+def _join_items(items: list[str]) -> str:
+    unique = [item for item in dict.fromkeys(items) if item]
+    return ", ".join(unique) if unique else "None from available decision summaries."
 
 
 def _alternative_target_candidates(target_quality: pd.DataFrame) -> str:
