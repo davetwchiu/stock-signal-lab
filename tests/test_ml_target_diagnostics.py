@@ -12,6 +12,7 @@ from src.ml.target_diagnostics import (
     build_target_arena_comparison,
     build_target_balance_diagnostics,
     build_target_feature_group_comparison,
+    build_target_fold_calibration,
     build_target_quality_summary,
     build_target_regime_comparison,
     build_target_stability_summary,
@@ -189,7 +190,53 @@ def test_target_walk_forward_comparison_returns_one_row_per_usable_target() -> N
     row = comparison.iloc[0]
     assert row["target_id"] == "custom_20d"
     assert row["prediction_count"] > 0
+    assert row["event_rate"] == pytest.approx(row["positive_rate"])
+    assert 0 < row["top_bucket_count"] <= row["prediction_count"]
+    assert 0 < row["bottom_bucket_count"] <= row["prediction_count"]
+    assert pd.notna(row["mean_predicted_probability"])
     assert row["quality_summary"] in {"Promising", "Mixed", "Weak"}
+
+
+def test_target_fold_calibration_returns_raw_fold_counts_and_gaps() -> None:
+    panel = walk_forward_panel()
+    candidate = TargetCandidate(
+        target_id="custom_20d",
+        display_name="Custom 20d",
+        label_column="label_custom_20d",
+        target_type="test",
+        horizon=20,
+        description="Test target.",
+        positive_label_meaning="Test positive.",
+    )
+
+    calibration = build_target_fold_calibration(
+        panel,
+        ["feature_signal"],
+        [candidate],
+        train_window=20,
+        test_window=10,
+        step=10,
+        embargo=20,
+        min_sample_count=20,
+        min_bucket_count=2,
+    )
+
+    assert set(calibration.columns) == {
+        "target_id",
+        "display_name",
+        "fold",
+        "sample_count",
+        "event_rate",
+        "mean_predicted_probability",
+        "calibration_gap",
+        "top_bucket_count",
+        "bottom_bucket_count",
+    }
+    assert calibration["fold"].nunique() > 1
+    assert (calibration["sample_count"] > 0).all()
+    assert calibration["calibration_gap"].notna().all()
+    assert calibration["top_bucket_count"].notna().all()
+    assert calibration["bottom_bucket_count"].notna().all()
 
 
 def test_extreme_class_balance_is_flagged_without_crashing_walk_forward() -> None:
@@ -284,7 +331,41 @@ def test_target_regime_comparison_handles_single_class_regimes_without_crashing(
 
     assert set(comparison["regime"]) == {"Positive-only regime", "Negative-only regime"}
     assert comparison["roc_auc"].isna().all()
+    assert comparison["event_rate"].notna().all()
+    assert comparison["mean_predicted_probability"].notna().all()
+    assert comparison["calibration_gap"].notna().all()
     assert comparison["interpretation"].str.contains("one class").all()
+
+
+def test_target_regime_comparison_includes_bucket_counts_for_mixed_regimes() -> None:
+    panel = walk_forward_panel()
+    panel["regime"] = np.where(np.arange(len(panel)) % 2 == 0, "Distribution", "Sideways")
+    candidate = TargetCandidate(
+        target_id="custom_20d",
+        display_name="Custom 20d",
+        label_column="label_custom_20d",
+        target_type="test",
+        horizon=20,
+        description="Test target.",
+        positive_label_meaning="Test positive.",
+    )
+
+    comparison = build_target_regime_comparison(
+        panel,
+        ["feature_signal"],
+        [candidate],
+        train_window=20,
+        test_window=10,
+        step=10,
+        embargo=20,
+        min_target_sample_count=20,
+        min_sample_count=2,
+        min_bucket_count=2,
+    )
+
+    assert comparison["top_bucket_count"].notna().all()
+    assert comparison["bottom_bucket_count"].notna().all()
+    assert comparison["fold_count"].gt(0).all()
 
 
 def test_target_stability_summary_selects_best_feature_group_deterministically() -> None:

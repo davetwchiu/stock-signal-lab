@@ -36,6 +36,7 @@ from src.ml.target_diagnostics import (
     build_target_arena_comparison,
     build_target_balance_diagnostics,
     build_target_feature_group_comparison,
+    build_target_fold_calibration,
     build_target_quality_summary,
     build_target_regime_comparison,
     build_target_stability_summary,
@@ -329,6 +330,18 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         probability_threshold=config.classification_threshold,
         model_selection_mode=config.model_mode,
     )
+    target_fold_calibration = build_target_fold_calibration(
+        target_panel,
+        columns,
+        target_candidates,
+        model_name=model_name,
+        train_window=config.train_window,
+        test_window=config.test_window,
+        step=config.step,
+        embargo=config.embargo,
+        probability_threshold=config.classification_threshold,
+        model_selection_mode=config.model_mode,
+    )
     target_feature_group = build_target_feature_group_comparison(
         target_panel,
         group_options,
@@ -531,6 +544,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "target_candidate_definitions": target_definitions,
         "target_balance": target_balance,
         "target_walk_forward_comparison": target_walk_forward,
+        "target_fold_calibration": target_fold_calibration,
         "target_feature_group_comparison": target_feature_group,
         "target_regime_comparison": target_regime,
         "target_stability_summary": target_stability,

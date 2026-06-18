@@ -61,6 +61,10 @@ TARGET_WALK_FORWARD_COLUMNS = [
     "worst_ticker_bucket_spread",
     "quality_summary",
     "interpretation",
+    "event_rate",
+    "mean_predicted_probability",
+    "top_bucket_count",
+    "bottom_bucket_count",
 ]
 
 TARGET_FEATURE_GROUP_COMPARISON_COLUMNS = [
@@ -93,6 +97,24 @@ TARGET_REGIME_COMPARISON_COLUMNS = [
     "direction",
     "quality_summary",
     "interpretation",
+    "fold_count",
+    "event_rate",
+    "mean_predicted_probability",
+    "calibration_gap",
+    "top_bucket_count",
+    "bottom_bucket_count",
+]
+
+TARGET_FOLD_CALIBRATION_COLUMNS = [
+    "target_id",
+    "display_name",
+    "fold",
+    "sample_count",
+    "event_rate",
+    "mean_predicted_probability",
+    "calibration_gap",
+    "top_bucket_count",
+    "bottom_bucket_count",
 ]
 
 TARGET_STABILITY_SUMMARY_COLUMNS = [
@@ -495,29 +517,62 @@ def build_target_balance_diagnostics(
     return pd.DataFrame(rows, columns=TARGET_BALANCE_COLUMNS)
 
 
-def _bucket_positive_rates(predictions: pd.DataFrame, min_bucket_count: int) -> tuple[object, object, object]:
+def _bucket_positive_rate_summary(
+    predictions: pd.DataFrame,
+    min_bucket_count: int,
+) -> tuple[object, object, object, object, object]:
     if predictions.empty or "probability" not in predictions or "actual" not in predictions:
-        return pd.NA, pd.NA, pd.NA
+        return pd.NA, pd.NA, pd.NA, pd.NA, pd.NA
     data = predictions[["probability", "actual"]].apply(pd.to_numeric, errors="coerce").dropna()
-    if len(data) < min_bucket_count * 2 or data["probability"].nunique(dropna=True) < 2:
-        return pd.NA, pd.NA, pd.NA
+    if len(data) < 2 or data["probability"].nunique(dropna=True) < 2:
+        return pd.NA, pd.NA, pd.NA, pd.NA, pd.NA
     try:
         data["_bucket"] = pd.qcut(data["probability"], q=3, labels=False, duplicates="drop")
     except ValueError:
-        return pd.NA, pd.NA, pd.NA
+        return pd.NA, pd.NA, pd.NA, pd.NA, pd.NA
     data = data.dropna(subset=["_bucket"])
     if data["_bucket"].nunique(dropna=True) < 2:
-        return pd.NA, pd.NA, pd.NA
+        return pd.NA, pd.NA, pd.NA, pd.NA, pd.NA
     grouped = data.groupby("_bucket", observed=True)["actual"]
     counts = grouped.size()
     rates = grouped.mean().sort_index()
     low = rates.index.min()
     high = rates.index.max()
+    bottom_count = int(counts.loc[low])
+    top_count = int(counts.loc[high])
     if counts.loc[low] < min_bucket_count or counts.loc[high] < min_bucket_count:
-        return pd.NA, pd.NA, pd.NA
+        return pd.NA, pd.NA, pd.NA, top_count, bottom_count
     bottom_rate = float(rates.loc[low])
     top_rate = float(rates.loc[high])
-    return top_rate, bottom_rate, top_rate - bottom_rate
+    return top_rate, bottom_rate, top_rate - bottom_rate, top_count, bottom_count
+
+
+def _bucket_positive_rates(predictions: pd.DataFrame, min_bucket_count: int) -> tuple[object, object, object]:
+    top_rate, bottom_rate, spread, _, _ = _bucket_positive_rate_summary(predictions, min_bucket_count)
+    return top_rate, bottom_rate, spread
+
+
+def _prediction_calibration_fields(predictions: pd.DataFrame) -> dict[str, object]:
+    if predictions.empty or "probability" not in predictions or "actual" not in predictions:
+        return {
+            "event_rate": pd.NA,
+            "mean_predicted_probability": pd.NA,
+            "calibration_gap": pd.NA,
+        }
+    data = predictions[["probability", "actual"]].apply(pd.to_numeric, errors="coerce").dropna()
+    if data.empty:
+        return {
+            "event_rate": pd.NA,
+            "mean_predicted_probability": pd.NA,
+            "calibration_gap": pd.NA,
+        }
+    event_rate = float(data["actual"].mean())
+    mean_probability = float(data["probability"].mean())
+    return {
+        "event_rate": event_rate,
+        "mean_predicted_probability": mean_probability,
+        "calibration_gap": event_rate - mean_probability,
+    }
 
 
 def _worst_fold_roc_auc(fold_metrics: pd.DataFrame) -> tuple[object, object]:
@@ -613,6 +668,10 @@ def _target_walk_forward_row_and_predictions(
         "worst_fold_roc_auc": pd.NA,
         "worst_ticker": pd.NA,
         "worst_ticker_bucket_spread": pd.NA,
+        "event_rate": pd.NA,
+        "mean_predicted_probability": pd.NA,
+        "top_bucket_count": pd.NA,
+        "bottom_bucket_count": pd.NA,
     }
     predictions = pd.DataFrame()
     if (
@@ -645,10 +704,16 @@ def _target_walk_forward_row_and_predictions(
             calibration = calibration_summary(result.predictions)
             if not calibration.empty:
                 row["calibration_gap"] = calibration.iloc[0].get("calibration_gap", pd.NA)
-            top_rate, bottom_rate, spread = _bucket_positive_rates(result.predictions, min_bucket_count)
+            row.update(_prediction_calibration_fields(result.predictions))
+            top_rate, bottom_rate, spread, top_count, bottom_count = _bucket_positive_rate_summary(
+                result.predictions,
+                min_bucket_count,
+            )
             row["top_bucket_positive_rate"] = top_rate
             row["bottom_bucket_positive_rate"] = bottom_rate
             row["bucket_spread"] = spread
+            row["top_bucket_count"] = top_count
+            row["bottom_bucket_count"] = bottom_count
             worst_fold, worst_fold_auc = _worst_fold_roc_auc(result.fold_metrics)
             row["worst_fold"] = worst_fold
             row["worst_fold_roc_auc"] = worst_fold_auc
@@ -815,7 +880,11 @@ def _target_regime_rows(
         regime_data = regime_data[regime_data[regime_col] != ""]
         for regime, group in regime_data.groupby(regime_col, sort=True):
             metrics = classification_metrics(group["actual"], group["probability"])
-            top_rate, bottom_rate, spread = _bucket_positive_rates(group, min_bucket_count)
+            top_rate, bottom_rate, spread, top_count, bottom_count = _bucket_positive_rate_summary(
+                group,
+                min_bucket_count,
+            )
+            calibration_fields = _prediction_calibration_fields(group)
             direction, summary, interpretation = _target_regime_direction(
                 spread,
                 int(len(group)),
@@ -838,9 +907,77 @@ def _target_regime_rows(
                     "direction": direction,
                     "quality_summary": summary,
                     "interpretation": interpretation,
+                    "fold_count": int(group["fold"].nunique()) if "fold" in group else pd.NA,
+                    **calibration_fields,
+                    "top_bucket_count": top_count,
+                    "bottom_bucket_count": bottom_count,
                 }
             )
     return rows
+
+
+def _target_fold_calibration_rows(
+    predictions: pd.DataFrame,
+    candidate: TargetCandidate,
+    *,
+    min_bucket_count: int,
+) -> list[dict[str, object]]:
+    if predictions.empty or "fold" not in predictions:
+        return []
+    rows: list[dict[str, object]] = []
+    for fold, group in predictions.groupby("fold", sort=True):
+        _, _, _, top_count, bottom_count = _bucket_positive_rate_summary(group, min_bucket_count)
+        rows.append(
+            {
+                "target_id": candidate.target_id,
+                "display_name": candidate.display_name,
+                "fold": fold,
+                "sample_count": int(len(group)),
+                **_prediction_calibration_fields(group),
+                "top_bucket_count": top_count,
+                "bottom_bucket_count": bottom_count,
+            }
+        )
+    return rows
+
+
+def build_target_fold_calibration(
+    panel: pd.DataFrame,
+    feature_columns: list[str],
+    candidates: list[TargetCandidate] | None = None,
+    *,
+    model_name: str = "logistic_regression",
+    train_window: int = 252,
+    test_window: int = 63,
+    step: int | None = None,
+    embargo: int = 20,
+    probability_threshold: float = 0.5,
+    model_selection_mode: str = "current_default",
+    min_sample_count: int = MIN_TARGET_DIAGNOSTIC_SAMPLE_COUNT,
+    min_bucket_count: int = MIN_TARGET_BUCKET_COUNT,
+) -> pd.DataFrame:
+    """Return raw per-fold calibration evidence for diagnostics-only target candidates."""
+
+    active = candidates or target_candidate_registry()
+    balance = build_target_balance_diagnostics(panel, active, min_sample_count=min_sample_count).set_index("target_id")
+    rows: list[dict[str, object]] = []
+    for candidate in active:
+        _, predictions = _target_walk_forward_row_and_predictions(
+            panel,
+            feature_columns,
+            candidate,
+            balance.loc[candidate.target_id],
+            model_name=model_name,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
+            embargo=embargo,
+            probability_threshold=probability_threshold,
+            model_selection_mode=model_selection_mode,
+            min_bucket_count=min_bucket_count,
+        )
+        rows.extend(_target_fold_calibration_rows(predictions, candidate, min_bucket_count=min_bucket_count))
+    return pd.DataFrame(rows, columns=TARGET_FOLD_CALIBRATION_COLUMNS)
 
 
 def build_target_regime_comparison(
