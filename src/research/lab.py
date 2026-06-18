@@ -107,6 +107,14 @@ OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS = [
     "label_column",
     *OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS,
 ]
+OPPORTUNITY_LABEL_BASELINE_BREAKDOWN_COLUMNS = [
+    "target_id",
+    "display_name",
+    "label_column",
+    "breakdown",
+    "segment",
+    *OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS,
+]
 MOMENTUM_BASELINE_CANDIDATES = (
     "momentum_60d",
     "rs_qqq_60d",
@@ -367,7 +375,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         outperformance.fold_metrics,
         label_col=f"label_outperform_{label_horizon}d",
     )
-    opportunity_label_baseline_challenge = build_opportunity_label_baseline_challenge(
+    opportunity_label_baseline_challenge, opportunity_label_baseline_breakdown = build_opportunity_label_baseline_tables(
         target_panel,
         columns,
         horizon=label_horizon,
@@ -454,6 +462,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "drawdown_risk_prevalence_baseline_comparison": drawdown_risk_prevalence_baseline,
         "opportunity_baseline_challenge": opportunity_baseline_challenge,
         "opportunity_label_baseline_challenge": opportunity_label_baseline_challenge,
+        "opportunity_label_baseline_breakdown": opportunity_label_baseline_breakdown,
         "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
         "adverse_outcome_label_comparison": adverse_outcome_label_comparison,
         "model_selection_summary": pd.concat(
@@ -556,6 +565,16 @@ def build_opportunity_baseline_challenge(
     if scored.empty:
         return pd.DataFrame(columns=OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS)
 
+    return _opportunity_baseline_summary(scored, probability_col, regime_col, momentum_feature, bucket_count)
+
+
+def _opportunity_baseline_summary(
+    scored: pd.DataFrame,
+    probability_col: str,
+    regime_col: str | None,
+    momentum_feature: str | None,
+    bucket_count: int,
+) -> pd.DataFrame:
     fold_details_text = ";".join(
         f"{int(row.fold)}:{int(row.train_rows)}:{float(row.global_prevalence):.6f}"
         for row in scored[["fold", "train_rows", "global_prevalence"]].drop_duplicates().itertuples()
@@ -611,6 +630,32 @@ def build_opportunity_baseline_challenge(
     return pd.DataFrame(rows, columns=OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS)
 
 
+def _opportunity_baseline_breakdown(
+    scored: pd.DataFrame,
+    probability_col: str,
+    regime_col: str | None,
+    momentum_feature: str | None,
+    bucket_count: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    groups = [("fold", "fold"), ("ticker", "Ticker")]
+    if regime_col:
+        groups.append(("regime", regime_col))
+
+    for breakdown, column in groups:
+        if column not in scored:
+            continue
+        for segment, group in scored.groupby(column, dropna=True, sort=True):
+            summary = _opportunity_baseline_summary(group, probability_col, regime_col, momentum_feature, bucket_count)
+            for row in summary.to_dict("records"):
+                rows.append({"breakdown": breakdown, "segment": segment, **row})
+
+    return pd.DataFrame(
+        rows,
+        columns=["breakdown", "segment", *OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS],
+    )
+
+
 def build_opportunity_label_baseline_challenge(
     dataset: pd.DataFrame,
     feature_columns: list[str],
@@ -629,11 +674,51 @@ def build_opportunity_label_baseline_challenge(
 ) -> pd.DataFrame:
     """Compare fixed opportunity labels with fold-aware simple baselines."""
 
+    challenge, _ = build_opportunity_label_baseline_tables(
+        dataset,
+        feature_columns,
+        horizon=horizon,
+        model_name=model_name,
+        train_window=train_window,
+        test_window=test_window,
+        step=step,
+        embargo=embargo,
+        probability_threshold=probability_threshold,
+        model_selection_mode=model_selection_mode,
+        bucket_count=bucket_count,
+        min_train_samples=min_train_samples,
+        min_train_events=min_train_events,
+    )
+    return challenge
+
+
+def build_opportunity_label_baseline_tables(
+    dataset: pd.DataFrame,
+    feature_columns: list[str],
+    *,
+    horizon: int,
+    model_name: str,
+    train_window: int,
+    test_window: int,
+    step: int | None,
+    embargo: int,
+    probability_threshold: float = 0.5,
+    model_selection_mode: str = "current_default",
+    bucket_count: int = 4,
+    min_train_samples: int = 20,
+    min_train_events: int = 5,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compare fixed labels with simple baselines, plus local failure breakdowns."""
+
     if dataset.empty or not feature_columns:
-        return pd.DataFrame(columns=OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS)
+        return (
+            pd.DataFrame(columns=OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS),
+            pd.DataFrame(columns=OPPORTUNITY_LABEL_BASELINE_BREAKDOWN_COLUMNS),
+        )
 
     panel, candidates = _with_opportunity_label_candidates(dataset, horizon)
     rows: list[dict[str, object]] = []
+    breakdown_rows: list[dict[str, object]] = []
     for candidate in candidates:
         label_column = candidate["label_column"]
         if label_column not in panel:
@@ -650,18 +735,32 @@ def build_opportunity_label_baseline_challenge(
             probability_threshold=probability_threshold,
             model_selection_mode=model_selection_mode,
         )
-        comparison = build_opportunity_baseline_challenge(
+        momentum_feature = _select_momentum_feature(panel)
+        regime_col = _select_regime_column(panel)
+        scored = _opportunity_baseline_scored_rows(
             result.predictions,
             panel,
             result.fold_metrics,
             label_col=label_column,
+            probability_col="probability",
+            regime_col=regime_col,
+            momentum_feature=momentum_feature,
             bucket_count=bucket_count,
             min_train_samples=min_train_samples,
             min_train_events=min_train_events,
         )
+        if scored.empty:
+            continue
+        comparison = _opportunity_baseline_summary(scored, "probability", regime_col, momentum_feature, bucket_count)
         for row in comparison.to_dict("records"):
             rows.append({**candidate, **row})
-    return pd.DataFrame(rows, columns=OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS)
+        breakdown = _opportunity_baseline_breakdown(scored, "probability", regime_col, momentum_feature, bucket_count)
+        for row in breakdown.to_dict("records"):
+            breakdown_rows.append({**candidate, **row})
+    return (
+        pd.DataFrame(rows, columns=OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS),
+        pd.DataFrame(breakdown_rows, columns=OPPORTUNITY_LABEL_BASELINE_BREAKDOWN_COLUMNS),
+    )
 
 
 def _with_opportunity_label_candidates(dataset: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, list[dict[str, str]]]:
