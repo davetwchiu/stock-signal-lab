@@ -101,6 +101,12 @@ OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS = [
     "fold_train_prevalence_details",
     "classification",
 ]
+OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS = [
+    "target_id",
+    "display_name",
+    "label_column",
+    *OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS,
+]
 MOMENTUM_BASELINE_CANDIDATES = (
     "momentum_60d",
     "rs_qqq_60d",
@@ -361,6 +367,18 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         outperformance.fold_metrics,
         label_col=f"label_outperform_{label_horizon}d",
     )
+    opportunity_label_baseline_challenge = build_opportunity_label_baseline_challenge(
+        target_panel,
+        columns,
+        horizon=label_horizon,
+        model_name=model_name,
+        train_window=config.train_window,
+        test_window=config.test_window,
+        step=config.step,
+        embargo=config.embargo,
+        probability_threshold=config.classification_threshold,
+        model_selection_mode=config.model_mode,
+    )
     drawdown_risk_feature_group_incremental_value = build_drawdown_risk_feature_group_incremental_value(
         supervised,
         group_options,
@@ -435,6 +453,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "drawdown_risk_regime_calibration": diagnostics.drawdown_risk_regime_calibration,
         "drawdown_risk_prevalence_baseline_comparison": drawdown_risk_prevalence_baseline,
         "opportunity_baseline_challenge": opportunity_baseline_challenge,
+        "opportunity_label_baseline_challenge": opportunity_label_baseline_challenge,
         "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
         "adverse_outcome_label_comparison": adverse_outcome_label_comparison,
         "model_selection_summary": pd.concat(
@@ -590,6 +609,103 @@ def build_opportunity_baseline_challenge(
         row.pop("_worst_regime_brier", None)
         row.pop("_worst_ticker_brier", None)
     return pd.DataFrame(rows, columns=OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS)
+
+
+def build_opportunity_label_baseline_challenge(
+    dataset: pd.DataFrame,
+    feature_columns: list[str],
+    *,
+    horizon: int,
+    model_name: str,
+    train_window: int,
+    test_window: int,
+    step: int | None,
+    embargo: int,
+    probability_threshold: float = 0.5,
+    model_selection_mode: str = "current_default",
+    bucket_count: int = 4,
+    min_train_samples: int = 20,
+    min_train_events: int = 5,
+) -> pd.DataFrame:
+    """Compare fixed opportunity labels with fold-aware simple baselines."""
+
+    if dataset.empty or not feature_columns:
+        return pd.DataFrame(columns=OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS)
+
+    panel, candidates = _with_opportunity_label_candidates(dataset, horizon)
+    rows: list[dict[str, object]] = []
+    for candidate in candidates:
+        label_column = candidate["label_column"]
+        if label_column not in panel:
+            continue
+        result = walk_forward_validate_classifier(
+            panel,
+            feature_columns,
+            label_column=label_column,
+            model_name=model_name,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
+            embargo=embargo,
+            probability_threshold=probability_threshold,
+            model_selection_mode=model_selection_mode,
+        )
+        comparison = build_opportunity_baseline_challenge(
+            result.predictions,
+            panel,
+            result.fold_metrics,
+            label_col=label_column,
+            bucket_count=bucket_count,
+            min_train_samples=min_train_samples,
+            min_train_events=min_train_events,
+        )
+        for row in comparison.to_dict("records"):
+            rows.append({**candidate, **row})
+    return pd.DataFrame(rows, columns=OPPORTUNITY_LABEL_BASELINE_CHALLENGE_COLUMNS)
+
+
+def _with_opportunity_label_candidates(dataset: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+    output = dataset.copy()
+    excess_col = f"forward_{horizon}d_excess_return"
+    drawdown_col = f"forward_{horizon}d_drawdown"
+    stronger_label = f"label_stronger_excess_{horizon}d"
+    composite_label = f"label_composite_opportunity_{horizon}d"
+
+    excess = pd.to_numeric(output.get(excess_col, pd.Series(pd.NA, index=output.index)), errors="coerce")
+    drawdown = pd.to_numeric(output.get(drawdown_col, pd.Series(pd.NA, index=output.index)), errors="coerce")
+    output[stronger_label] = (excess > 0.05).astype(float)
+    output.loc[excess.isna(), stronger_label] = pd.NA
+    output[composite_label] = ((excess > 0.0) & (drawdown >= -0.10)).astype(float)
+    output.loc[excess.isna() | drawdown.isna(), composite_label] = pd.NA
+
+    candidates = [
+        {
+            "target_id": f"outperform_{horizon}d",
+            "display_name": f"Current {horizon}d outperformance",
+            "label_column": f"label_outperform_{horizon}d",
+        },
+        {
+            "target_id": f"stronger_excess_{horizon}d",
+            "display_name": f"Stronger {horizon}d excess return",
+            "label_column": stronger_label,
+        },
+        {
+            "target_id": f"top_tercile_excess_{horizon}d",
+            "display_name": f"Top-third relative performer",
+            "label_column": f"label_top_tercile_excess_{horizon}d",
+        },
+        {
+            "target_id": f"risk_adjusted_excess_{horizon}d",
+            "display_name": f"Recent-vol adjusted excess",
+            "label_column": f"label_risk_adjusted_excess_{horizon}d",
+        },
+        {
+            "target_id": f"composite_opportunity_{horizon}d",
+            "display_name": f"Positive excess with acceptable drawdown",
+            "label_column": composite_label,
+        },
+    ]
+    return output, candidates
 
 
 def _select_momentum_feature(panel: pd.DataFrame) -> str | None:

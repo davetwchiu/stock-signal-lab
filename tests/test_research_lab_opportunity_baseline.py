@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.research.lab import build_opportunity_baseline_challenge
+from src.research.lab import build_opportunity_baseline_challenge, build_opportunity_label_baseline_challenge
 
 
 def test_opportunity_baseline_challenge_uses_training_fold_prevalence() -> None:
@@ -55,3 +55,60 @@ def test_opportunity_baseline_challenge_uses_training_fold_prevalence() -> None:
         "momentum_bucket_prevalence_baseline",
         "regime_momentum_bucket_prevalence_baseline",
     }
+
+
+def test_opportunity_label_baseline_challenge_compares_fixed_candidate_labels() -> None:
+    dates = pd.date_range("2024-01-01", periods=30, freq="D")
+    rows = []
+    for date in dates:
+        for ticker, excess, drawdown, signal in (
+            ("AAA", 0.08, -0.03, 0.9),
+            ("BBB", 0.03, -0.12, 0.5),
+            ("CCC", -0.01, -0.02, 0.1),
+        ):
+            rows.append(
+                {
+                    "Date": date,
+                    "Ticker": ticker,
+                    "signal": signal,
+                    "forward_20d_excess_return": excess,
+                    "forward_20d_drawdown": drawdown,
+                    "label_outperform_20d": float(excess > 0.02),
+                    "label_top_tercile_excess_20d": float(ticker == "AAA"),
+                    "label_risk_adjusted_excess_20d": float(excess > 0.0),
+                    "market_regime": "calm" if ticker != "BBB" else "risk_on",
+                    "rs_qqq_60d": signal,
+                }
+            )
+    panel = pd.DataFrame(rows)
+
+    table = build_opportunity_label_baseline_challenge(
+        panel,
+        ["signal"],
+        horizon=20,
+        model_name="logistic_regression",
+        train_window=5,
+        test_window=5,
+        step=5,
+        embargo=0,
+        min_train_samples=1,
+        min_train_events=0,
+    )
+
+    assert set(table["target_id"]) == {
+        "outperform_20d",
+        "stronger_excess_20d",
+        "top_tercile_excess_20d",
+        "risk_adjusted_excess_20d",
+        "composite_opportunity_20d",
+    }
+    assert set(table["comparator"]) == {
+        "model_predicted_opportunity",
+        "global_fold_prevalence_baseline",
+        "regime_fold_prevalence_baseline",
+        "momentum_bucket_prevalence_baseline",
+        "regime_momentum_bucket_prevalence_baseline",
+    }
+    composite = table[table["target_id"] == "composite_opportunity_20d"]
+    assert composite["label_column"].iat[0] == "label_composite_opportunity_20d"
+    assert composite["sample_count"].iat[0] > 0
