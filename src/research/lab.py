@@ -16,6 +16,7 @@ from src.features.technical import build_technical_features
 from src.features.wavelet import rolling_wavelet_features
 from src.ml.datasets import build_supervised_panel, feature_group_columns
 from src.ml.diagnostics import (
+    DEFAULT_REGIME_COLUMNS,
     build_drawdown_risk_prevalence_baseline_comparison,
     build_feature_family_importance_stability,
     build_feature_importance_production_readiness,
@@ -28,6 +29,7 @@ from src.ml.diagnostics import (
     build_validation_leakage_diagnostics,
     build_validation_overfit_warnings,
 )
+from src.ml.metrics import classification_metrics
 from src.ml.models import MODEL_OPTIONS
 from src.ml.target_diagnostics import (
     add_target_candidate_labels,
@@ -78,6 +80,35 @@ RISK_INCREMENTAL_VALUE_COLUMNS = [
     "fold_train_prevalence_details",
     "classification",
 ]
+OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS = [
+    "comparator",
+    "sample_count",
+    "ticker_count",
+    "fold_count",
+    "event_prevalence",
+    "mean_predicted_opportunity",
+    "roc_auc",
+    "pr_auc",
+    "brier_score",
+    "calibration_gap",
+    "worst_regime",
+    "worst_fold",
+    "worst_ticker",
+    "fallback_count",
+    "momentum_feature",
+    "bucket_count",
+    "fallback_rule",
+    "fold_train_prevalence_details",
+    "classification",
+]
+MOMENTUM_BASELINE_CANDIDATES = (
+    "momentum_60d",
+    "rs_qqq_60d",
+    "rs_spy_60d",
+    "momentum_20d",
+    "rs_qqq_120d",
+    "rs_spy_120d",
+)
 ADVERSE_OUTCOME_LABEL_COMPARISON_COLUMNS = [
     "label",
     "definition",
@@ -324,6 +355,12 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         supervised,
         risk.fold_metrics,
     )
+    opportunity_baseline_challenge = build_opportunity_baseline_challenge(
+        outperformance.predictions,
+        supervised,
+        outperformance.fold_metrics,
+        label_col=f"label_outperform_{label_horizon}d",
+    )
     drawdown_risk_feature_group_incremental_value = build_drawdown_risk_feature_group_incremental_value(
         supervised,
         group_options,
@@ -397,6 +434,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "drawdown_risk_calibration_quality": diagnostics.drawdown_risk_calibration_quality,
         "drawdown_risk_regime_calibration": diagnostics.drawdown_risk_regime_calibration,
         "drawdown_risk_prevalence_baseline_comparison": drawdown_risk_prevalence_baseline,
+        "opportunity_baseline_challenge": opportunity_baseline_challenge,
         "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
         "adverse_outcome_label_comparison": adverse_outcome_label_comparison,
         "model_selection_summary": pd.concat(
@@ -454,6 +492,375 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "quick": config.quick,
     }
     return build_research_lab_export_payload(run_metadata=metadata, tables=tables)
+
+
+def build_opportunity_baseline_challenge(
+    predictions: pd.DataFrame,
+    baseline_panel: pd.DataFrame,
+    fold_details: pd.DataFrame,
+    *,
+    label_col: str = "label_outperform_20d",
+    probability_col: str = "probability",
+    bucket_count: int = 4,
+    min_train_samples: int = 20,
+    min_train_events: int = 5,
+) -> pd.DataFrame:
+    """Compare opportunity probabilities with train-fold prevalence baselines."""
+
+    required_predictions = {"fold", "Date", "Ticker", "actual", probability_col}
+    required_panel = {"Date", "Ticker", label_col}
+    required_folds = {"fold", "train_start", "train_end"}
+    if (
+        predictions.empty
+        or baseline_panel.empty
+        or fold_details.empty
+        or not required_predictions.issubset(predictions.columns)
+        or not required_panel.issubset(baseline_panel.columns)
+        or not required_folds.issubset(fold_details.columns)
+    ):
+        return pd.DataFrame(columns=OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS)
+
+    momentum_feature = _select_momentum_feature(baseline_panel)
+    regime_col = _select_regime_column(baseline_panel)
+    scored = _opportunity_baseline_scored_rows(
+        predictions,
+        baseline_panel,
+        fold_details,
+        label_col=label_col,
+        probability_col=probability_col,
+        regime_col=regime_col,
+        momentum_feature=momentum_feature,
+        bucket_count=bucket_count,
+        min_train_samples=min_train_samples,
+        min_train_events=min_train_events,
+    )
+    if scored.empty:
+        return pd.DataFrame(columns=OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS)
+
+    fold_details_text = ";".join(
+        f"{int(row.fold)}:{int(row.train_rows)}:{float(row.global_prevalence):.6f}"
+        for row in scored[["fold", "train_rows", "global_prevalence"]].drop_duplicates().itertuples()
+    )
+    comparators = [
+        ("model_predicted_opportunity", probability_col, 0, "model output"),
+        ("global_fold_prevalence_baseline", "global_fold_prevalence", 0, "training fold prevalence"),
+        (
+            "regime_fold_prevalence_baseline",
+            "regime_fold_prevalence",
+            int(scored["regime_fallback"].sum()),
+            "fallback to global fold prevalence",
+        ),
+        (
+            "momentum_bucket_prevalence_baseline",
+            "momentum_bucket_prevalence",
+            int(scored["momentum_fallback"].sum()),
+            "training-fold momentum quantile buckets; fallback to global fold prevalence",
+        ),
+        (
+            "regime_momentum_bucket_prevalence_baseline",
+            "regime_momentum_bucket_prevalence",
+            int(scored["regime_momentum_fallback"].sum()),
+            "training-fold regime+momentum buckets; fallback to regime, then global",
+        ),
+    ]
+    rows = [
+        _opportunity_baseline_metrics(
+            scored,
+            comparator=name,
+            probability_col=column,
+            regime_col=regime_col,
+            fallback_count=fallbacks,
+            momentum_feature=momentum_feature,
+            bucket_count=bucket_count,
+            fallback_rule=fallback_rule,
+            fold_details=fold_details_text,
+        )
+        for name, column, fallbacks, fallback_rule in comparators
+    ]
+    by_name = {row["comparator"]: row for row in rows}
+    model = by_name["model_predicted_opportunity"]
+    baseline_results = []
+    for name, _, _, _ in comparators[1:]:
+        result = _opportunity_baseline_classification(model, by_name[name])
+        by_name[name]["classification"] = result
+        baseline_results.append(result)
+    model["classification"] = _opportunity_model_summary_classification(baseline_results)
+    for row in rows:
+        row.pop("_worst_fold_brier", None)
+        row.pop("_worst_regime_brier", None)
+        row.pop("_worst_ticker_brier", None)
+    return pd.DataFrame(rows, columns=OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS)
+
+
+def _select_momentum_feature(panel: pd.DataFrame) -> str | None:
+    for column in MOMENTUM_BASELINE_CANDIDATES:
+        if column in panel and pd.to_numeric(panel[column], errors="coerce").notna().any():
+            return column
+    return None
+
+
+def _select_regime_column(panel: pd.DataFrame) -> str | None:
+    for column in DEFAULT_REGIME_COLUMNS:
+        if column in panel and panel[column].notna().any():
+            return column
+    return None
+
+
+def _opportunity_baseline_scored_rows(
+    predictions: pd.DataFrame,
+    baseline_panel: pd.DataFrame,
+    fold_details: pd.DataFrame,
+    *,
+    label_col: str,
+    probability_col: str,
+    regime_col: str | None,
+    momentum_feature: str | None,
+    bucket_count: int,
+    min_train_samples: int,
+    min_train_events: int,
+) -> pd.DataFrame:
+    merge_cols = ["Date", "Ticker"]
+    extra_cols = [column for column in [label_col, regime_col, momentum_feature] if column]
+    panel = baseline_panel[[*merge_cols, *extra_cols]].copy()
+    panel["Date"] = pd.to_datetime(panel["Date"])
+    panel[label_col] = pd.to_numeric(panel[label_col], errors="coerce")
+    if regime_col:
+        panel[regime_col] = panel[regime_col].astype(str).str.strip()
+    if momentum_feature:
+        panel[momentum_feature] = pd.to_numeric(panel[momentum_feature], errors="coerce")
+
+    usable = predictions.rename(columns={probability_col: "model_probability"}).copy()
+    usable["Date"] = pd.to_datetime(usable["Date"])
+    usable["actual"] = pd.to_numeric(usable["actual"], errors="coerce")
+    usable["model_probability"] = pd.to_numeric(usable["model_probability"], errors="coerce").clip(0.0, 1.0)
+    usable = usable.merge(panel, on=merge_cols, how="left")
+    usable = usable.rename(columns={"model_probability": probability_col})
+    usable = usable.dropna(subset=["fold", "Date", "Ticker", "actual", probability_col])
+    if usable.empty:
+        return pd.DataFrame()
+
+    fold_rows = fold_details.drop_duplicates(subset=["fold"], keep="last").set_index("fold")
+    frames = []
+    for fold, group in usable.groupby("fold", sort=True):
+        if fold not in fold_rows.index:
+            continue
+        fold_row = fold_rows.loc[fold]
+        train = panel[
+            (panel["Date"] >= pd.to_datetime(fold_row["train_start"]))
+            & (panel["Date"] <= pd.to_datetime(fold_row["train_end"]))
+            & panel[label_col].notna()
+        ].copy()
+        if train.empty:
+            continue
+        global_prevalence = float(train[label_col].mean())
+        out = group.copy()
+        out["global_prevalence"] = global_prevalence
+        out["train_rows"] = len(train)
+        out["global_fold_prevalence"] = global_prevalence
+        out["regime_fold_prevalence"] = global_prevalence
+        out["momentum_bucket_prevalence"] = global_prevalence
+        out["regime_momentum_bucket_prevalence"] = global_prevalence
+        out["regime_fallback"] = False
+        out["momentum_fallback"] = False
+        out["regime_momentum_fallback"] = False
+
+        regime_rates = _prevalence_lookup(train, label_col, [regime_col] if regime_col else [], min_train_samples, min_train_events)
+        if regime_col:
+            for idx, row in out.iterrows():
+                key = (str(row.get(regime_col)).strip(),)
+                if key in regime_rates:
+                    out.at[idx, "regime_fold_prevalence"] = regime_rates[key]
+                else:
+                    out.at[idx, "regime_fallback"] = True
+
+        if momentum_feature:
+            edges = _training_quantile_edges(train[momentum_feature], bucket_count)
+            if edges is not None:
+                train["_momentum_bucket"] = pd.cut(
+                    train[momentum_feature], bins=edges, labels=False, include_lowest=True
+                )
+                out["_momentum_bucket"] = pd.cut(
+                    out[momentum_feature], bins=edges, labels=False, include_lowest=True
+                )
+                momentum_rates = _prevalence_lookup(
+                    train, label_col, ["_momentum_bucket"], min_train_samples, min_train_events
+                )
+                combo_keys = [regime_col, "_momentum_bucket"] if regime_col else []
+                combo_rates = _prevalence_lookup(train, label_col, combo_keys, min_train_samples, min_train_events)
+                for idx, row in out.iterrows():
+                    bucket_key = (row.get("_momentum_bucket"),)
+                    if bucket_key in momentum_rates:
+                        out.at[idx, "momentum_bucket_prevalence"] = momentum_rates[bucket_key]
+                    else:
+                        out.at[idx, "momentum_fallback"] = True
+
+                    combo_key = (str(row.get(regime_col)).strip(), row.get("_momentum_bucket")) if regime_col else ()
+                    if combo_key in combo_rates:
+                        out.at[idx, "regime_momentum_bucket_prevalence"] = combo_rates[combo_key]
+                    else:
+                        out.at[idx, "regime_momentum_fallback"] = True
+                        out.at[idx, "regime_momentum_bucket_prevalence"] = out.at[idx, "regime_fold_prevalence"]
+            else:
+                out["momentum_fallback"] = True
+                out["regime_momentum_fallback"] = True
+        else:
+            out["momentum_fallback"] = True
+            out["regime_momentum_fallback"] = True
+        frames.append(out)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _training_quantile_edges(values: pd.Series, bucket_count: int) -> list[float] | None:
+    clean = pd.to_numeric(values, errors="coerce").dropna()
+    if len(clean) < bucket_count * 2 or clean.nunique() < bucket_count:
+        return None
+    quantiles = clean.quantile([i / bucket_count for i in range(bucket_count + 1)]).drop_duplicates().to_list()
+    if len(quantiles) < 3:
+        return None
+    quantiles[0] = float("-inf")
+    quantiles[-1] = float("inf")
+    return quantiles
+
+
+def _prevalence_lookup(
+    data: pd.DataFrame,
+    label_col: str,
+    keys: list[str],
+    min_train_samples: int,
+    min_train_events: int,
+) -> dict[tuple[object, ...], float]:
+    if not keys:
+        return {}
+    rates = {}
+    for key, group in data.dropna(subset=keys).groupby(keys, dropna=True):
+        event_count = int((group[label_col] == 1).sum())
+        non_event_count = int((group[label_col] == 0).sum())
+        if len(group) >= min_train_samples and event_count >= min_train_events and non_event_count >= min_train_events:
+            rates[key if isinstance(key, tuple) else (key,)] = float(group[label_col].mean())
+    return rates
+
+
+def _opportunity_baseline_metrics(
+    data: pd.DataFrame,
+    *,
+    comparator: str,
+    probability_col: str,
+    regime_col: str | None,
+    fallback_count: int,
+    momentum_feature: str | None,
+    bucket_count: int,
+    fallback_rule: str,
+    fold_details: str,
+) -> dict[str, object]:
+    metrics = classification_metrics(data["actual"], data[probability_col])
+    event_prevalence = float(data["actual"].mean()) if not data.empty else pd.NA
+    mean_predicted = float(data[probability_col].mean()) if not data.empty else pd.NA
+    return {
+        "comparator": comparator,
+        "sample_count": int(len(data)),
+        "ticker_count": int(data["Ticker"].nunique()) if "Ticker" in data else 0,
+        "fold_count": int(data["fold"].nunique()) if "fold" in data else 0,
+        "event_prevalence": event_prevalence,
+        "mean_predicted_opportunity": mean_predicted,
+        "roc_auc": metrics.get("roc_auc", pd.NA),
+        "pr_auc": metrics.get("pr_auc", pd.NA),
+        "brier_score": metrics.get("brier_score", pd.NA),
+        "calibration_gap": event_prevalence - mean_predicted
+        if pd.notna(event_prevalence) and pd.notna(mean_predicted)
+        else pd.NA,
+        "worst_regime": _worst_brier_group(data, probability_col, regime_col) if regime_col else pd.NA,
+        "worst_fold": _worst_brier_group(data, probability_col, "fold"),
+        "worst_ticker": _worst_brier_group(data, probability_col, "Ticker"),
+        "fallback_count": fallback_count,
+        "momentum_feature": momentum_feature or pd.NA,
+        "bucket_count": bucket_count if momentum_feature else pd.NA,
+        "fallback_rule": fallback_rule,
+        "fold_train_prevalence_details": fold_details,
+        "classification": "insufficient_evidence",
+        "_worst_fold_brier": _worst_brier(data, probability_col, "fold"),
+        "_worst_regime_brier": _worst_brier(data, probability_col, regime_col) if regime_col else pd.NA,
+        "_worst_ticker_brier": _worst_brier(data, probability_col, "Ticker"),
+    }
+
+
+def _worst_brier_group(data: pd.DataFrame, probability_col: str, group_col: str | None) -> object:
+    if not group_col or group_col not in data:
+        return pd.NA
+    values = [
+        (value, float(((group[probability_col] - group["actual"]) ** 2).mean()))
+        for value, group in data.groupby(group_col, dropna=True, sort=True)
+        if not group.empty
+    ]
+    return pd.NA if not values else max(values, key=lambda item: item[1])[0]
+
+
+def _worst_brier(data: pd.DataFrame, probability_col: str, group_col: str | None) -> object:
+    if not group_col or group_col not in data:
+        return pd.NA
+    values = [
+        float(((group[probability_col] - group["actual"]) ** 2).mean())
+        for _, group in data.groupby(group_col, dropna=True)
+        if not group.empty
+    ]
+    return pd.NA if not values else max(values)
+
+
+def _opportunity_baseline_classification(model: dict[str, object], baseline: dict[str, object]) -> str:
+    values = {
+        name: pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
+        for name, row, column in (
+            ("model_pr", model, "pr_auc"),
+            ("baseline_pr", baseline, "pr_auc"),
+            ("model_brier", model, "brier_score"),
+            ("baseline_brier", baseline, "brier_score"),
+            ("model_gap", model, "calibration_gap"),
+            ("baseline_gap", baseline, "calibration_gap"),
+            ("model_worst_fold", model, "_worst_fold_brier"),
+            ("baseline_worst_fold", baseline, "_worst_fold_brier"),
+            ("model_worst_regime", model, "_worst_regime_brier"),
+            ("baseline_worst_regime", baseline, "_worst_regime_brier"),
+        )
+    }
+    if any(pd.isna(value) for value in values.values()):
+        return "insufficient_evidence"
+
+    model_wins = sum(
+        (
+            values["model_pr"] > values["baseline_pr"] + 0.01,
+            values["model_brier"] + 0.0025 < values["baseline_brier"],
+            abs(values["model_gap"]) + 0.025 < abs(values["baseline_gap"]),
+            values["model_worst_fold"] + 0.01 < values["baseline_worst_fold"],
+            values["model_worst_regime"] + 0.01 < values["baseline_worst_regime"],
+        )
+    )
+    baseline_wins = sum(
+        (
+            values["baseline_pr"] > values["model_pr"] + 0.01,
+            values["baseline_brier"] + 0.0025 < values["model_brier"],
+            abs(values["baseline_gap"]) + 0.025 < abs(values["model_gap"]),
+            values["baseline_worst_fold"] + 0.01 < values["model_worst_fold"],
+            values["baseline_worst_regime"] + 0.01 < values["model_worst_regime"],
+        )
+    )
+    if model_wins >= 3 and baseline_wins <= 1:
+        return "model_beats_baseline"
+    if baseline_wins >= 3 and model_wins <= 1:
+        return "baseline_beats_model"
+    if max(model_wins, baseline_wins) <= 2:
+        return "baseline_matches_model"
+    return "unstable_or_inconclusive"
+
+
+def _opportunity_model_summary_classification(baseline_results: list[str]) -> str:
+    if not baseline_results or all(result == "insufficient_evidence" for result in baseline_results):
+        return "insufficient_evidence"
+    if "baseline_beats_model" in baseline_results:
+        return "baseline_beats_model"
+    if "unstable_or_inconclusive" in baseline_results:
+        return "unstable_or_inconclusive"
+    if all(result == "model_beats_baseline" for result in baseline_results):
+        return "model_beats_baseline"
+    return "baseline_matches_model"
 
 
 def build_drawdown_risk_feature_group_incremental_value(
