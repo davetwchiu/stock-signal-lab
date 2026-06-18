@@ -78,6 +78,32 @@ RISK_INCREMENTAL_VALUE_COLUMNS = [
     "fold_train_prevalence_details",
     "classification",
 ]
+ADVERSE_OUTCOME_LABEL_COMPARISON_COLUMNS = [
+    "label",
+    "definition",
+    "threshold",
+    "sample_count",
+    "ticker_count",
+    "fold_count",
+    "event_prevalence",
+    "current_label_overlap_rate",
+    "regime_concentration",
+    "most_concentrated_regime",
+    "model_roc_auc",
+    "model_pr_auc",
+    "model_brier_score",
+    "model_calibration_gap",
+    "global_fold_baseline_brier_score",
+    "global_fold_baseline_calibration_gap",
+    "regime_fold_baseline_brier_score",
+    "regime_fold_baseline_calibration_gap",
+    "model_vs_global_fold_baseline",
+    "model_vs_regime_fold_baseline",
+    "worst_regime",
+    "worst_fold",
+    "worst_ticker",
+    "classification",
+]
 
 
 @dataclass(frozen=True)
@@ -310,6 +336,19 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         probability_threshold=config.classification_threshold,
         model_selection_mode=config.model_mode,
     )
+    adverse_outcome_label_comparison = build_adverse_outcome_label_comparison(
+        supervised,
+        columns,
+        current_label_column=f"label_drawdown_risk_{label_horizon}d",
+        horizon=label_horizon,
+        model_name=model_name,
+        train_window=config.train_window,
+        test_window=config.test_window,
+        step=config.step,
+        embargo=config.embargo,
+        probability_threshold=config.classification_threshold,
+        model_selection_mode=config.model_mode,
+    )
     validation_overfit_warnings = build_validation_overfit_warnings(
         outperformance.predictions,
         baseline_panel=supervised,
@@ -359,6 +398,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "drawdown_risk_regime_calibration": diagnostics.drawdown_risk_regime_calibration,
         "drawdown_risk_prevalence_baseline_comparison": drawdown_risk_prevalence_baseline,
         "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
+        "adverse_outcome_label_comparison": adverse_outcome_label_comparison,
         "model_selection_summary": pd.concat(
             [
                 summarize_model_selection(outperformance.fold_metrics, "outperformance"),
@@ -458,6 +498,205 @@ def build_drawdown_risk_feature_group_incremental_value(
             continue
         rows.append(_risk_incremental_row(feature_group, len(columns), comparison))
     return pd.DataFrame(rows, columns=RISK_INCREMENTAL_VALUE_COLUMNS)
+
+
+def build_adverse_outcome_label_comparison(
+    dataset: pd.DataFrame,
+    feature_columns: list[str],
+    *,
+    current_label_column: str,
+    horizon: int,
+    model_name: str,
+    train_window: int,
+    test_window: int,
+    step: int | None,
+    embargo: int,
+    probability_threshold: float = 0.5,
+    model_selection_mode: str = "current_default",
+) -> pd.DataFrame:
+    """Compare fixed research-only adverse labels with prevalence baselines."""
+
+    panel, candidates = _with_adverse_outcome_labels(dataset, horizon)
+    rows: list[dict[str, object]] = []
+    for candidate in candidates:
+        label = str(candidate["label"])
+        result = walk_forward_validate_classifier(
+            panel,
+            feature_columns,
+            label_column=label,
+            model_name=model_name,
+            train_window=train_window,
+            test_window=test_window,
+            step=step,
+            embargo=embargo,
+            probability_threshold=probability_threshold,
+            model_selection_mode=model_selection_mode,
+        )
+        comparison = build_drawdown_risk_prevalence_baseline_comparison(
+            result.predictions,
+            panel,
+            result.fold_metrics,
+            label_col=label,
+        )
+        rows.append(_adverse_outcome_label_row(panel, current_label_column, candidate, comparison))
+    return pd.DataFrame(rows, columns=ADVERSE_OUTCOME_LABEL_COMPARISON_COLUMNS)
+
+
+def _with_adverse_outcome_labels(dataset: pd.DataFrame, horizon: int) -> tuple[pd.DataFrame, list[dict[str, str]]]:
+    output = dataset.copy()
+    drawdown_col = f"forward_{horizon}d_drawdown"
+    excess_col = f"forward_{horizon}d_excess_return"
+    return_col = f"forward_{horizon}d_return"
+    candidates = [
+        {
+            "label": f"risk_severe_drawdown_{horizon}d",
+            "definition": f"future {horizon}d max drawdown < -15%",
+            "threshold": "forward_drawdown < -0.15",
+        },
+        {
+            "label": f"risk_negative_excess_{horizon}d",
+            "definition": f"future {horizon}d excess return vs benchmark < -5%",
+            "threshold": "forward_excess_return < -0.05",
+        },
+        {
+            "label": f"risk_composite_drawdown_underperform_{horizon}d",
+            "definition": f"future {horizon}d drawdown < -10% and excess return < -2%",
+            "threshold": "forward_drawdown < -0.10 and forward_excess_return < -0.02",
+        },
+    ]
+    output[candidates[0]["label"]] = (_numeric(output.get(drawdown_col)) < -0.15).astype(float)
+    output[candidates[1]["label"]] = (_numeric(output.get(excess_col)) < -0.05).astype(float)
+    output[candidates[2]["label"]] = (
+        (_numeric(output.get(drawdown_col)) < -0.10) & (_numeric(output.get(excess_col)) < -0.02)
+    ).astype(float)
+    output.loc[_numeric(output.get(drawdown_col)).isna(), candidates[0]["label"]] = pd.NA
+    output.loc[_numeric(output.get(excess_col)).isna(), candidates[1]["label"]] = pd.NA
+    output.loc[
+        _numeric(output.get(drawdown_col)).isna() | _numeric(output.get(excess_col)).isna(),
+        candidates[2]["label"],
+    ] = pd.NA
+
+    if "volatility_20d" in output and return_col in output and drawdown_col in output:
+        vol_label = f"risk_vol_adjusted_adverse_{horizon}d"
+        vol_move = _numeric(output["volatility_20d"]) * (horizon / 252) ** 0.5
+        output[vol_label] = (
+            (_numeric(output[return_col]) < -vol_move) | (_numeric(output[drawdown_col]) < -vol_move)
+        ).astype(float)
+        output.loc[
+            vol_move.isna() | _numeric(output[return_col]).isna() | _numeric(output[drawdown_col]).isna(),
+            vol_label,
+        ] = pd.NA
+        candidates.append(
+            {
+                "label": vol_label,
+                "definition": f"future {horizon}d return or drawdown worse than trailing-volatility move",
+                "threshold": "forward_return or forward_drawdown < -volatility_20d*sqrt(20/252)",
+            }
+        )
+    return output, candidates
+
+
+def _adverse_outcome_label_row(
+    panel: pd.DataFrame,
+    current_label_column: str,
+    candidate: dict[str, str],
+    comparison: pd.DataFrame,
+) -> dict[str, object]:
+    label = candidate["label"]
+    row = {column: pd.NA for column in ADVERSE_OUTCOME_LABEL_COMPARISON_COLUMNS}
+    row.update({key: candidate[key] for key in ("label", "definition", "threshold")})
+    if comparison.empty:
+        row["classification"] = "insufficient_evidence"
+        return row
+
+    by_name = {str(item["comparator"]): item for _, item in comparison.iterrows()}
+    model = by_name.get("model_predicted_risk")
+    global_base = by_name.get("global_fold_prevalence_baseline")
+    regime_base = by_name.get("regime_fold_prevalence_baseline")
+    if model is None or global_base is None or regime_base is None:
+        row["classification"] = "insufficient_evidence"
+        return row
+
+    row.update(
+        {
+            "sample_count": model["sample_count"],
+            "ticker_count": model["ticker_count"],
+            "fold_count": model["fold_count"],
+            "event_prevalence": model["event_prevalence"],
+            "current_label_overlap_rate": _current_label_overlap(panel, label, current_label_column),
+            **_regime_concentration(panel, label),
+            "model_roc_auc": model["roc_auc"],
+            "model_pr_auc": model["pr_auc"],
+            "model_brier_score": model["brier_score"],
+            "model_calibration_gap": model["calibration_gap"],
+            "global_fold_baseline_brier_score": global_base["brier_score"],
+            "global_fold_baseline_calibration_gap": global_base["calibration_gap"],
+            "regime_fold_baseline_brier_score": regime_base["brier_score"],
+            "regime_fold_baseline_calibration_gap": regime_base["calibration_gap"],
+            "model_vs_global_fold_baseline": global_base["classification"],
+            "model_vs_regime_fold_baseline": regime_base["classification"],
+            "worst_regime": model["worst_regime"],
+            "worst_fold": model["worst_fold"],
+            "worst_ticker": model["worst_ticker"],
+        }
+    )
+    row["classification"] = _adverse_label_classification(row)
+    return row
+
+
+def _numeric(values: object) -> pd.Series:
+    return pd.to_numeric(values if values is not None else pd.Series(dtype=float), errors="coerce")
+
+
+def _current_label_overlap(panel: pd.DataFrame, label: str, current_label_column: str) -> object:
+    if label not in panel or current_label_column not in panel:
+        return pd.NA
+    data = panel[[label, current_label_column]].apply(pd.to_numeric, errors="coerce").dropna()
+    positives = data[data[label] == 1]
+    return pd.NA if positives.empty else float((positives[current_label_column] == 1).mean())
+
+
+def _regime_concentration(panel: pd.DataFrame, label: str) -> dict[str, object]:
+    regime_col = next((column for column in ("market_regime", "regime") if column in panel), None)
+    if regime_col is None or label not in panel:
+        return {"regime_concentration": pd.NA, "most_concentrated_regime": pd.NA}
+    positives = panel[pd.to_numeric(panel[label], errors="coerce") == 1]
+    if positives.empty:
+        return {"regime_concentration": pd.NA, "most_concentrated_regime": pd.NA}
+    shares = positives[regime_col].astype(str).value_counts(normalize=True)
+    return {"regime_concentration": float(shares.iloc[0]), "most_concentrated_regime": shares.index[0]}
+
+
+def _adverse_label_classification(row: dict[str, object]) -> str:
+    results = {str(row.get("model_vs_global_fold_baseline")), str(row.get("model_vs_regime_fold_baseline"))}
+    if "insufficient_evidence" in results:
+        return "insufficient_evidence"
+    if _rare_event_cosmetic_brier_only(row):
+        return "rare_event_cosmetic_brier_only"
+    if results == {"model_beats_baseline"}:
+        return "candidate_beats_baseline"
+    if "baseline_beats_model" in results:
+        return "baseline_beats_candidate"
+    if results == {"baseline_matches_model"}:
+        return "baseline_matches_candidate"
+    return "unstable_or_inconclusive"
+
+
+def _rare_event_cosmetic_brier_only(row: dict[str, object]) -> bool:
+    prevalence = pd.to_numeric(pd.Series([row.get("event_prevalence")]), errors="coerce").iloc[0]
+    pr_auc = pd.to_numeric(pd.Series([row.get("model_pr_auc")]), errors="coerce").iloc[0]
+    brier = pd.to_numeric(pd.Series([row.get("model_brier_score")]), errors="coerce").iloc[0]
+    global_brier = pd.to_numeric(pd.Series([row.get("global_fold_baseline_brier_score")]), errors="coerce").iloc[0]
+    regime_brier = pd.to_numeric(pd.Series([row.get("regime_fold_baseline_brier_score")]), errors="coerce").iloc[0]
+    concentration = pd.to_numeric(pd.Series([row.get("regime_concentration")]), errors="coerce").iloc[0]
+    if pd.isna(prevalence) or prevalence >= 0.05 or pd.isna(brier):
+        return False
+    brier_not_worse = (pd.isna(global_brier) or brier <= global_brier) and (
+        pd.isna(regime_brier) or brier <= regime_brier
+    )
+    weak_pr = pd.isna(pr_auc) or pr_auc <= max(0.05, prevalence * 1.5)
+    concentrated = pd.notna(concentration) and concentration >= 0.75
+    return bool(brier_not_worse and (weak_pr or concentrated))
 
 
 def _insufficient_risk_incremental_row(feature_group: str, features: int) -> dict[str, object]:
