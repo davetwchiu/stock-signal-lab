@@ -8,6 +8,7 @@ import pandas as pd
 
 from src.research.export import (
     build_opportunity_label_decision_summary,
+    build_risk_label_decision_summary,
     build_research_evidence_summary,
     build_research_lab_export_payload,
     export_research_lab_diagnostics,
@@ -326,6 +327,112 @@ def test_export_includes_opportunity_label_decision_summary_csv(tmp_path: Path) 
     assert "opportunity_label_decision_summary.csv" in result.manifest["files_written"]
     assert result.manifest["row_counts"]["opportunity_label_decision_summary.csv"] == 1
     assert exported.loc[0, "recommended_decision"] == "Continue"
+
+
+def test_risk_label_decision_summary_holds_drawdown_as_risk_visibility_only() -> None:
+    summary = build_risk_label_decision_summary(
+        {
+            "ml_diagnostics_summary": pd.DataFrame(
+                {
+                    "target": ["drawdown_risk"],
+                    "roc_auc": [0.63],
+                    "pr_auc": [0.21],
+                    "brier_score": [0.16],
+                }
+            ),
+            "drawdown_risk_calibration_quality": pd.DataFrame(
+                {
+                    "calibration_gap": [-0.19],
+                    "monotonicity": ["not clearly monotonic"],
+                }
+            ),
+            "drawdown_risk_prevalence_baseline_comparison": pd.DataFrame(
+                {
+                    "comparator": ["model_predicted_risk"],
+                    "classification": ["baseline_beats_model"],
+                    "worst_regime": ["Uptrend / high volatility"],
+                }
+            ),
+            "drawdown_risk_regime_calibration": pd.DataFrame(
+                {
+                    "regime": ["Downtrend / high risk", "Uptrend / high volatility"],
+                    "calibration_gap": [-0.02, -0.26],
+                    "classification": ["miscalibrated", "miscalibrated"],
+                }
+            ),
+            "drawdown_risk_feature_group_incremental_value": pd.DataFrame(
+                {"classification": ["baseline_beats_feature_group", "baseline_beats_feature_group"]}
+            ),
+        }
+    )
+
+    row = summary.set_index("risk_target").loc["drawdown_risk_20d"]
+    assert row["recommended_decision"] == "Hold as risk-visibility-only"
+    assert row["production_readiness"] == "not_ready"
+    assert row["feature_group_dependence"] == "baseline_beats_all_feature_groups"
+    assert row["weakest_regime"] == "Uptrend / high volatility"
+
+
+def test_risk_label_decision_summary_keeps_adverse_labels_audit_only() -> None:
+    summary = build_risk_label_decision_summary(
+        {
+            "adverse_outcome_label_comparison": pd.DataFrame(
+                {
+                    "label": ["risk_severe_drawdown_20d"],
+                    "classification": ["baseline_beats_candidate"],
+                    "model_vs_regime_fold_baseline": ["baseline_beats_model"],
+                    "worst_regime": ["Uptrend / high volatility"],
+                    "worst_ticker": ["PLTR"],
+                    "model_calibration_gap": [-0.16],
+                }
+            )
+        }
+    )
+
+    row = summary.iloc[0]
+    assert row["recommended_decision"] == "Hold as audit-only"
+    assert row["risk_visibility_usefulness"] == "audit_only"
+    assert row["production_readiness"] == "not_ready"
+
+
+def test_risk_label_decision_summary_missing_fields_needs_more_data() -> None:
+    summary = build_risk_label_decision_summary(
+        {
+            "adverse_outcome_label_comparison": pd.DataFrame(
+                {
+                    "label": ["risk_negative_excess_20d"],
+                    "classification": ["baseline_beats_candidate"],
+                }
+            )
+        }
+    )
+
+    row = summary.iloc[0]
+    assert row["recommended_decision"] == "Needs more data"
+    assert "Missing source fields" in row["short_reason"]
+
+
+def test_export_includes_risk_label_decision_summary_csv(tmp_path: Path) -> None:
+    result = export_research_lab_diagnostics(
+        run_metadata=metadata(),
+        tables={
+            "adverse_outcome_label_comparison": pd.DataFrame(
+                {
+                    "label": ["risk_severe_drawdown_20d"],
+                    "classification": ["baseline_beats_candidate"],
+                    "model_vs_regime_fold_baseline": ["baseline_beats_model"],
+                    "worst_regime": ["Uptrend / high volatility"],
+                }
+            )
+        },
+        output_root=tmp_path,
+        run_id="run",
+    )
+
+    exported = pd.read_csv(result.run_dir / "risk_label_decision_summary.csv")
+    assert "risk_label_decision_summary.csv" in result.manifest["files_written"]
+    assert result.manifest["row_counts"]["risk_label_decision_summary.csv"] == 1
+    assert exported.loc[0, "recommended_decision"] == "Hold as audit-only"
 
 
 def test_export_includes_research_evidence_summary_csv(tmp_path: Path) -> None:
