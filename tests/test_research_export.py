@@ -158,10 +158,48 @@ def test_codex_handoff_contains_required_sections(tmp_path: Path) -> None:
     )
     assert "## ML reliability gate diagnostics" in handoff
     assert "Research-only reliability gates were tested without changing production scoring." in handoff
+    assert "## ML decision handoff" in handoff
+    assert "decision summary unavailable" in handoff
     assert "## Suggested next engineering direction" in handoff
     assert "## How Codex should use this bundle" in handoff
     assert "no production target switch is supported" in handoff
     assert "## Codex instructions for next iteration" in handoff
+
+
+def test_codex_handoff_summarizes_ml_decision_summaries(tmp_path: Path) -> None:
+    result = export_research_lab_diagnostics(
+        run_metadata=metadata(),
+        tables={
+            "opportunity_label_decision_summary": pd.DataFrame(
+                {
+                    "target_name": ["Recent-vol adjusted excess"],
+                    "production_readiness": ["not_ready"],
+                    "audit_only_flag": [True],
+                    "recommended_decision": ["Hold as audit-only"],
+                    "weakest_tickers": ["PLTR,TSLA"],
+                    "inversion_hypothesis_result": ["ticker-driven; do not invert regime-wide"],
+                }
+            ),
+            "risk_label_decision_summary": pd.DataFrame(
+                {
+                    "risk_target": ["drawdown_risk_20d", "risk_severe_drawdown_20d"],
+                    "production_readiness": ["not_ready", "not_ready"],
+                    "risk_visibility_usefulness": ["risk_visibility_only", "audit_only"],
+                    "recommended_decision": ["Hold as risk-visibility-only", "Hold as audit-only"],
+                }
+            ),
+        },
+        output_root=tmp_path,
+        run_id="run",
+    )
+
+    handoff = result.codex_handoff
+    assert "## ML decision handoff" in handoff
+    assert "Current production recommendation: No production ML change supported by decision summaries." in handoff
+    assert "Opportunity posture: Recent-vol adjusted excess: Hold as audit-only (not_ready)." in handoff
+    assert "Risk-visibility-only items: drawdown_risk_20d" in handoff
+    assert "Audit-only items: Recent-vol adjusted excess, risk_severe_drawdown_20d" in handoff
+    assert "Tasks not to repeat without fresh evidence: broad high-vol/uptrend inversion test, PLTR/TSLA ticker-exclusion proof, adverse-risk production switch" in handoff
 
 
 def test_research_evidence_summary_plainly_surfaces_negative_and_missing_evidence() -> None:
