@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
 from src.research.backtest import (
     BUY_AND_HOLD,
+    SIMPLE_TREND_DRAWDOWN_RISK,
+    SIMPLE_TREND_REDUCED_DEFENSIVENESS,
     SIMPLE_TREND,
     SSL_PRODUCTION,
+    SSL_WITHOUT_ML,
+    SSL_WITH_ML,
     SMA_200,
     SMA_50_200,
     SimpleROIBacktestConfig,
     add_comparison_columns,
+    build_roi_decision_handoff,
     buy_and_hold_signal,
     drawdown_details,
     moving_average_cross_signal,
@@ -19,6 +26,7 @@ from src.research.backtest import (
     simple_trend_drawdown_risk_signal,
     simple_trend_reduced_defensiveness_signal,
     simple_trend_signal,
+    write_optional_csv,
 )
 
 
@@ -143,3 +151,62 @@ def test_comparison_columns_are_per_strategy() -> None:
     assert output.loc[SIMPLE_TREND, "beats_buy_hold"] is False
     assert output.loc[SIMPLE_TREND, "beats_200dma"] is True
     assert output.loc[SIMPLE_TREND, "improves_return_drawdown_tradeoff_vs_ssl"] is True
+
+
+def test_roi_decision_handoff_records_pivot_evidence() -> None:
+    handoff = build_roi_decision_handoff(roi_pivot_results()).iloc[0]
+
+    assert handoff["decision"] == "Pivot"
+    assert handoff["ssl_beats_buy_hold_count"] == 0
+    assert handoff["ssl_test_count"] == 5
+    assert handoff["ssl_beats_200dma_count"] == 0
+    assert handoff["ml_adds_value_count"] == 0
+    assert handoff["simple_rules_beats_buy_hold_count"] == 0
+    assert handoff["simple_rule_test_count"] == 15
+    assert handoff["simple_rules_beats_200dma_count"] == 0
+    assert handoff["simple_rules_improve_tradeoff_vs_ssl_count"] == 14
+    assert handoff["future_work_gate"] == "ROI backtest evidence required before ML diagnostics or active rule changes."
+    assert "Pivot toward portfolio risk visibility, sizing support, and rule transparency." in handoff[
+        "plain_language_summary"
+    ]
+
+
+def test_roi_decision_handoff_can_be_exported(tmp_path: Path) -> None:
+    output = tmp_path / "roi_decision_handoff.csv"
+
+    write_optional_csv(build_roi_decision_handoff(roi_pivot_results()), output)
+
+    exported = pd.read_csv(output).iloc[0]
+    assert exported["decision"] == "Pivot"
+    assert exported["simple_rules_improve_tradeoff_vs_ssl_count"] == 14
+    assert exported["project_pivot"] == "portfolio risk visibility, sizing support, and rule transparency"
+
+
+def roi_pivot_results() -> pd.DataFrame:
+    rows = []
+    simple_rules = [SIMPLE_TREND, SIMPLE_TREND_DRAWDOWN_RISK, SIMPLE_TREND_REDUCED_DEFENSIVENESS]
+    for i in range(5):
+        ticker = f"T{i}"
+        rows.extend(
+            [
+                _summary_row(ticker, BUY_AND_HOLD, 1100.0, 0.10, -0.30),
+                _summary_row(ticker, SMA_200, 1050.0, 0.05, -0.15),
+                _summary_row(ticker, SSL_WITHOUT_ML, 950.0, -0.05, -0.08),
+                _summary_row(ticker, SSL_WITH_ML, 900.0, -0.10, -0.05),
+                _summary_row(ticker, SSL_PRODUCTION, 900.0, -0.10, -0.05),
+            ]
+        )
+        for strategy in simple_rules:
+            rows.append(_summary_row(ticker, strategy, 1030.0, 0.03, -0.20))
+    rows[-1] = _summary_row("T4", SIMPLE_TREND_REDUCED_DEFENSIVENESS, 800.0, -0.20, -0.20)
+    return add_comparison_columns(pd.DataFrame(rows))
+
+
+def _summary_row(ticker: str, strategy: str, final_value: float, total_return: float, max_drawdown: float) -> dict[str, object]:
+    return {
+        "ticker": ticker,
+        "strategy": strategy,
+        "final_value": final_value,
+        "total_return": total_return,
+        "max_drawdown": max_drawdown,
+    }

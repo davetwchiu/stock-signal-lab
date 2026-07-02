@@ -8,7 +8,13 @@ from typing import Sequence
 
 import pandas as pd
 
-from src.research.backtest import SimpleROIBacktestConfig, default_lookback_start, run_simple_roi_backtest, write_optional_csv
+from src.research.backtest import (
+    SimpleROIBacktestConfig,
+    build_roi_decision_handoff,
+    default_lookback_start,
+    run_simple_roi_backtest,
+    write_optional_csv,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default=None)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--output", type=Path, default=None, help="Optional CSV output path.")
+    parser.add_argument("--summary-output", type=Path, default=None, help="Optional ROI decision handoff CSV path.")
     return parser
 
 
@@ -60,8 +67,11 @@ def run_from_args(args: argparse.Namespace) -> pd.DataFrame:
         use_cache=not args.no_cache,
     )
     results = run_simple_roi_backtest(config)
+    handoff = build_roi_decision_handoff(results)
     write_optional_csv(results, args.output)
+    write_optional_csv(handoff, args.summary_output)
     print_results(results, args.output)
+    print_handoff(handoff, args.summary_output)
     return results
 
 
@@ -115,6 +125,19 @@ def print_results(results: pd.DataFrame, output: Path | None = None) -> None:
     )
     if output is not None:
         print(f"\nCSV output: {output}")
+
+
+def print_handoff(handoff: pd.DataFrame, output: Path | None = None) -> None:
+    """Print the compact ROI decision handoff."""
+
+    if handoff.empty:
+        return
+    row = handoff.iloc[0]
+    print("\nROI decision handoff:")
+    print(f"Decision: {row['decision']}")
+    print(str(row["plain_language_summary"]))
+    if output is not None:
+        print(f"Summary CSV output: {output}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

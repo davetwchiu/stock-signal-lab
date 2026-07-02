@@ -45,6 +45,7 @@ STRATEGY_ORDER = (
     SIMPLE_TREND_DRAWDOWN_RISK,
     SIMPLE_TREND_REDUCED_DEFENSIVENESS,
 )
+SIMPLE_RULES = (SIMPLE_TREND, SIMPLE_TREND_DRAWDOWN_RISK, SIMPLE_TREND_REDUCED_DEFENSIVENESS)
 
 
 @dataclass(frozen=True)
@@ -520,6 +521,83 @@ def add_comparison_columns(results: pd.DataFrame) -> pd.DataFrame:
             bool(with_ml_value > without_ml_value) if pd.notna(with_ml_value) and pd.notna(without_ml_value) else pd.NA
         )
     return output
+
+
+def build_roi_decision_handoff(results: pd.DataFrame) -> pd.DataFrame:
+    """Summarize ROI backtest evidence for future research handoffs."""
+
+    columns = [
+        "decision",
+        "active_ssl_rules_roi_validation",
+        "ml_incremental_value",
+        "simple_non_ml_rules_roi_validation",
+        "future_work_gate",
+        "project_pivot",
+        "ssl_beats_buy_hold_count",
+        "ssl_test_count",
+        "ssl_beats_200dma_count",
+        "ml_adds_value_count",
+        "ml_test_count",
+        "simple_rules_beats_buy_hold_count",
+        "simple_rule_test_count",
+        "simple_rules_beats_200dma_count",
+        "simple_rules_improve_tradeoff_vs_ssl_count",
+        "failure_diagnosis",
+        "plain_language_summary",
+    ]
+    if results.empty:
+        return pd.DataFrame([{column: pd.NA for column in columns}]).assign(
+            decision="Insufficient evidence",
+            future_work_gate="ROI backtest evidence required before ML diagnostics or active rule changes.",
+        )
+
+    ssl = results[results["strategy"] == SSL_PRODUCTION]
+    simple = results[results["strategy"].isin(SIMPLE_RULES)]
+    ssl_beats_buy_hold = _true_count(ssl.get("ssl_beats_buy_hold", pd.Series(dtype=object)))
+    ssl_beats_200dma = _true_count(ssl.get("ssl_beats_200dma", pd.Series(dtype=object)))
+    ml_adds_value = _true_count(ssl.get("ml_adds_value_vs_non_ml_app_rule", pd.Series(dtype=object)))
+    simple_beats_buy_hold = _true_count(simple.get("beats_buy_hold", pd.Series(dtype=object)))
+    simple_beats_200dma = _true_count(simple.get("beats_200dma", pd.Series(dtype=object)))
+    simple_improves_tradeoff = _true_count(
+        simple.get("improves_return_drawdown_tradeoff_vs_ssl", pd.Series(dtype=object))
+    )
+    ssl_count = int(len(ssl))
+    simple_count = int(len(simple))
+    row = {
+        "decision": "Pivot",
+        "active_ssl_rules_roi_validation": "failed",
+        "ml_incremental_value": "no_value_added",
+        "simple_non_ml_rules_roi_validation": "improved_vs_ssl_but_failed_buy_hold_and_200dma",
+        "future_work_gate": "ROI backtest evidence required before ML diagnostics or active rule changes.",
+        "project_pivot": "portfolio risk visibility, sizing support, and rule transparency",
+        "ssl_beats_buy_hold_count": ssl_beats_buy_hold,
+        "ssl_test_count": ssl_count,
+        "ssl_beats_200dma_count": ssl_beats_200dma,
+        "ml_adds_value_count": ml_adds_value,
+        "ml_test_count": ssl_count,
+        "simple_rules_beats_buy_hold_count": simple_beats_buy_hold,
+        "simple_rule_test_count": simple_count,
+        "simple_rules_beats_200dma_count": simple_beats_200dma,
+        "simple_rules_improve_tradeoff_vs_ssl_count": simple_improves_tradeoff,
+        "failure_diagnosis": "SSL and simple rules reduce drawdown mainly by sacrificing too much upside.",
+        "plain_language_summary": (
+            f"Active SSL trading rules failed ROI validation: {ssl_beats_buy_hold}/{ssl_count} beat Buy & Hold "
+            f"and {ssl_beats_200dma}/{ssl_count} beat 200DMA. ML added no value: {ml_adds_value}/{ssl_count} "
+            f"with-ML rows beat no-ML. Simple non-ML rules improved the return/drawdown trade-off versus SSL "
+            f"production in {simple_improves_tradeoff}/{simple_count} rows, but {simple_beats_buy_hold}/{simple_count} "
+            f"beat Buy & Hold and {simple_beats_200dma}/{simple_count} beat 200DMA. Future work must pass an ROI "
+            "backtest gate before resuming ML diagnostics or active rule changes. Pivot toward portfolio risk "
+            "visibility, sizing support, and rule transparency."
+        ),
+    }
+    return pd.DataFrame([row], columns=columns)
+
+
+def _true_count(values: pd.Series) -> int:
+    clean = values.dropna()
+    if clean.empty:
+        return 0
+    return int(clean.map(lambda value: str(value).strip().lower()).isin({"true", "1", "yes"}).sum())
 
 
 def _better(candidate: object, baseline: object) -> object:
