@@ -15,6 +15,7 @@ from src.data.fetch import load_daily_data
 from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config, profile_settings
 from src.decision.explain import ticker_explanation
 from src.decision.report import generate_markdown_report, main_warning, portfolio_summary_text
+from src.decision.risk_cockpit import RISK_COCKPIT_TICKERS, build_risk_cockpit
 from src.decision.shortlist import SHORTLIST_VIEW_OPTIONS, filter_decision_shortlist
 from src.decision.table import action_counts, build_decision_table, parse_current_weights_input
 from src.decision.user_benchmark import resolve_active_benchmark, save_user_benchmark
@@ -612,7 +613,7 @@ with st.sidebar:
         end_date = st.date_input("End date", value=default_end, help="Historical data end date.")
 
 data_tickers = list(tickers)
-for required in {benchmark, "SPY", "QQQ"}:
+for required in dict.fromkeys((benchmark, "SPY", "QQQ")):
     if required not in data_tickers:
         data_tickers.append(required)
 
@@ -629,6 +630,14 @@ with st.spinner("Loading data and preparing today's decision view..."):
             frames[ticker] = cached_load(ticker, str(start_date), str(end_date))
         except Exception as exc:
             load_errors[ticker] = str(exc)
+    risk_frames = dict(frames)
+    for ticker in RISK_COCKPIT_TICKERS:
+        if ticker in risk_frames:
+            continue
+        try:
+            risk_frames[ticker] = cached_load(ticker, str(start_date), str(end_date))
+        except Exception as exc:
+            load_errors[ticker] = f"Risk Cockpit input unavailable: {exc}"
 
     feature_frames = build_features_for_universe(
         frames,
@@ -687,6 +696,7 @@ report_markdown = generate_markdown_report(
 portfolio_correlation, portfolio_crowding, factor_exposure, factor_crowding = (
     build_portfolio_crowding_diagnostics(frames, tickers)
 )
+risk_cockpit = build_risk_cockpit(risk_frames, tickers)
 
 with today_tab:
     if load_errors:
@@ -712,6 +722,23 @@ with today_tab:
     st.info(summary_text)
     if warning_text != "No dominant warning.":
         st.warning(warning_text)
+
+    st.subheader("Risk Cockpit")
+    st.caption(
+        "Hard price-data risk visibility only. This does not change scoring, actions, sizing, ranking, "
+        "allocation, saved settings, cache logic, or ML behavior."
+    )
+    risk_card_1, risk_card_2 = st.columns(2)
+    risk_card_1.metric("Market stress", risk_cockpit.market_state)
+    risk_card_2.metric("Theme stress", risk_cockpit.theme_state)
+    st.write("**Market stress panel**")
+    st.dataframe(risk_cockpit.market_panel, width="stretch", hide_index=True)
+    st.write("**Theme stress panel**")
+    st.dataframe(risk_cockpit.theme_panel, width="stretch", hide_index=True)
+    st.write("**Single-name trend health panel**")
+    st.dataframe(risk_cockpit.single_name_health, width="stretch", hide_index=True)
+    st.write("**Plain-language decision memo**")
+    st.info(risk_cockpit.memo)
 
     st.subheader("Today's Decision Table")
     st.caption(
