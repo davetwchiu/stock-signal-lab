@@ -31,6 +31,9 @@ SMA_50_200 = "50/200-day moving-average cross rule"
 SSL_PRODUCTION = "Stock Signal Lab production rule"
 SSL_WITHOUT_ML = "Stock Signal Lab production rule without ML"
 SSL_WITH_ML = "Stock Signal Lab production rule with ML"
+SIMPLE_TREND = "Simple trend-only rule"
+SIMPLE_TREND_DRAWDOWN_RISK = "Simple trend + drawdown-risk rule"
+SIMPLE_TREND_REDUCED_DEFENSIVENESS = "Simple trend + reduced-defensiveness rule"
 STRATEGY_ORDER = (
     BUY_AND_HOLD,
     SMA_200,
@@ -38,6 +41,9 @@ STRATEGY_ORDER = (
     SSL_PRODUCTION,
     SSL_WITHOUT_ML,
     SSL_WITH_ML,
+    SIMPLE_TREND,
+    SIMPLE_TREND_DRAWDOWN_RISK,
+    SIMPLE_TREND_REDUCED_DEFENSIVENESS,
 )
 
 
@@ -91,6 +97,31 @@ def moving_average_cross_signal(price: pd.Series, short_window: int = 50, long_w
     short_average = price.rolling(window=short_window, min_periods=short_window).mean()
     long_average = price.rolling(window=long_window, min_periods=long_window).mean()
     return (short_average > long_average).astype(float).fillna(0.0)
+
+
+def simple_trend_signal(features: pd.DataFrame) -> pd.Series:
+    """Long when price is above both 50d and 200d averages."""
+
+    dist_50 = pd.to_numeric(features.get("dist_ma_50d", pd.Series(index=features.index)), errors="coerce")
+    dist_200 = pd.to_numeric(features.get("dist_ma_200d", pd.Series(index=features.index)), errors="coerce")
+    return ((dist_50 > 0.0) & (dist_200 > 0.0)).astype(float)
+
+
+def simple_trend_drawdown_risk_signal(features: pd.DataFrame) -> pd.Series:
+    """Trend rule with the existing regime drawdown-risk thresholds."""
+
+    dd_60 = pd.to_numeric(features.get("max_drawdown_60d", pd.Series(index=features.index)), errors="coerce")
+    dd_120 = pd.to_numeric(features.get("max_drawdown_120d", pd.Series(index=features.index)), errors="coerce")
+    return (simple_trend_signal(features).eq(1.0) & (dd_60 > -0.12) & (dd_120 > -0.20)).astype(float)
+
+
+def simple_trend_reduced_defensiveness_signal(features: pd.DataFrame) -> pd.Series:
+    """Less defensive trend rule: require one positive average and no major 120d drawdown."""
+
+    dist_50 = pd.to_numeric(features.get("dist_ma_50d", pd.Series(index=features.index)), errors="coerce")
+    dist_200 = pd.to_numeric(features.get("dist_ma_200d", pd.Series(index=features.index)), errors="coerce")
+    dd_120 = pd.to_numeric(features.get("max_drawdown_120d", pd.Series(index=features.index)), errors="coerce")
+    return (((dist_50 > 0.0) | (dist_200 > 0.0)) & (dd_120 > -0.20)).astype(float)
 
 
 def run_single_strategy_backtest(
@@ -242,6 +273,9 @@ def run_simple_roi_backtest(config: SimpleROIBacktestConfig | None = None) -> pd
                 decision_config,
                 cfg.profile_name,
             ).reindex(price.index),
+            SIMPLE_TREND: simple_trend_signal(features).reindex(price.index),
+            SIMPLE_TREND_DRAWDOWN_RISK: simple_trend_drawdown_risk_signal(features).reindex(price.index),
+            SIMPLE_TREND_REDUCED_DEFENSIVENESS: simple_trend_reduced_defensiveness_signal(features).reindex(price.index),
         }
         signals[SSL_PRODUCTION] = signals[SSL_WITH_ML]
         for strategy in STRATEGY_ORDER:
@@ -468,15 +502,49 @@ def add_comparison_columns(results: pd.DataFrame) -> pd.DataFrame:
         sma_value = values.get(SMA_200, pd.NA)
         without_ml_value = values.get(SSL_WITHOUT_ML, pd.NA)
         with_ml_value = values.get(SSL_WITH_ML, pd.NA)
+        ssl_row = group[group["strategy"] == SSL_PRODUCTION].head(1)
         mask = output["ticker"] == ticker
         output.loc[mask, "best_strategy_per_ticker"] = best_strategy
         output.loc[mask, "worst_strategy_per_ticker"] = worst_strategy
+        output.loc[mask, "beats_buy_hold"] = output.loc[mask, "final_value"].map(
+            lambda value: _better(value, buy_hold_value)
+        )
+        output.loc[mask, "beats_200dma"] = output.loc[mask, "final_value"].map(lambda value: _better(value, sma_value))
+        output.loc[mask, "improves_return_drawdown_tradeoff_vs_ssl"] = output.loc[mask].apply(
+            lambda row: _improves_return_drawdown_tradeoff(row, ssl_row.iloc[0]) if not ssl_row.empty else pd.NA,
+            axis=1,
+        )
         output.loc[mask, "ssl_beats_buy_hold"] = bool(ssl_value > buy_hold_value) if pd.notna(ssl_value) else pd.NA
         output.loc[mask, "ssl_beats_200dma"] = bool(ssl_value > sma_value) if pd.notna(ssl_value) else pd.NA
         output.loc[mask, "ml_adds_value_vs_non_ml_app_rule"] = (
             bool(with_ml_value > without_ml_value) if pd.notna(with_ml_value) and pd.notna(without_ml_value) else pd.NA
         )
     return output
+
+
+def _better(candidate: object, baseline: object) -> object:
+    if pd.isna(candidate) or pd.isna(baseline):
+        return pd.NA
+    return bool(float(candidate) > float(baseline))
+
+
+def _return_drawdown_tradeoff(row: pd.Series) -> float | None:
+    total_return = row.get("total_return", pd.NA)
+    max_drawdown = row.get("max_drawdown", pd.NA)
+    if pd.isna(total_return) or pd.isna(max_drawdown):
+        return None
+    drawdown = abs(float(max_drawdown))
+    if drawdown <= 1e-12:
+        return float("inf") if float(total_return) > 0 else float(total_return)
+    return float(total_return) / drawdown
+
+
+def _improves_return_drawdown_tradeoff(candidate: pd.Series, baseline: pd.Series) -> object:
+    candidate_score = _return_drawdown_tradeoff(candidate)
+    baseline_score = _return_drawdown_tradeoff(baseline)
+    if candidate_score is None or baseline_score is None:
+        return pd.NA
+    return bool(float(candidate["total_return"]) > float(baseline["total_return"]) and candidate_score > baseline_score)
 
 
 def default_lookback_start(start: str, years: int = 3) -> str:
