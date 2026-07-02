@@ -15,7 +15,7 @@ from src.data.fetch import load_daily_data
 from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config, profile_settings
 from src.decision.explain import ticker_explanation
 from src.decision.report import generate_markdown_report, main_warning, portfolio_summary_text
-from src.decision.risk_cockpit import RISK_COCKPIT_TICKERS, build_risk_cockpit
+from src.decision.risk_cockpit import RISK_COCKPIT_TICKERS, build_risk_cockpit, format_risk_cockpit_display
 from src.decision.shortlist import SHORTLIST_VIEW_OPTIONS, filter_decision_shortlist
 from src.decision.table import action_counts, build_decision_table, parse_current_weights_input
 from src.decision.user_benchmark import resolve_active_benchmark, save_user_benchmark
@@ -732,11 +732,11 @@ with today_tab:
     risk_card_1.metric("Market stress", risk_cockpit.market_state)
     risk_card_2.metric("Theme stress", risk_cockpit.theme_state)
     st.write("**Market stress panel**")
-    st.dataframe(risk_cockpit.market_panel, width="stretch", hide_index=True)
+    st.dataframe(format_risk_cockpit_display(risk_cockpit.market_panel), width="stretch", hide_index=True)
     st.write("**Theme stress panel**")
-    st.dataframe(risk_cockpit.theme_panel, width="stretch", hide_index=True)
+    st.dataframe(format_risk_cockpit_display(risk_cockpit.theme_panel), width="stretch", hide_index=True)
     st.write("**Single-name trend health panel**")
-    st.dataframe(risk_cockpit.single_name_health, width="stretch", hide_index=True)
+    st.dataframe(format_risk_cockpit_display(risk_cockpit.single_name_health), width="stretch", hide_index=True)
     st.write("**Plain-language decision memo**")
     st.info(risk_cockpit.memo)
 
