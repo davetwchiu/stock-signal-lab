@@ -104,15 +104,15 @@ from src.utils.config import FeatureConfig
 st.set_page_config(page_title="Stock Signal Lab", layout="wide")
 
 DECISION_HELP = {
-    "ml_score": "Higher means the relative setup looks more constructive under current trend and risk conditions.",
-    "drawdown": "Estimated chance of a meaningful pullback over the forward review window.",
-    "action": "A plain-English action label based on trend, opportunity, pullback risk, relative strength, and risk controls.",
+    "ml_score": "Legacy 0-100 audit score from the older scoring model.",
+    "drawdown": "Legacy model estimate of pullback risk over the forward review window.",
+    "action": "Legacy posture label based on trend, audit score, pullback risk, relative strength, and risk controls.",
 }
 DECISION_TABLE_COLUMN_LABELS = {
     "Rule-based regime": "Trend backdrop",
-    "ML score": "Opportunity score",
+    "ML score": "Legacy audit score",
     "Drawdown-risk probability": "Pullback risk",
-    "Target exposure bucket": "Suggested position size",
+    "Target exposure bucket": "Exposure bucket reference",
     "One-line reason": "Reason",
 }
 BENCHMARK_OPTIONS = ["SPY", "QQQ", "SMH", "SOXX"]
@@ -476,15 +476,15 @@ def show_ml_feature_signal_diagnostics(diagnostics: MLFeatureSignalDiagnostics) 
 config = load_decision_config()
 
 st.title("Stock Signal Lab")
-st.caption("Decision support for regime, risk, and portfolio exposure. Research only, not financial advice.")
+st.caption("Risk Cockpit and position-discipline support. Research only, not financial advice.")
 
 with st.sidebar:
-    st.header("Decision Cockpit")
+    st.header("Risk Cockpit")
     profile_name = st.selectbox(
         "Profile",
         options=["Conservative", "Balanced", "Aggressive"],
         index=1,
-        help="Choose how conservative the suggested cash reserve and position sizes should be.",
+        help="Choose how conservative the reference cash floor and exposure buckets should be.",
     )
     advanced_override = st.toggle(
         "Show advanced settings",
@@ -712,11 +712,11 @@ with today_tab:
     card_1.metric("Market regime", market_regime or "Unavailable", help="Rule-based regime for the selected benchmark.")
     risk_state = "Defensive" if "Downtrend" in market_regime or "elevated" in summary_text else "Normal"
     card_2.metric("Portfolio risk state", risk_state, help="Plain-English portfolio risk posture.")
-    card_3.metric("Suggested gross exposure", f"{suggested_gross:.0%}", help="Maximum suggested invested exposure.")
-    card_4.metric("Suggested cash level", f"{suggested_cash:.0%}", help="Suggested minimum cash reserve.")
+    card_3.metric("Profile reference exposure", f"{suggested_gross:.0%}", help="Profile reference invested exposure.")
+    card_4.metric("Profile cash floor", f"{suggested_cash:.0%}", help="Profile minimum cash reserve.")
 
-    st.write(
-        f"Actions: Add {counts['Add']} | Hold {counts['Hold']} | Trim {counts['Trim']} | "
+    st.caption(
+        f"Legacy posture labels: Add {counts['Add']} | Hold {counts['Hold']} | Trim {counts['Trim']} | "
         f"Exit {counts['Exit']} | Watch {counts['Watch']}"
     )
     st.info(summary_text)
@@ -740,20 +740,20 @@ with today_tab:
     st.write("**Plain-language decision memo**")
     st.info(risk_cockpit.memo)
 
-    st.subheader("Today's Decision Table")
+    st.subheader("Legacy scoring table / audit reference")
     st.caption(
-        "Opportunity score is a 0-100 ranking aid, not a price target, expected return, or buy probability. "
+        "Legacy audit score is a 0-100 historical scoring aid, not a price target, expected return, "
+        "buy probability, alpha forecast, or daily trading signal. "
         + DECISION_HELP["ml_score"]
         + " Pullback risk: "
         + DECISION_HELP["drawdown"]
     )
     if current_weights.empty:
         st.caption(
-            "Suggested action labels assume zero current holdings; read them as target-position stances "
-            "or watchlist actions unless optional current weights are supplied."
+            "Legacy posture labels assume zero current holdings unless optional current weights are supplied."
         )
     else:
-        st.caption("Suggested action labels use the optional current weights entered in advanced settings.")
+        st.caption("Legacy posture labels use the optional current weights entered in advanced settings.")
     cockpit_view = st.selectbox(
         "Cockpit view",
         SHORTLIST_VIEW_OPTIONS,
@@ -762,7 +762,7 @@ with today_tab:
     filtered_decision_table = filter_decision_shortlist(decision_table, cockpit_view)
     st.caption(
         f"Showing {len(filtered_decision_table)} of {len(decision_table)} rows. "
-        "This display filter does not change scores, ranking, actions, or position sizing."
+        "This display filter does not change scores, ranking, posture labels, or exposure buckets."
     )
     displayed_decision_table = display_decision_table(filtered_decision_table)
     if displayed_decision_table.empty:
@@ -771,9 +771,9 @@ with today_tab:
         st.dataframe(styled_decision_table(displayed_decision_table), width="stretch")
     c1, c2 = st.columns(2)
     c1.download_button(
-        "Export today's decision table to CSV",
+        "Export legacy audit table to CSV",
         dataframe_to_csv(decision_table),
-        file_name="today_decision_table.csv",
+        file_name="legacy_scoring_audit_table.csv",
         mime="text/csv",
     )
     c2.download_button(
@@ -807,8 +807,12 @@ with explain_tab:
         feature_row = latest_features[latest_features["Ticker"] == selected_ticker].iloc[0]
         explanation = ticker_explanation(decision_row, feature_row)
 
-        st.metric("Current suggested action", explanation["action"], help=DECISION_HELP["action"])
-        st.metric("Target exposure", explanation["target_exposure"], help="Exposure bucket relative to the max allowed position size.")
+        st.metric("Current posture label", explanation["action"], help=DECISION_HELP["action"])
+        st.metric(
+            "Exposure bucket reference",
+            explanation["target_exposure"],
+            help="Reference bucket relative to the max allowed position size.",
+        )
         st.write("**Reason**")
         st.write(explanation["reason"])
 
@@ -828,7 +832,10 @@ with explain_tab:
 
 with research_tab:
     st.subheader("Research Lab")
-    st.caption("Advanced diagnostics and parameter-heavy testing live here.")
+    st.caption(
+        "Legacy ML and target diagnostics are retained for audit only. The product direction is "
+        "Risk Cockpit / Position Discipline, not ML-alpha rescue."
+    )
 
     with st.expander("Research evidence summary", expanded=True):
         st.caption(
@@ -873,7 +880,7 @@ with research_tab:
     with st.expander("Portfolio overlap, correlation, and factor crowding", expanded=False):
         st.caption(
             "Risk visibility only, not alpha: high crowding means several holdings may behave like one large bet. "
-            "Use this to avoid accidental overconcentration; it does not change ML Score, suggested action, "
+            "Use this to avoid accidental overconcentration; it does not change ML Score, legacy posture labels, "
             "sizing, ranking, or allocation."
         )
         st.write("**Portfolio crowding summary**")
@@ -943,7 +950,7 @@ with research_tab:
             "Model",
             options=list(MODEL_OPTIONS),
             format_func=lambda value: value.replace("_", " ").title(),
-            help="Stage 2 model family. Decision Mode uses the locked default model.",
+            help="Legacy research model family. The audit table uses the locked default model.",
         )
         model_selection_mode = st.selectbox(
             "ML model mode",
@@ -972,9 +979,9 @@ with research_tab:
             )
         probability_threshold = st.slider("Classification threshold", 0.05, 0.95, 0.50, 0.05)
         show_ml_diagnostics = st.checkbox(
-            "Show ML signal diagnostics",
+            "Show legacy ML audit diagnostics",
             value=False,
-            help="Run extra research-only diagnostics for existing walk-forward ML signal outputs.",
+            help="Run extra research-only diagnostics for existing walk-forward legacy ML outputs.",
         )
         run_extended_target_comparison = st.checkbox(
             "Run extended target comparison",
@@ -1032,9 +1039,9 @@ with research_tab:
 
                 if show_ml_diagnostics:
                     st.info(
-                        "ML signal health is research-only. It checks whether past out-of-sample "
-                        "ML predictions separated stronger and weaker signals. The labels are historical "
-                        "diagnostics only. This panel does not affect Decision Mode, scores, sizing, "
+                        "Legacy ML audit health is research-only. It checks whether past out-of-sample "
+                        "ML predictions separated stronger and weaker historical groups. The labels are "
+                        "diagnostics only. This panel does not affect the audit table, scores, sizing, "
                         "ranking, allocation, saved portfolio, benchmark, or cache."
                     )
                     try:
@@ -1224,10 +1231,10 @@ with research_tab:
                                 )
                             )
                             verdict, reason, health_metrics = ml_signal_health_interpretation(diagnostics)
-                            st.write("**ML signal health**")
+                            st.write("**Legacy ML audit health**")
                             st.caption(
                                 "Research-only interpretation of existing walk-forward diagnostics. "
-                                "This does not affect Decision Mode, scores, sizing, ranking, or allocation."
+                                "This does not affect the audit table, scores, sizing, ranking, or allocation."
                             )
                             verdict_message = f"**{verdict}** - {reason}"
                             if verdict == "Healthy":
@@ -1248,8 +1255,8 @@ with research_tab:
                                 )
                             st.write("**ML diagnostics summary**")
                             st.caption(
-                                "Research-only diagnostics for existing walk-forward signal outputs. "
-                                "These tables do not change Decision Mode logic."
+                                "Research-only diagnostics for existing walk-forward legacy ML outputs. "
+                                "These tables do not change Risk Cockpit or legacy scoring logic."
                             )
                             st.dataframe(diagnostics.summary, width="stretch")
                             summary_export = diagnostic_export_frame(diagnostics.summary)
@@ -1296,10 +1303,10 @@ with research_tab:
                                     width="stretch",
                                     hide_index=True,
                                 )
-                            st.write("**Alternative ML target diagnostics**")
+                            st.write("**Legacy ML target audit diagnostics**")
                             st.caption(
-                                "These diagnostics compare possible future ML targets. They do not change "
-                                "Decision Cockpit scoring or today's ML Score."
+                                "These diagnostics compare legacy target definitions for audit triage. They do not change "
+                                "Risk Cockpit logic or the legacy ML Score."
                             )
                             st.write("Candidate target definitions")
                             st.dataframe(
@@ -1334,10 +1341,10 @@ with research_tab:
                                 width="stretch",
                                 hide_index=True,
                             )
-                            st.write("Target quality summary and recommendation")
+                            st.write("Target quality audit summary")
                             st.caption(
-                                "This summary helps decide which target deserves future production testing. "
-                                "It does not change Decision Cockpit scoring or today's ML Score."
+                                "This summary is retained for audit triage only. It does not set the product roadmap "
+                                "or change Risk Cockpit logic or the legacy ML Score."
                             )
                             if target_quality_summary.empty:
                                 st.info("No target quality summary was available.")
@@ -1381,7 +1388,7 @@ with research_tab:
                                 )
                             st.caption(
                                 "These diagnostics compare target candidates under different feature sets and "
-                                "regimes. They do not change Decision Cockpit scoring or today's ML Score."
+                                "regimes. They do not change Risk Cockpit logic or the legacy ML Score."
                             )
                             if run_extended_target_comparison:
                                 st.write("Target comparison by feature group")
@@ -1444,14 +1451,14 @@ with research_tab:
                                     )
                             else:
                                 st.info("Enable Run extended target comparison to compare targets by feature group and regime.")
-                            st.write("**Opportunity-risk joint validation**")
+                            st.write("**Legacy score/risk joint validation**")
                             st.caption(
                                 interpret_opportunity_risk_joint_validation(
                                     diagnostics.opportunity_risk_joint_validation
                                 )
                             )
                             if diagnostics.opportunity_risk_joint_validation.empty:
-                                st.info("No opportunity-risk joint validation was available for this sample.")
+                                st.info("No legacy score/risk joint validation was available for this sample.")
                             else:
                                 st.dataframe(
                                     diagnostics.opportunity_risk_joint_validation,
@@ -1537,10 +1544,10 @@ with research_tab:
                                 st.dataframe(diagnostics.regime_segmented, width="stretch")
                             st.write("**ML score regime bucket audit**")
                             st.caption(
-                                "ML Score is not always a one-way opportunity signal. In high-volatility "
+                                "ML Score is not a forward product signal. In high-volatility "
                                 "uptrends, high scores can mark extended setups with more reversal/drawdown "
                                 "risk. This is audit evidence only and does not change production ML Score, "
-                                "action, sizing, ranking, or allocation."
+                                "legacy posture labels, exposure buckets, ranking, or allocation."
                             )
                             if diagnostics.ml_score_regime_bucket_audit.empty:
                                 st.info("No ML score regime bucket audit was available for this sample.")
@@ -1744,8 +1751,8 @@ with research_tab:
         research_export_payload = st.session_state.get("research_lab_export_payload")
         if research_export_payload:
             st.caption(
-                "This export is for research iteration. It does not change Decision Cockpit "
-                "scoring or today's ML Score."
+                "This export is for research iteration. It does not change Risk Cockpit logic "
+                "or the legacy ML Score."
             )
             if st.button("Export Research Lab diagnostics bundle", key="export_research_lab_diagnostics_bundle"):
                 try:
