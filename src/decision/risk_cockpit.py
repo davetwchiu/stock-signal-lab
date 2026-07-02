@@ -18,6 +18,28 @@ SINGLE_NAME_STATES = (
     "Watch only",
 )
 RISK_COCKPIT_TICKERS = ("SPY", "QQQ", "SOXX", "SMH", "TLT", "IEF")
+RISK_COCKPIT_PERCENT_COLUMNS = frozenset(
+    {
+        "QQQ 60d RS vs SPY",
+        "QQQ vs 50DMA",
+        "QQQ vs 200DMA",
+        "QQQ from 126d high",
+        "QQQ 20d return",
+        "QQQ 60d return",
+        "QQQ vol expansion",
+        "TLT/IEF vs 200DMA",
+        "60d RS vs QQQ",
+        "60d RS vs SOXX",
+        "Vs 50DMA",
+        "Vs 200DMA",
+        "From 126d high",
+        "20d return",
+        "60d return",
+        "120d return",
+        "60d drawdown",
+        "Vol expansion",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -110,7 +132,52 @@ def _relative_return(frames: dict[str, pd.DataFrame], ticker: str, benchmark: st
 def _pct(value: object) -> str:
     if value is None or pd.isna(value):
         return "n/a"
-    return f"{float(value):.1%}"
+    return f"{float(value):+.1%}"
+
+
+def format_risk_cockpit_display(table: pd.DataFrame) -> pd.DataFrame:
+    out = table.copy()
+    for column in out.columns:
+        if column in RISK_COCKPIT_PERCENT_COLUMNS:
+            out[column] = out[column].map(_pct)
+    return out
+
+
+def _join_phrases(phrases: list[str]) -> str:
+    if len(phrases) <= 1:
+        return "".join(phrases)
+    return f"{', '.join(phrases[:-1])} and {phrases[-1]}"
+
+
+def _market_offsets(qqq: dict[str, object], qqq_rs_spy: float | None) -> list[str]:
+    offsets: list[str] = []
+    above_50 = (qqq.get("Vs 50DMA") or 0) >= 0
+    above_200 = (qqq.get("Vs 200DMA") or 0) >= 0
+    if above_50 and above_200:
+        offsets.append("QQQ remains above 50DMA / 200DMA")
+    elif above_50:
+        offsets.append("QQQ remains above 50DMA")
+    elif above_200:
+        offsets.append("QQQ remains above 200DMA")
+    if qqq_rs_spy is not None and qqq_rs_spy >= 0:
+        offsets.append("QQQ is outperforming SPY")
+    return offsets
+
+
+def _market_evidence(
+    deterioration_flags: list[str],
+    warning_flags: list[str],
+    offsets: list[str],
+) -> str:
+    if warning_flags and not deterioration_flags and offsets:
+        return f"{'; '.join(warning_flags)}, but {_join_phrases(offsets)}."
+    flags = deterioration_flags + warning_flags
+    if flags:
+        evidence = "; ".join(flags)
+        if offsets:
+            evidence += f"; offsetting evidence: {_join_phrases(offsets)}."
+        return evidence
+    return "QQQ trend, drawdown, relative strength, and volatility are not flashing stress."
 
 
 def build_market_stress_panel(frames: dict[str, pd.DataFrame]) -> tuple[str, pd.DataFrame]:
@@ -137,21 +204,22 @@ def build_market_stress_panel(frames: dict[str, pd.DataFrame]) -> tuple[str, pd.
         )
         return "Elevated", panel
 
-    flags: list[str] = []
+    deterioration_flags: list[str] = []
     if (qqq.get("Vs 200DMA") or 0) < 0:
-        flags.append("QQQ is below its 200DMA")
+        deterioration_flags.append("QQQ is below its 200DMA")
     if (qqq.get("Vs 50DMA") or 0) < 0 and (qqq.get("20d return") or 0) < 0:
-        flags.append("QQQ is below its 50DMA with a negative 20d return")
+        deterioration_flags.append("QQQ is below its 50DMA with a negative 20d return")
     if (qqq.get("From 126d high") or 0) <= -0.10:
-        flags.append("QQQ is more than 10% below its 126d high")
+        deterioration_flags.append("QQQ is more than 10% below its 126d high")
     if qqq_rs_spy is not None and qqq_rs_spy <= -0.03:
-        flags.append("QQQ is lagging SPY over 60d")
+        deterioration_flags.append("QQQ is lagging SPY over 60d")
+    warning_flags: list[str] = []
     if (qqq.get("Vol expansion") or 0) >= 0.25:
-        flags.append("QQQ 20d volatility is expanding versus 60d volatility")
+        warning_flags.append("QQQ volatility is expanding")
 
-    if (qqq.get("Vs 200DMA") or 0) < 0 or len(flags) >= 3:
+    if (qqq.get("Vs 200DMA") or 0) < 0 or len(deterioration_flags) >= 3:
         state = "Stressed"
-    elif flags:
+    elif deterioration_flags:
         state = "Elevated"
     else:
         state = "Normal"
@@ -168,10 +236,10 @@ def build_market_stress_panel(frames: dict[str, pd.DataFrame]) -> tuple[str, pd.
                 "QQQ 60d return": qqq.get("60d return"),
                 "QQQ vol expansion": qqq.get("Vol expansion"),
                 "TLT/IEF vs 200DMA": tlt.get("Vs 200DMA"),
-                "Evidence": (
-                    "; ".join(flags)
-                    if flags
-                    else "QQQ trend, drawdown, relative strength, and volatility are not flashing stress."
+                "Evidence": _market_evidence(
+                    deterioration_flags,
+                    warning_flags,
+                    _market_offsets(qqq, qqq_rs_spy),
                 ),
             }
         ]
@@ -196,6 +264,23 @@ def build_theme_stress_panel(frames: dict[str, pd.DataFrame]) -> tuple[str, pd.D
             or (rs_qqq is not None and rs_qqq <= -0.08)
             or (metrics.get("From 126d high") or 0) <= -0.18
         )
+        cooling = (
+            not weak
+            and (
+                (metrics.get("20d return") is not None and float(metrics["20d return"]) < 0)
+                or (metrics.get("From 126d high") is not None and float(metrics["From 126d high"]) <= -0.05)
+            )
+        )
+        if missing:
+            evidence = f"{ticker} hard price data is incomplete."
+        elif stressed:
+            evidence = f"{ticker} semiconductor trend is stressed."
+        elif weak:
+            evidence = f"{ticker} semiconductor trend is weakening."
+        elif cooling:
+            evidence = f"{ticker} trend remains healthy, but short-term returns are cooling / below recent highs."
+        else:
+            evidence = f"{ticker} trend remains healthy."
         rows.append(
             {
                 "Ticker": ticker,
@@ -205,6 +290,7 @@ def build_theme_stress_panel(frames: dict[str, pd.DataFrame]) -> tuple[str, pd.D
                 "From 126d high": metrics.get("From 126d high"),
                 "20d return": metrics.get("20d return"),
                 "60d return": metrics.get("60d return"),
+                "Evidence": evidence,
                 "_missing": missing,
                 "_weak": weak,
                 "_stressed": stressed,
