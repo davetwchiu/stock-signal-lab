@@ -45,6 +45,7 @@ from src.ml.target_diagnostics import (
     target_candidate_registry,
     target_definition_table,
 )
+from src.ml.labels import make_forward_labels
 from src.ml.validation import compare_feature_groups, summarize_model_selection, walk_forward_validate_classifier
 from src.research.earnings_events import load_earnings_events
 from src.research.export import build_research_lab_export_payload
@@ -188,6 +189,34 @@ ADVERSE_OUTCOME_LABEL_COMPARISON_COLUMNS = [
     "worst_ticker",
     "classification",
 ]
+STRESS_RELATIVE_STRENGTH_COLUMNS = [
+    "date",
+    "ticker",
+    "benchmark",
+    "regime",
+    "stress_window",
+    "stress_threshold",
+    "rebound_threshold",
+    "stress_event",
+    "stress_day_count",
+    "rebound_day_count",
+    "stress_excess_return",
+    "resilience_rate",
+    "downside_capture",
+    "close_position_recovery",
+    "rebound_leadership_return",
+    "stress_relative_strength_score",
+    "stress_rs_bucket",
+    "forward_20d_excess_return",
+    "forward_60d_excess_return",
+    "max_forward_drawdown",
+    "ordinary_momentum_score",
+    "ordinary_momentum_feature",
+    "buy_hold_forward_20d_return",
+    "benchmark_forward_20d_return",
+    "above_200dma",
+    "classification",
+]
 
 
 @dataclass(frozen=True)
@@ -316,6 +345,11 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         supervised,
         benchmark_price=benchmark_frame["Adj Close"],
         base_horizon=label_horizon,
+    )
+    stress_relative_strength = build_stress_relative_strength_diagnostics(
+        target_panel,
+        benchmark_frame["Adj Close"],
+        benchmark=benchmark,
     )
     target_balance = build_target_balance_diagnostics(target_panel, target_candidates)
     target_walk_forward = build_target_walk_forward_comparison(
@@ -521,6 +555,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "risk_adjusted_opportunity_fragility": risk_adjusted_opportunity_fragility,
         "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
         "adverse_outcome_label_comparison": adverse_outcome_label_comparison,
+        "stress_relative_strength_diagnostics": stress_relative_strength,
         "model_selection_summary": pd.concat(
             [
                 summarize_model_selection(outperformance.fold_metrics, "outperformance"),
@@ -623,6 +658,183 @@ def build_opportunity_baseline_challenge(
         return pd.DataFrame(columns=OPPORTUNITY_BASELINE_CHALLENGE_COLUMNS)
 
     return _opportunity_baseline_summary(scored, probability_col, regime_col, momentum_feature, bucket_count)
+
+
+def build_stress_relative_strength_diagnostics(
+    panel: pd.DataFrame,
+    benchmark_price: pd.Series,
+    *,
+    benchmark: str = "QQQ",
+    stress_threshold: float = -0.015,
+    rebound_threshold: float = 0.01,
+    stress_window: int = 63,
+    min_stress_days: int = 3,
+) -> pd.DataFrame:
+    """Score trailing stress resilience without using future return labels as inputs."""
+
+    required = {"Date", "Ticker", "Adj Close", "High", "Low", "Close"}
+    if panel.empty or not required.issubset(panel.columns) or benchmark_price.empty:
+        return pd.DataFrame(columns=STRESS_RELATIVE_STRENGTH_COLUMNS)
+
+    prices = benchmark_price.copy()
+    prices.index = pd.to_datetime(prices.index)
+    benchmark_return = prices.sort_index().pct_change()
+    stress_days = benchmark_return <= stress_threshold
+    rebound_days = (benchmark_return >= rebound_threshold) & stress_days.rolling(5, min_periods=1).max().shift(1).fillna(False)
+
+    output = _with_forward_60d(panel, prices).copy()
+    output["Date"] = pd.to_datetime(output["Date"])
+    rows = []
+    for ticker, group in output.groupby("Ticker", sort=True):
+        ordered = group.sort_values("Date").copy()
+        ordered["_benchmark_return"] = benchmark_return.reindex(ordered["Date"]).to_numpy()
+        ordered["_stress_day"] = stress_days.reindex(ordered["Date"]).fillna(False).to_numpy()
+        ordered["_rebound_day"] = rebound_days.reindex(ordered["Date"]).fillna(False).to_numpy()
+        rows.append(
+            _stress_relative_strength_ticker_rows(
+                ordered,
+                ticker=str(ticker),
+                benchmark=benchmark,
+                stress_threshold=stress_threshold,
+                rebound_threshold=rebound_threshold,
+                stress_window=stress_window,
+            )
+        )
+    if not rows:
+        return pd.DataFrame(columns=STRESS_RELATIVE_STRENGTH_COLUMNS)
+
+    diagnostics = pd.concat(rows, ignore_index=True)
+    diagnostics["stress_relative_strength_score"] = _stress_relative_strength_score(diagnostics)
+    diagnostics["ordinary_momentum_score"] = _date_rank_score(diagnostics, "ordinary_momentum_value")
+    diagnostics["stress_rs_bucket"] = _stress_rs_buckets(diagnostics)
+    diagnostics["classification"] = diagnostics.apply(
+        lambda row: _stress_rs_classification(row, min_stress_days=min_stress_days),
+        axis=1,
+    )
+    return diagnostics[STRESS_RELATIVE_STRENGTH_COLUMNS]
+
+
+def _stress_relative_strength_ticker_rows(
+    data: pd.DataFrame,
+    *,
+    ticker: str,
+    benchmark: str,
+    stress_threshold: float,
+    rebound_threshold: float,
+    stress_window: int,
+) -> pd.DataFrame:
+    ticker_return = pd.to_numeric(data["Adj Close"], errors="coerce").pct_change()
+    benchmark_return = pd.to_numeric(data["_benchmark_return"], errors="coerce")
+    stress_mask = data["_stress_day"].astype(bool)
+    rebound_mask = data["_rebound_day"].astype(bool)
+    excess = ticker_return - benchmark_return
+    stress_count = stress_mask.astype(int).rolling(stress_window, min_periods=1).sum()
+    rebound_count = rebound_mask.astype(int).rolling(stress_window, min_periods=1).sum()
+    stress_excess = excess.where(stress_mask).rolling(stress_window, min_periods=1).mean()
+    resilience = (ticker_return > benchmark_return).where(stress_mask).rolling(stress_window, min_periods=1).mean()
+    ticker_down = ticker_return.where(stress_mask).rolling(stress_window, min_periods=1).sum()
+    benchmark_down = benchmark_return.where(stress_mask).rolling(stress_window, min_periods=1).sum()
+    downside_capture = ticker_down / benchmark_down.replace(0, pd.NA)
+    day_range = pd.to_numeric(data["High"], errors="coerce") - pd.to_numeric(data["Low"], errors="coerce")
+    close_position = ((pd.to_numeric(data["Close"], errors="coerce") - pd.to_numeric(data["Low"], errors="coerce")) / day_range.replace(0, pd.NA))
+    close_recovery = close_position.where(stress_mask).rolling(stress_window, min_periods=1).mean()
+    rebound_leadership = excess.where(rebound_mask).rolling(stress_window, min_periods=1).mean()
+    momentum_feature = _select_momentum_feature(data)
+
+    return pd.DataFrame(
+        {
+            "date": data["Date"].dt.strftime("%Y-%m-%d"),
+            "Date": data["Date"],
+            "ticker": ticker,
+            "Ticker": ticker,
+            "benchmark": benchmark,
+            "regime": _optional_series(data, "regime"),
+            "stress_window": f"{stress_window}d",
+            "stress_threshold": stress_threshold,
+            "rebound_threshold": rebound_threshold,
+            "stress_event": stress_mask,
+            "stress_day_count": stress_count,
+            "rebound_day_count": rebound_count,
+            "stress_excess_return": stress_excess,
+            "resilience_rate": resilience,
+            "downside_capture": downside_capture,
+            "close_position_recovery": close_recovery,
+            "rebound_leadership_return": rebound_leadership,
+            "forward_20d_excess_return": _optional_series(data, "forward_20d_excess_return"),
+            "forward_60d_excess_return": _optional_series(data, "forward_60d_excess_return"),
+            "max_forward_drawdown": _optional_series(data, "forward_20d_drawdown"),
+            "ordinary_momentum_feature": momentum_feature or "",
+            "ordinary_momentum_value": _optional_series(data, momentum_feature),
+            "buy_hold_forward_20d_return": _optional_series(data, "forward_20d_return"),
+            "benchmark_forward_20d_return": _optional_series(data, "benchmark_forward_20d_return"),
+            "above_200dma": pd.to_numeric(_optional_series(data, "dist_ma_200d"), errors="coerce") > 0,
+        }
+    )
+
+
+def _optional_series(data: pd.DataFrame, column: str | None) -> pd.Series:
+    if column and column in data:
+        return data[column]
+    return pd.Series(pd.NA, index=data.index)
+
+
+def _with_forward_60d(panel: pd.DataFrame, benchmark_price: pd.Series) -> pd.DataFrame:
+    if "forward_60d_excess_return" in panel:
+        return panel
+    rows = []
+    for _, group in panel.groupby("Ticker", sort=False):
+        ordered = group.sort_values("Date").copy()
+        indexed = ordered.set_index("Date")
+        labels = make_forward_labels(indexed, benchmark_price=benchmark_price, horizon=60)
+        rows.append(ordered.join(labels[["forward_60d_excess_return"]], on="Date"))
+    return pd.concat(rows, ignore_index=True) if rows else panel.copy()
+
+
+def _stress_relative_strength_score(data: pd.DataFrame) -> pd.Series:
+    components = [
+        _date_rank_score(data, "stress_excess_return"),
+        _date_rank_score(data, "resilience_rate"),
+        _date_rank_score(data, "downside_capture", ascending=False),
+        _date_rank_score(data, "close_position_recovery"),
+        _date_rank_score(data, "rebound_leadership_return"),
+    ]
+    scores = pd.concat(components, axis=1).mean(axis=1, skipna=True) * 100.0
+    scores[pd.concat(components, axis=1).notna().sum(axis=1) < 2] = pd.NA
+    return scores
+
+
+def _date_rank_score(data: pd.DataFrame, column: str | None, *, ascending: bool = True) -> pd.Series:
+    if not column or column not in data:
+        return pd.Series(pd.NA, index=data.index, dtype="Float64")
+    values = pd.to_numeric(data[column], errors="coerce")
+    return values.groupby(data["Date"]).rank(pct=True, ascending=ascending)
+
+
+def _stress_rs_buckets(data: pd.DataFrame) -> pd.Series:
+    buckets = pd.Series("Unbucketed", index=data.index, dtype="object")
+    for _, group in data.groupby("Date", sort=False):
+        scores = pd.to_numeric(group["stress_relative_strength_score"], errors="coerce")
+        if scores.notna().sum() < 3 or scores.nunique(dropna=True) < 3:
+            continue
+        ranked = scores.rank(method="first")
+        labels = pd.qcut(ranked, q=3, labels=["Low", "Mid", "High"])
+        buckets.loc[group.index] = labels.astype(str)
+    return buckets
+
+
+def _stress_rs_classification(row: pd.Series, *, min_stress_days: int) -> str:
+    if pd.isna(row.get("stress_relative_strength_score")) or row.get("stress_day_count", 0) < min_stress_days:
+        return "insufficient sample"
+    if row.get("stress_rs_bucket") != "High":
+        return "mixed"
+    f20 = row.get("forward_20d_excess_return")
+    f60 = row.get("forward_60d_excess_return")
+    drawdown = row.get("max_forward_drawdown")
+    if pd.notna(f20) and float(f20) > 0 and (pd.isna(f60) or float(f60) >= 0) and (pd.isna(drawdown) or float(drawdown) >= -0.10):
+        return "promising"
+    if pd.notna(f20) and float(f20) <= 0:
+        return "weak"
+    return "mixed"
 
 
 def _opportunity_baseline_summary(
