@@ -86,6 +86,12 @@ from src.ml.validation import (
 from src.portfolio.allocation import AllocationConfig
 from src.portfolio.risk import RiskControlConfig
 from src.portfolio.simulator import simulate_portfolio
+from src.research.ai_layer_rotation import (
+    AI_LAYER_BASKETS,
+    AI_LAYER_TICKERS,
+    build_ai_layer_rotation_diagnostics,
+    format_ai_layer_rotation_display,
+)
 from src.research.export import (
     build_research_evidence_summary,
     build_research_lab_export_payload,
@@ -631,13 +637,13 @@ with st.spinner("Loading data and preparing today's decision view..."):
         except Exception as exc:
             load_errors[ticker] = str(exc)
     risk_frames = dict(frames)
-    for ticker in RISK_COCKPIT_TICKERS:
+    for ticker in dict.fromkeys((*RISK_COCKPIT_TICKERS, *AI_LAYER_TICKERS)):
         if ticker in risk_frames:
             continue
         try:
             risk_frames[ticker] = cached_load(ticker, str(start_date), str(end_date))
         except Exception as exc:
-            load_errors[ticker] = f"Risk Cockpit input unavailable: {exc}"
+            load_errors[ticker] = f"Risk Cockpit / AI Layer Rotation input unavailable: {exc}"
 
     feature_frames = build_features_for_universe(
         frames,
@@ -697,6 +703,7 @@ portfolio_correlation, portfolio_crowding, factor_exposure, factor_crowding = (
     build_portfolio_crowding_diagnostics(frames, tickers)
 )
 risk_cockpit = build_risk_cockpit(risk_frames, tickers)
+ai_layer_rotation = build_ai_layer_rotation_diagnostics(risk_frames, benchmark="QQQ")
 
 with today_tab:
     if load_errors:
@@ -735,6 +742,37 @@ with today_tab:
     st.dataframe(format_risk_cockpit_display(risk_cockpit.market_panel), width="stretch", hide_index=True)
     st.write("**Theme stress panel**")
     st.dataframe(format_risk_cockpit_display(risk_cockpit.theme_panel), width="stretch", hide_index=True)
+    st.write("**AI Layer Rotation**")
+    st.caption(
+        "Equal-weight price baskets. One layer up while another is down is rotation; "
+        "five negative layers is AI risk-off. This panel does not change any production behavior."
+    )
+    rotation_row = ai_layer_rotation.summary.iloc[0]
+    rotation_card_1, rotation_card_2, rotation_card_3 = st.columns(3)
+    rotation_card_1.metric("AI market state", rotation_row["market_state"])
+    rotation_card_2.metric("Rotation classification", rotation_row["classification"])
+    rotation_strength = rotation_row["rotation_strength"]
+    rotation_card_3.metric(
+        "5d rotation strength",
+        "n/a" if pd.isna(rotation_strength) else f"{float(rotation_strength):.1%}",
+        help="Spread between the strongest and weakest layer's 5d return relative to QQQ.",
+    )
+    st.caption(f"{rotation_row['rotation_direction']}. {rotation_row['evidence']}")
+    rotation_5d = ai_layer_rotation.detail[ai_layer_rotation.detail["window"] == 5][
+        ["layer", "basket_return", "relative_qqq_return", "breadth"]
+    ]
+    st.dataframe(
+        format_ai_layer_rotation_display(rotation_5d).rename(
+            columns={
+                "layer": "Layer",
+                "basket_return": "5d return",
+                "relative_qqq_return": "5d vs QQQ",
+                "breadth": "Breadth",
+            }
+        ),
+        width="stretch",
+        hide_index=True,
+    )
     st.write("**Single-name trend health panel**")
     st.dataframe(format_risk_cockpit_display(risk_cockpit.single_name_health), width="stretch", hide_index=True)
     st.write("**Plain-language decision memo**")
@@ -869,6 +907,40 @@ with research_tab:
                 mime="text/csv",
                 key="download_research_evidence_summary_csv",
             )
+
+    with st.expander("AI Five-Layer Rotation Diagnostics", expanded=True):
+        st.caption(
+            "Research-only, equal-weight price baskets using 1d / 5d / 20d / 60d windows. "
+            "Returns are compared with QQQ; breadth is the share of constituents with a positive window return."
+        )
+        st.caption(" | ".join(f"{layer}: {', '.join(names)}" for layer, names in AI_LAYER_BASKETS.items()))
+        st.write("**Current rotation summary (5d signal window)**")
+        st.dataframe(
+            format_ai_layer_rotation_display(ai_layer_rotation.summary),
+            width="stretch",
+            hide_index=True,
+        )
+        st.write("**Layer detail**")
+        st.dataframe(
+            format_ai_layer_rotation_display(ai_layer_rotation.detail),
+            width="stretch",
+            hide_index=True,
+        )
+        rotation_download_1, rotation_download_2 = st.columns(2)
+        rotation_download_1.download_button(
+            "Download AI layer detail CSV",
+            dataframe_to_csv(ai_layer_rotation.detail),
+            file_name="ai_layer_rotation_diagnostics.csv",
+            mime="text/csv",
+            key="download_ai_layer_rotation_diagnostics_csv",
+        )
+        rotation_download_2.download_button(
+            "Download AI layer summary CSV",
+            dataframe_to_csv(ai_layer_rotation.summary),
+            file_name="ai_layer_rotation_summary.csv",
+            mime="text/csv",
+            key="download_ai_layer_rotation_summary_csv",
+        )
 
     with st.expander("Market overview and rule-based baseline", expanded=False):
         st.dataframe(overview_table(feature_frames), width="stretch")
@@ -1695,6 +1767,8 @@ with research_tab:
                                 "portfolio_crowding_summary": portfolio_crowding,
                                 "portfolio_factor_proxy_exposure": factor_exposure,
                                 "portfolio_factor_crowding_summary": factor_crowding,
+                                "ai_layer_rotation_diagnostics": ai_layer_rotation.detail,
+                                "ai_layer_rotation_summary": ai_layer_rotation.summary,
                                 "earnings_event_diagnostics": diagnostics.earnings_event_diagnostics,
                                 "ml_score_by_earnings_window": diagnostics.ml_score_by_earnings_window,
                                 "earnings_pead_summary": diagnostics.earnings_pead_summary,

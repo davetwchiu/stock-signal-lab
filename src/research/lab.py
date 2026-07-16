@@ -49,6 +49,7 @@ from src.ml.labels import make_forward_labels
 from src.ml.validation import compare_feature_groups, summarize_model_selection, walk_forward_validate_classifier
 from src.research.earnings_events import load_earnings_events
 from src.research.export import build_research_lab_export_payload
+from src.research.ai_layer_rotation import AI_LAYER_TICKERS, build_ai_layer_rotation_diagnostics
 from src.research.portfolio_crowding import build_portfolio_crowding_diagnostics
 from src.utils.config import FeatureConfig
 
@@ -258,6 +259,20 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
     benchmark_frame = frames.get(benchmark)
     if benchmark_frame is None or benchmark_frame.empty:
         raise ValueError(f"No benchmark data available for {benchmark}")
+    rotation_frames = dict(frames)
+    for ticker in AI_LAYER_TICKERS:
+        if ticker in rotation_frames:
+            continue
+        try:
+            rotation_frames[ticker] = load_daily_data(
+                ticker,
+                start=str(start_date),
+                end=str(end_date),
+                use_cache=True,
+            )
+        except Exception:
+            continue
+    ai_layer_rotation = build_ai_layer_rotation_diagnostics(rotation_frames, benchmark="QQQ")
 
     ticker_feature_frames = {ticker: frame for ticker, frame in feature_frames.items() if ticker in tickers}
     supervised = build_supervised_panel(
@@ -556,6 +571,8 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
         "adverse_outcome_label_comparison": adverse_outcome_label_comparison,
         "stress_relative_strength_diagnostics": stress_relative_strength,
+        "ai_layer_rotation_diagnostics": ai_layer_rotation.detail,
+        "ai_layer_rotation_summary": ai_layer_rotation.summary,
         "model_selection_summary": pd.concat(
             [
                 summarize_model_selection(outperformance.fold_metrics, "outperformance"),
