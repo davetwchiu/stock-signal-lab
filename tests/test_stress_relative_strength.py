@@ -4,7 +4,12 @@ import pandas as pd
 
 from src.ml.labels import make_forward_labels
 from src.research.export import export_research_lab_diagnostics
-from src.research.lab import STRESS_RELATIVE_STRENGTH_COLUMNS, build_stress_relative_strength_diagnostics
+from src.research.lab import (
+    STRESS_RELATIVE_STRENGTH_COLUMNS,
+    STRESS_RELATIVE_STRENGTH_SNAPSHOT_COLUMNS,
+    build_stress_relative_strength_diagnostics,
+    latest_stress_relative_strength_snapshot,
+)
 
 
 def synthetic_panel() -> tuple[pd.DataFrame, pd.Series]:
@@ -96,7 +101,7 @@ def test_resilient_ticker_ranks_above_weak_ticker_during_stress() -> None:
     assert latest.loc["STRONG", "stress_rs_bucket"] == "High"
 
 
-def test_stress_relative_strength_export_shape(tmp_path) -> None:
+def test_latest_stress_relative_strength_snapshot_is_sorted_and_sample_gated() -> None:
     panel, benchmark = synthetic_panel()
     diagnostics = build_stress_relative_strength_diagnostics(
         panel,
@@ -105,9 +110,37 @@ def test_stress_relative_strength_export_shape(tmp_path) -> None:
         min_stress_days=1,
     )
 
+    snapshot = latest_stress_relative_strength_snapshot(diagnostics, min_stress_days=1)
+
+    assert list(snapshot.columns) == STRESS_RELATIVE_STRENGTH_SNAPSHOT_COLUMNS
+    assert snapshot["ticker"].tolist() == ["STRONG", "MID", "WEAK"]
+    assert snapshot["sample_status"].eq("sufficient").all()
+    assert snapshot["date"].nunique() == 1
+
+
+def test_latest_stress_relative_strength_snapshot_handles_missing_data() -> None:
+    snapshot = latest_stress_relative_strength_snapshot(pd.DataFrame({"ticker": ["NVDA"]}))
+
+    assert snapshot.empty
+    assert list(snapshot.columns) == STRESS_RELATIVE_STRENGTH_SNAPSHOT_COLUMNS
+
+
+def test_stress_relative_strength_export_shape(tmp_path) -> None:
+    panel, benchmark = synthetic_panel()
+    diagnostics = build_stress_relative_strength_diagnostics(
+        panel,
+        benchmark,
+        stress_window=40,
+        min_stress_days=1,
+    )
+    snapshot = latest_stress_relative_strength_snapshot(diagnostics, min_stress_days=1)
+
     result = export_research_lab_diagnostics(
         run_metadata={"created_at": "2026-07-09T10:00:00", "benchmark": "QQQ", "ticker_count": 3},
-        tables={"stress_relative_strength_diagnostics": diagnostics},
+        tables={
+            "stress_relative_strength_diagnostics": diagnostics,
+            "stress_relative_strength_snapshot": snapshot,
+        },
         output_root=tmp_path,
         run_id="run",
     )
@@ -115,3 +148,4 @@ def test_stress_relative_strength_export_shape(tmp_path) -> None:
     exported = pd.read_csv(result.run_dir / "stress_relative_strength_diagnostics.csv")
     assert list(exported.columns) == STRESS_RELATIVE_STRENGTH_COLUMNS
     assert result.manifest["row_counts"]["stress_relative_strength_diagnostics.csv"] == len(diagnostics)
+    assert result.manifest["row_counts"]["stress_relative_strength_snapshot.csv"] == 3

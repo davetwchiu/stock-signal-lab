@@ -218,6 +218,23 @@ STRESS_RELATIVE_STRENGTH_COLUMNS = [
     "above_200dma",
     "classification",
 ]
+STRESS_RELATIVE_STRENGTH_SNAPSHOT_COLUMNS = [
+    "date",
+    "ticker",
+    "benchmark",
+    "stress_window",
+    "stress_day_count",
+    "rebound_day_count",
+    "stress_relative_strength_score",
+    "stress_rs_bucket",
+    "stress_excess_return",
+    "resilience_rate",
+    "downside_capture",
+    "close_position_recovery",
+    "rebound_leadership_return",
+    "above_200dma",
+    "sample_status",
+]
 
 
 @dataclass(frozen=True)
@@ -366,6 +383,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         benchmark_frame["Adj Close"],
         benchmark=benchmark,
     )
+    stress_relative_strength_snapshot = latest_stress_relative_strength_snapshot(stress_relative_strength)
     target_balance = build_target_balance_diagnostics(target_panel, target_candidates)
     target_walk_forward = build_target_walk_forward_comparison(
         target_panel,
@@ -571,6 +589,7 @@ def assemble_research_lab_payload(config: ResearchLabRunConfig) -> dict[str, obj
         "drawdown_risk_feature_group_incremental_value": drawdown_risk_feature_group_incremental_value,
         "adverse_outcome_label_comparison": adverse_outcome_label_comparison,
         "stress_relative_strength_diagnostics": stress_relative_strength,
+        "stress_relative_strength_snapshot": stress_relative_strength_snapshot,
         "ai_layer_rotation_diagnostics": ai_layer_rotation.detail,
         "ai_layer_rotation_summary": ai_layer_rotation.summary,
         "model_selection_summary": pd.concat(
@@ -729,6 +748,34 @@ def build_stress_relative_strength_diagnostics(
         axis=1,
     )
     return diagnostics[STRESS_RELATIVE_STRENGTH_COLUMNS]
+
+
+def latest_stress_relative_strength_snapshot(
+    diagnostics: pd.DataFrame,
+    *,
+    min_stress_days: int = 3,
+) -> pd.DataFrame:
+    """Return one latest trailing stress-resilience row per ticker for display."""
+
+    required = set(STRESS_RELATIVE_STRENGTH_SNAPSHOT_COLUMNS) - {"sample_status"}
+    if diagnostics.empty or not required.issubset(diagnostics.columns):
+        return pd.DataFrame(columns=STRESS_RELATIVE_STRENGTH_SNAPSHOT_COLUMNS)
+
+    output = diagnostics.copy()
+    output["_date"] = pd.to_datetime(output["date"], errors="coerce")
+    output = output.dropna(subset=["_date"]).sort_values(["ticker", "_date"])
+    output = output.groupby("ticker", sort=False, as_index=False).tail(1)
+    scores = pd.to_numeric(output["stress_relative_strength_score"], errors="coerce")
+    stress_days = pd.to_numeric(output["stress_day_count"], errors="coerce")
+    output["sample_status"] = "insufficient sample"
+    output.loc[scores.notna() & stress_days.ge(min_stress_days), "sample_status"] = "sufficient"
+    output["stress_relative_strength_score"] = scores
+    output = output.sort_values(
+        ["stress_relative_strength_score", "ticker"],
+        ascending=[False, True],
+        na_position="last",
+    )
+    return output[STRESS_RELATIVE_STRENGTH_SNAPSHOT_COLUMNS].reset_index(drop=True)
 
 
 def _stress_relative_strength_ticker_rows(

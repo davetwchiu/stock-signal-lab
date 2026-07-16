@@ -99,6 +99,10 @@ from src.research.export import (
     zip_research_bundle,
 )
 from src.research.earnings_events import load_earnings_events
+from src.research.lab import (
+    build_stress_relative_strength_diagnostics,
+    latest_stress_relative_strength_snapshot,
+)
 from src.research.portfolio_crowding import build_portfolio_crowding_diagnostics
 from src.robustness.ablation import run_feature_ablation
 from src.robustness.runner import run_robustness_tests
@@ -674,6 +678,26 @@ else:
     feature_columns = []
     current_scores = pd.DataFrame()
 
+qqq_frame = frames.get("QQQ")
+if qqq_frame is not None and not qqq_frame.empty and decision_feature_frames:
+    stress_panel = (
+        supervised
+        if benchmark == "QQQ"
+        else build_supervised_panel(
+            decision_feature_frames,
+            benchmark_price=qqq_frame["Adj Close"],
+            horizon=config.default_label_horizon,
+        )
+    )
+    stress_relative_strength = build_stress_relative_strength_diagnostics(
+        stress_panel,
+        qqq_frame["Adj Close"],
+        benchmark="QQQ",
+    )
+else:
+    stress_relative_strength = pd.DataFrame()
+stress_relative_strength_snapshot = latest_stress_relative_strength_snapshot(stress_relative_strength)
+
 latest_features = latest_feature_table(decision_feature_frames)
 decision_table = build_decision_table(
     current_scores,
@@ -941,6 +965,94 @@ with research_tab:
             mime="text/csv",
             key="download_ai_layer_rotation_summary_csv",
         )
+
+    with st.expander("Stress Relative Strength", expanded=True):
+        st.caption(
+            "Trailing hard-price evidence from QQQ stress and rebound days. It describes which holdings "
+            "were relatively resilient; it is not a return forecast, score override, action, or sizing instruction."
+        )
+        if stress_relative_strength_snapshot.empty:
+            st.info("No stress-relative-strength snapshot is available for the current portfolio and date range.")
+        else:
+            sufficient_stress_rows = stress_relative_strength_snapshot[
+                stress_relative_strength_snapshot["sample_status"] == "sufficient"
+            ]
+            if len(sufficient_stress_rows) >= 2:
+                leader = sufficient_stress_rows.iloc[0]
+                laggard = sufficient_stress_rows.iloc[-1]
+                st.info(
+                    f"Trailing stress resilience: {leader['ticker']} ranks highest and "
+                    f"{laggard['ticker']} ranks lowest across {len(sufficient_stress_rows)} names with "
+                    "sufficient stress-day history."
+                )
+            elif len(sufficient_stress_rows) == 1:
+                st.info(
+                    f"Only {sufficient_stress_rows.iloc[0]['ticker']} has sufficient stress-day history; "
+                    "a cross-name resilience comparison is not yet available."
+                )
+            else:
+                st.info("No holding has enough QQQ stress days for a reliable trailing comparison.")
+
+            stress_snapshot_display = stress_relative_strength_snapshot.rename(
+                columns={
+                    "date": "Date",
+                    "ticker": "Ticker",
+                    "stress_day_count": "Stress days",
+                    "rebound_day_count": "Rebound days",
+                    "stress_relative_strength_score": "Stress RS score",
+                    "stress_rs_bucket": "Stress RS bucket",
+                    "stress_excess_return": "Stress excess return",
+                    "resilience_rate": "Resilience rate",
+                    "downside_capture": "Downside capture",
+                    "rebound_leadership_return": "Rebound leadership",
+                    "above_200dma": "Above 200DMA",
+                    "sample_status": "Sample status",
+                }
+            )
+            st.dataframe(
+                stress_snapshot_display[
+                    [
+                        "Date",
+                        "Ticker",
+                        "Stress days",
+                        "Rebound days",
+                        "Stress RS score",
+                        "Stress RS bucket",
+                        "Stress excess return",
+                        "Resilience rate",
+                        "Downside capture",
+                        "Rebound leadership",
+                        "Above 200DMA",
+                        "Sample status",
+                    ]
+                ].style.format(
+                    {
+                        "Stress RS score": "{:.1f}",
+                        "Stress excess return": "{:+.1%}",
+                        "Resilience rate": "{:.0%}",
+                        "Downside capture": "{:.2f}x",
+                        "Rebound leadership": "{:+.1%}",
+                    },
+                    na_rep="n/a",
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+            stress_download_1, stress_download_2 = st.columns(2)
+            stress_download_1.download_button(
+                "Download stress snapshot CSV",
+                dataframe_to_csv(stress_relative_strength_snapshot),
+                file_name="stress_relative_strength_snapshot.csv",
+                mime="text/csv",
+                key="download_stress_relative_strength_snapshot_csv",
+            )
+            stress_download_2.download_button(
+                "Download stress history CSV",
+                dataframe_to_csv(stress_relative_strength),
+                file_name="stress_relative_strength_diagnostics.csv",
+                mime="text/csv",
+                key="download_stress_relative_strength_diagnostics_csv",
+            )
 
     with st.expander("Market overview and rule-based baseline", expanded=False):
         st.dataframe(overview_table(feature_frames), width="stretch")
@@ -1769,6 +1881,8 @@ with research_tab:
                                 "portfolio_factor_crowding_summary": factor_crowding,
                                 "ai_layer_rotation_diagnostics": ai_layer_rotation.detail,
                                 "ai_layer_rotation_summary": ai_layer_rotation.summary,
+                                "stress_relative_strength_diagnostics": stress_relative_strength,
+                                "stress_relative_strength_snapshot": stress_relative_strength_snapshot,
                                 "earnings_event_diagnostics": diagnostics.earnings_event_diagnostics,
                                 "ml_score_by_earnings_window": diagnostics.ml_score_by_earnings_window,
                                 "earnings_pead_summary": diagnostics.earnings_pead_summary,
