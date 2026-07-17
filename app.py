@@ -16,7 +16,6 @@ from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config,
 from src.decision.explain import ticker_explanation
 from src.decision.report import generate_markdown_report, main_warning, portfolio_summary_text
 from src.decision.risk_cockpit import RISK_COCKPIT_TICKERS, build_risk_cockpit, format_risk_cockpit_display
-from src.decision.shortlist import SHORTLIST_VIEW_OPTIONS, filter_decision_shortlist
 from src.decision.table import action_counts, build_decision_table, parse_current_weights_input
 from src.decision.user_benchmark import resolve_active_benchmark, save_user_benchmark
 from src.decision.user_portfolio import (
@@ -114,16 +113,7 @@ from src.utils.config import FeatureConfig
 st.set_page_config(page_title="Stock Signal Lab", layout="wide")
 
 DECISION_HELP = {
-    "ml_score": "Legacy 0-100 audit score from the older scoring model.",
-    "drawdown": "Legacy model estimate of pullback risk over the forward review window.",
     "action": "Legacy posture label based on trend, audit score, pullback risk, relative strength, and risk controls.",
-}
-DECISION_TABLE_COLUMN_LABELS = {
-    "Rule-based regime": "Trend backdrop",
-    "ML score": "Legacy audit score",
-    "Drawdown-risk probability": "Pullback risk",
-    "Target exposure bucket": "Exposure bucket reference",
-    "One-line reason": "Reason",
 }
 BENCHMARK_OPTIONS = ["SPY", "QQQ", "SMH", "SOXX"]
 REPO_ROOT = Path(__file__).resolve().parent
@@ -266,58 +256,6 @@ def score_panel_from_validation(out_predictions: pd.DataFrame, risk_predictions:
             "ML Drawdown-Risk Probability": risk_prob,
             "ML Score": ml_score(out_prob, risk_prob),
         }
-    )
-
-
-def display_decision_table(table: pd.DataFrame) -> pd.DataFrame:
-    """Return a display-only copy with investor-facing column labels."""
-
-    return table.copy().rename(columns=DECISION_TABLE_COLUMN_LABELS)
-
-
-def _format_percent(value: float) -> str:
-    """Format a probability as a compact percentage for display."""
-
-    if pd.isna(value):
-        return ""
-    percent = float(value) * 100
-    if abs(percent - round(percent)) < 0.05:
-        return f"{percent:.0f}%"
-    return f"{percent:.1f}%"
-
-
-def _decision_display_column(table: pd.DataFrame, internal_column: str) -> str:
-    """Resolve the visible column label used for styling."""
-
-    display_column = DECISION_TABLE_COLUMN_LABELS.get(internal_column, internal_column)
-    return display_column if display_column in table.columns else internal_column
-
-
-def styled_decision_table(table: pd.DataFrame):
-    """Return a lightly styled DataFrame for the cockpit."""
-
-    if table.empty:
-        return table
-    score_column = _decision_display_column(table, "ML score")
-    risk_column = _decision_display_column(table, "Drawdown-risk probability")
-    rank_column = _decision_display_column(table, "Relative strength rank")
-    number_formats = {
-        score_column: "{:.0f}",
-        rank_column: "{:.0f}",
-        risk_column: _format_percent,
-    }
-    return table.style.background_gradient(
-        subset=[score_column],
-        cmap="RdYlGn",
-        vmin=0,
-        vmax=100,
-    ).background_gradient(
-        subset=[risk_column],
-        cmap="YlOrRd",
-        vmin=0,
-        vmax=1,
-    ).format(
-        {column: formatter for column, formatter in number_formats.items() if column in table.columns}
     )
 
 
@@ -802,43 +740,7 @@ with today_tab:
     st.write("**Plain-language decision memo**")
     st.info(risk_cockpit.memo)
 
-    st.subheader("Legacy scoring table / audit reference")
-    st.caption(
-        "Legacy audit score is a 0-100 historical scoring aid, not a price target, expected return, "
-        "buy probability, alpha forecast, or daily trading signal. "
-        + DECISION_HELP["ml_score"]
-        + " Pullback risk: "
-        + DECISION_HELP["drawdown"]
-    )
-    if current_weights.empty:
-        st.caption(
-            "Legacy posture labels assume zero current holdings unless optional current weights are supplied."
-        )
-    else:
-        st.caption("Legacy posture labels use the optional current weights entered in advanced settings.")
-    cockpit_view = st.selectbox(
-        "Cockpit view",
-        SHORTLIST_VIEW_OPTIONS,
-        help="Filter the displayed rows without changing the calculated Decision Cockpit table.",
-    )
-    filtered_decision_table = filter_decision_shortlist(decision_table, cockpit_view)
-    st.caption(
-        f"Showing {len(filtered_decision_table)} of {len(decision_table)} rows. "
-        "This display filter does not change scores, ranking, posture labels, or exposure buckets."
-    )
-    displayed_decision_table = display_decision_table(filtered_decision_table)
-    if displayed_decision_table.empty:
-        st.info("No rows match this cockpit view.")
-    else:
-        st.dataframe(styled_decision_table(displayed_decision_table), width="stretch")
-    c1, c2 = st.columns(2)
-    c1.download_button(
-        "Export legacy audit table to CSV",
-        dataframe_to_csv(decision_table),
-        file_name="legacy_scoring_audit_table.csv",
-        mime="text/csv",
-    )
-    c2.download_button(
+    st.download_button(
         "Export Decision Report to Markdown",
         report_markdown.encode("utf-8"),
         file_name="decision_report.md",
