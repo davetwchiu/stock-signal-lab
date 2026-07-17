@@ -101,6 +101,23 @@ def test_resilient_ticker_ranks_above_weak_ticker_during_stress() -> None:
     assert latest.loc["STRONG", "stress_rs_bucket"] == "High"
 
 
+def test_zero_range_candle_keeps_rolling_metrics_numeric() -> None:
+    panel, benchmark = synthetic_panel()
+    zero_range = (panel["Ticker"] == "STRONG") & (panel["Date"] == pd.Timestamp("2024-01-29"))
+    panel.loc[zero_range, "High"] = panel.loc[zero_range, "Close"]
+    panel.loc[zero_range, "Low"] = panel.loc[zero_range, "Close"]
+
+    diagnostics = build_stress_relative_strength_diagnostics(
+        panel,
+        benchmark,
+        stress_window=10,
+        min_stress_days=1,
+    )
+
+    assert pd.api.types.is_numeric_dtype(diagnostics["downside_capture"])
+    assert pd.api.types.is_numeric_dtype(diagnostics["close_position_recovery"])
+
+
 def test_latest_stress_relative_strength_snapshot_is_sorted_and_sample_gated() -> None:
     panel, benchmark = synthetic_panel()
     diagnostics = build_stress_relative_strength_diagnostics(
