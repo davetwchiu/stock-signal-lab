@@ -707,7 +707,8 @@ with today_tab:
     st.write("**AI Layer Rotation**")
     st.caption(
         "Equal-weight price baskets. One layer up while another is down is rotation; "
-        "five negative layers is AI risk-off. This panel does not change any production behavior."
+        "five negative layers are interpreted with QQQ's 200-day trend as either a broad pullback "
+        "or elevated tail risk. This panel does not change any production behavior."
     )
     rotation_row = ai_layer_rotation.summary.iloc[0]
     rotation_card_1, rotation_card_2, rotation_card_3 = st.columns(3)

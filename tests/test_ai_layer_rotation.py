@@ -20,6 +20,21 @@ def _price_frame(daily_return: float, rows: int = 81) -> pd.DataFrame:
     return pd.DataFrame({"Adj Close": price}, index=dates)
 
 
+def _benchmark_regime_frame(early_return: float) -> pd.DataFrame:
+    dates = pd.date_range("2025-01-02", periods=220, freq="B")
+    returns = pd.Series([early_return] * 214 + [-0.002] * 6, index=dates)
+    price = 100.0 * (1.0 + returns).cumprod()
+    return pd.DataFrame({"Adj Close": price}, index=dates)
+
+
+def _all_layers_lower_frames(benchmark_return: float) -> dict[str, pd.DataFrame]:
+    frames = {"QQQ": _benchmark_regime_frame(benchmark_return)}
+    for tickers in AI_LAYER_BASKETS.values():
+        for ticker in tickers:
+            frames[ticker] = _price_frame(-0.001, rows=220).set_axis(frames["QQQ"].index)
+    return frames
+
+
 def _rotation_frames() -> dict[str, pd.DataFrame]:
     layer_returns = {
         "Energy": 0.004,
@@ -84,13 +99,28 @@ def test_one_positive_layer_is_crowded_rotation() -> None:
     assert summary["all_layers_weaker"] == False
 
 
-def test_five_negative_layers_are_ai_risk_off() -> None:
+def test_five_negative_layers_without_benchmark_regime_stay_unconfirmed() -> None:
     summary = summarize_ai_layer_rotation(_summary_detail([-0.01, -0.02, -0.03, -0.04, -0.05])).iloc[0]
 
-    assert summary["market_state"] == "AI risk-off"
-    assert summary["classification"] == "broad de-risking"
+    assert summary["market_state"] == "Broad selloff"
+    assert summary["classification"] == "regime unconfirmed"
     assert summary["rotation_direction"] == "All layers lower"
     assert summary["all_layers_weaker"] == True
+    assert "do not infer an exit signal" in summary["evidence"]
+
+
+def test_benchmark_regime_separates_pullback_from_elevated_tail_risk() -> None:
+    pullback = build_ai_layer_rotation_diagnostics(_all_layers_lower_frames(0.001)).summary.iloc[0]
+    structural = build_ai_layer_rotation_diagnostics(_all_layers_lower_frames(-0.001)).summary.iloc[0]
+
+    assert pullback["benchmark_trend"] == "above 200d average"
+    assert pullback["market_state"] == "Broad pullback"
+    assert pullback["classification"] == "broad pullback"
+    assert "not an exit signal" in pullback["evidence"]
+    assert structural["benchmark_trend"] == "below 200d average"
+    assert structural["market_state"] == "Elevated tail risk"
+    assert structural["classification"] == "bear-market selloff"
+    assert "do not infer negative expected return" in structural["evidence"]
 
 
 def test_missing_layer_data_stays_unavailable() -> None:
