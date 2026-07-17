@@ -35,6 +35,7 @@ AI_LAYER_DETAIL_COLUMNS = [
 AI_LAYER_SUMMARY_COLUMNS = [
     "as_of",
     "signal_window",
+    "benchmark_trend",
     "market_state",
     "classification",
     "leading_layer",
@@ -101,11 +102,20 @@ def build_ai_layer_rotation_diagnostics(
                 )
             )
     detail = pd.DataFrame(rows, columns=AI_LAYER_DETAIL_COLUMNS)
-    summary = summarize_ai_layer_rotation(detail, signal_window=signal_window)
+    summary = summarize_ai_layer_rotation(
+        detail,
+        signal_window=signal_window,
+        benchmark_above_200dma=_above_200dma(benchmark_price, as_of),
+    )
     return AILayerRotationDiagnostics(detail=detail, summary=summary)
 
 
-def summarize_ai_layer_rotation(detail: pd.DataFrame, *, signal_window: int = 5) -> pd.DataFrame:
+def summarize_ai_layer_rotation(
+    detail: pd.DataFrame,
+    *,
+    signal_window: int = 5,
+    benchmark_above_200dma: bool | None = None,
+) -> pd.DataFrame:
     """Classify current leadership using absolute returns over one signal window."""
 
     if detail.empty or not {"layer", "window", "basket_return", "relative_qqq_return"}.issubset(detail.columns):
@@ -132,11 +142,30 @@ def summarize_ai_layer_rotation(detail: pd.DataFrame, *, signal_window: int = 5)
     laggard = current.loc[current["relative_qqq_return"].idxmin()]
     strength = float(leader["relative_qqq_return"] - laggard["relative_qqq_return"])
 
-    if all_layers_weaker:
-        market_state = "AI risk-off"
-        classification = "broad de-risking"
+    if all_layers_weaker and benchmark_above_200dma is True:
+        market_state = "Broad pullback"
+        classification = "broad pullback"
         direction = "All layers lower"
-        evidence = f"All five AI layers have negative {signal_window}d basket returns."
+        evidence = (
+            f"All five AI layers have negative {signal_window}d returns, but QQQ remains above its "
+            "200-day average; treat this as a pullback, not an exit signal."
+        )
+    elif all_layers_weaker and benchmark_above_200dma is False:
+        market_state = "Elevated tail risk"
+        classification = "bear-market selloff"
+        direction = "All layers lower"
+        evidence = (
+            f"All five AI layers have negative {signal_window}d returns and QQQ is below its 200-day "
+            "average; review position sizes, but do not infer negative expected return."
+        )
+    elif all_layers_weaker:
+        market_state = "Broad selloff"
+        classification = "regime unconfirmed"
+        direction = "All layers lower"
+        evidence = (
+            f"All five AI layers have negative {signal_window}d returns, but 200 trading days of "
+            "QQQ history are unavailable; do not infer an exit signal."
+        )
     elif positive_count and negative_count:
         market_state = "Rotation"
         classification = "crowded rotation" if positive_count == 1 else "healthy rotation"
@@ -161,6 +190,7 @@ def summarize_ai_layer_rotation(detail: pd.DataFrame, *, signal_window: int = 5)
     row = {
         "as_of": as_of,
         "signal_window": f"{signal_window}d",
+        "benchmark_trend": _benchmark_trend_label(benchmark_above_200dma),
         "market_state": market_state,
         "classification": classification,
         "leading_layer": str(leader["layer"]),
@@ -266,6 +296,21 @@ def _max_drawdown(daily_returns: pd.Series) -> float:
     return float((wealth / wealth.cummax() - 1.0).min())
 
 
+def _above_200dma(price: pd.Series, as_of: pd.Timestamp) -> bool | None:
+    history = price.loc[:as_of].tail(200)
+    if len(history) < 200:
+        return None
+    return bool(history.iloc[-1] >= history.mean())
+
+
+def _benchmark_trend_label(above_200dma: bool | None) -> str:
+    if above_200dma is True:
+        return "above 200d average"
+    if above_200dma is False:
+        return "below 200d average"
+    return "unavailable"
+
+
 def _strength_label(strength: float) -> str:
     if strength < 0.02:
         return "weak"
@@ -290,6 +335,7 @@ def _insufficient_summary(
     row = {
         "as_of": as_of,
         "signal_window": f"{signal_window}d",
+        "benchmark_trend": "unavailable",
         "market_state": "Unavailable",
         "classification": "insufficient_data",
         "leading_layer": pd.NA,
