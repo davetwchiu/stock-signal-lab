@@ -13,6 +13,7 @@ from src.backtest.engine import run_backtest
 from src.backtest.signals import positions_from_regimes
 from src.data.fetch import load_daily_data
 from src.decision.config import DEFAULT_ADVANCED_OVERRIDE, load_decision_config, profile_settings
+from src.decision.broad_pullback import SECTOR_PULLBACK_TICKERS, build_broad_pullback_playbook
 from src.decision.explain import ticker_explanation
 from src.decision.report import generate_markdown_report, main_warning, portfolio_summary_text
 from src.decision.risk_cockpit import RISK_COCKPIT_TICKERS, build_risk_cockpit, format_risk_cockpit_display
@@ -579,13 +580,13 @@ with st.spinner("Loading data and preparing today's decision view..."):
         except Exception as exc:
             load_errors[ticker] = str(exc)
     risk_frames = dict(frames)
-    for ticker in dict.fromkeys((*RISK_COCKPIT_TICKERS, *AI_LAYER_TICKERS)):
+    for ticker in dict.fromkeys((*RISK_COCKPIT_TICKERS, *AI_LAYER_TICKERS, *SECTOR_PULLBACK_TICKERS)):
         if ticker in risk_frames:
             continue
         try:
             risk_frames[ticker] = cached_load(ticker, str(start_date), str(end_date))
         except Exception as exc:
-            load_errors[ticker] = f"Risk Cockpit / AI Layer Rotation input unavailable: {exc}"
+            load_errors[ticker] = f"Risk decision-support input unavailable: {exc}"
 
     feature_frames = build_features_for_universe(
         frames,
@@ -666,6 +667,7 @@ portfolio_correlation, portfolio_crowding, factor_exposure, factor_crowding = (
 )
 risk_cockpit = build_risk_cockpit(risk_frames, tickers)
 ai_layer_rotation = build_ai_layer_rotation_diagnostics(risk_frames, benchmark="QQQ")
+broad_pullback = build_broad_pullback_playbook(risk_frames)
 
 with today_tab:
     if load_errors:
@@ -736,6 +738,29 @@ with today_tab:
         width="stretch",
         hide_index=True,
     )
+    st.write("**S&P Sector Broad-Pullback Playbook**")
+    st.caption(
+        "Exact decision-support rule: all nine long-history S&P sector ETFs are down over five trading days "
+        "while SPY remains above its 200-day average. It does not change portfolio actions or sizing."
+    )
+    pullback_card_1, pullback_card_2, pullback_card_3 = st.columns(3)
+    pullback_card_1.metric("Playbook status", broad_pullback.status)
+    pullback_card_2.metric(
+        "Sectors down (5d)",
+        f"{broad_pullback.negative_sector_count}/9"
+        if broad_pullback.available_sector_count == len(SECTOR_PULLBACK_TICKERS)
+        else "n/a",
+        help=f"{broad_pullback.available_sector_count}/9 sector ETFs have aligned 5-day prices.",
+    )
+    pullback_card_3.metric("Decision support", broad_pullback.action)
+    if broad_pullback.status == "Confirmed":
+        st.info(broad_pullback.evidence)
+        st.caption(
+            "Validation excluded calendar years 2008, 2009, and 2020. Even in the remaining sample, the "
+            "worst 10% of events saw SPY fall at least another 4.4% intraperiod over the next 20 trading days."
+        )
+    else:
+        st.caption(broad_pullback.evidence)
     st.write("**Single-name trend health panel**")
     st.dataframe(format_risk_cockpit_display(risk_cockpit.single_name_health), width="stretch", hide_index=True)
     st.write("**Plain-language decision memo**")
